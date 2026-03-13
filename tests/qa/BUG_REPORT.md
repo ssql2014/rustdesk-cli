@@ -191,20 +191,23 @@
 
 ## Bug Summary (Prioritized)
 
-| # | Bug | Severity | Category |
-|---|-----|----------|----------|
-| BUG-015 | exec is completely stubbed | CRITICAL | Functionality |
-| BUG-001 | Connect to invalid server succeeds | CRITICAL | Functionality |
-| BUG-002 | Capture reports success, writes no file | CRITICAL | Functionality |
-| BUG-003 | Wrong password accepted | MAJOR | Security |
-| BUG-012 | `do` batch bypasses session check | MAJOR | Functionality |
-| BUG-013 | Errors go to stdout not stderr | MAJOR | Convention |
-| BUG-014 | Disconnect no-session returns 0, PM says 2 | MEDIUM | Behavior |
-| BUG-016 | exec JSON missing stdout/stderr fields | MEDIUM | API |
-| BUG-004 | scroll command missing | MEDIUM | Spec gap |
-| BUG-005 | click --double missing | MEDIUM | Spec gap |
-| BUG-006 | --password-stdin missing | MEDIUM | Spec gap |
-| BUG-007 | meta modifier missing | MEDIUM | Spec gap |
-| BUG-008 | capture file required (spec says optional) | MEDIUM | Spec gap |
-| BUG-009 | Exit codes don't match spec (2 vs 3) | LOW | Convention |
-| BUG-010 | RUSTDESK_PASSWORD not in help | LOW | Docs |
+| # | Bug | Severity | Category | Fixed by #18? |
+|---|-----|----------|----------|---------------|
+| BUG-015 | exec is completely stubbed | CRITICAL | Functionality | **YES** — #18 wires terminal channel through daemon |
+| BUG-001 | Connect to invalid server succeeds | CRITICAL | Functionality | **YES** — #18 replaces stub connect with real handshake |
+| BUG-002 | Capture reports success, writes no file | CRITICAL | Functionality | **PARTIAL** — real connection needed, but capture pipeline may still be stubbed |
+| BUG-003 | Wrong password accepted | MAJOR | Security | **YES** — real auth flow will validate passwords |
+| BUG-012 | `do` batch bypasses session check | MAJOR | Functionality | **LIKELY** — real daemon will reject commands on dead connection |
+| BUG-013 | Errors go to stdout not stderr | MAJOR | Convention | **NO** — CLI output routing, not daemon issue |
+| BUG-014 | Disconnect no-session returns 0, PM says 2 | MEDIUM | Behavior | **MAYBE** — depends on exit code cleanup scope |
+| BUG-016 | exec JSON missing stdout/stderr fields | MEDIUM | API | **LIKELY** — new exec implementation should use PM-spec fields |
+| BUG-004 | scroll command missing | MEDIUM | Spec gap | **NO** — CLI/clap change, not daemon |
+| BUG-005 | click --double missing | MEDIUM | Spec gap | **NO** — CLI/clap change |
+| BUG-006 | --password-stdin missing | MEDIUM | Spec gap | **NO** — CLI/clap change |
+| BUG-007 | meta modifier missing | MEDIUM | Spec gap | **NO** — CLI/clap change |
+| BUG-008 | capture file required (spec says optional) | MEDIUM | Spec gap | **NO** — CLI/clap change |
+| BUG-009 | Exit codes don't match spec (2 vs 3) | LOW | Convention | **MAYBE** — if exit code routing is in scope |
+| BUG-010 | RUSTDESK_PASSWORD not in help | LOW | Docs | **NO** — help text change |
+
+### Regression test suite: `tests/qa/regression_daemon_wiring.sh`
+Targeted tests for verifying #18 fixes. Run after Max's PR lands.

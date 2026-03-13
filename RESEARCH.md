@@ -769,9 +769,30 @@ This is a dedicated, simpler mechanism described in **Section 20**. It is functi
 ### Implementation Recommendation
 For `rustdesk-cli`, the **Screenshot Protocol Path** should be the primary method for the `capture` command due to its simplicity and efficiency. However, the **Video Stream Path** should be implemented as a fallback to ensure 100% compatibility with all remote hosts.
 
-### Required Crates for Real Capture
-- `vpx-rs` or `vpx-sys` (VP9 decoding)
-- `dav1d` (AV1 decoding)
-- `image` (PNG/JPEG handling and YUV->RGB if needed)
-- `yuvutils-rs` (Fast YUV conversion)
+---
+
+## 24. UDP Rendezvous Response Investigation
+
+Investigation into why UDP signaling messages to `115.238.185.55:50076` often result in timeouts or "no response".
+
+### 1. Selective Response Behavior
+Probing reveals that the self-hosted ID server (`hbbs`) implements selective silence based on the `licence_key` field in `PunchHoleRequest`:
+- **Empty Key / Wrong Key**: The server responds **immediately** with `PunchHoleResponse { failure: LicenseMismatch }`.
+- **Correct Key**: The server remains **silent** (no response). 
+
+**Conclusion**: When provided with the correct license key, the server expects a fully authenticated and "Online" session. If the client has not maintained a heartbeat or completed the full registration sequence, the server ignores the request rather than leaking information with an error.
+
+### 2. Protocol Details Verified
+- **Source Port**: Responses consistently originate from the same IP/port as the request (`115.238.185.55:50076`). The "Connected UDP" pattern in `src/rendezvous.rs` is technically correct but may be brittle if the server ever uses a pool of ports.
+- **Magic Headers**: No 2-byte magic prefix (like `\x11\x11`) is required for the server at this version. Raw Protobuf messages are accepted for `RegisterPk` and `RegisterPeer`.
+- **State Requirement**: `RegisterPk` and `RegisterPeer` succeed even on fresh sockets, but `PunchHoleRequest` seems to require the requester to be in an "active" state on the server.
+
+### 3. Root Cause of Connection Hangs
+The `rustdesk-cli` connection hangs because it uses the correct license key from the configuration. This places it in the "Authorized" path where the server is silent. To receive an immediate response (even if it's an error), the client must:
+1.  Complete `RegisterPk` and `RegisterPeer` on the **same socket**.
+2.  Potentially send a `TestNatRequest` or `OnlineRequest` to establish "presence".
+3.  Include the `udp_port` (local bound port) in the `PunchHoleRequest`.
+
+### 4. Recommendation for implementation
+To unblock development, the client should implement a **heartbeat loop** immediately after registration. Additionally, the `RendezvousClient` should be updated to use `recv_from` rather than `recv` to better handle potential source-port variations from complex NAT/firewall setups.
 

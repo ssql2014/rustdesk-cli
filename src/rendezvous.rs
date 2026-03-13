@@ -6,7 +6,8 @@ use tokio::net::UdpSocket;
 
 use crate::proto::hbb::{
     ConnType, NatType, PunchHoleRequest, PunchHoleResponse, RegisterPeer, RegisterPeerResponse,
-    RelayResponse, RendezvousMessage, RequestRelay, rendezvous_message,
+    RegisterPk, RegisterPkResponse, RelayResponse, RendezvousMessage, RequestRelay,
+    rendezvous_message,
 };
 
 pub struct RendezvousClient {
@@ -41,6 +42,28 @@ impl RendezvousClient {
         match self.send_request(&request).await?.union {
             Some(rendezvous_message::Union::RegisterPeerResponse(response)) => Ok(response),
             other => bail!("unexpected rendezvous response to RegisterPeer: {other:?}"),
+        }
+    }
+
+    pub async fn register_pk(
+        &self,
+        my_id: &str,
+        uuid: &[u8],
+        public_key: &[u8],
+    ) -> Result<RegisterPkResponse> {
+        let request = RendezvousMessage {
+            union: Some(rendezvous_message::Union::RegisterPk(RegisterPk {
+                id: my_id.to_string(),
+                uuid: uuid.to_vec(),
+                pk: public_key.to_vec(),
+                old_id: String::new(),
+                no_register_device: false,
+            })),
+        };
+
+        match self.send_request(&request).await?.union {
+            Some(rendezvous_message::Union::RegisterPkResponse(response)) => Ok(response),
+            other => bail!("unexpected rendezvous response to RegisterPk: {other:?}"),
         }
     }
 
@@ -152,6 +175,53 @@ mod tests {
         let response = client.register_peer("host-1", b"public-key").await?;
 
         assert!(response.request_pk);
+        server_task.await.expect("server task should join")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn register_pk_sends_uuid_and_public_key_and_parses_response() -> Result<()> {
+        let server = bind_test_server().await;
+        let server_addr = server.local_addr()?;
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 4096];
+            let (size, peer) = server.recv_from(&mut buf).await?;
+            let message = RendezvousMessage::decode(&buf[..size])?;
+
+            match message.union {
+                Some(rendezvous_message::Union::RegisterPk(register)) => {
+                    assert_eq!(register.id, "host-1");
+                    assert_eq!(register.uuid, vec![1, 2, 3, 4]);
+                    assert_eq!(register.pk, vec![9; 32]);
+                    assert!(register.old_id.is_empty());
+                    assert!(!register.no_register_device);
+                }
+                other => panic!("expected RegisterPk, got {other:?}"),
+            }
+
+            let response = RendezvousMessage {
+                union: Some(rendezvous_message::Union::RegisterPkResponse(
+                    RegisterPkResponse {
+                        result: crate::proto::hbb::register_pk_response::Result::Ok as i32,
+                        keep_alive: 30,
+                    },
+                )),
+            };
+            let mut encoded = Vec::new();
+            response.encode(&mut encoded)?;
+            server.send_to(&encoded, peer).await?;
+            Result::<()>::Ok(())
+        });
+
+        let client = RendezvousClient::connect(&server_addr.to_string()).await?;
+        let response = client.register_pk("host-1", &[1, 2, 3, 4], &[9; 32]).await?;
+
+        assert_eq!(
+            response.result,
+            crate::proto::hbb::register_pk_response::Result::Ok as i32
+        );
+        assert_eq!(response.keep_alive, 30);
         server_task.await.expect("server task should join")?;
         Ok(())
     }

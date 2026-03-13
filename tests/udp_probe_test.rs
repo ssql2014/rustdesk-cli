@@ -9,16 +9,16 @@ use proto::hbb::{RendezvousMessage, rendezvous_message, PunchHoleRequest};
 
 #[tokio::test]
 #[ignore]
-async fn test_udp_punch_empty_key() -> Result<()> {
+async fn test_udp_rendezvous_punch_authorized() -> Result<()> {
     let server_addr = "115.238.185.55:50076";
     let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+    socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     
-    // Construct PunchHoleRequest with an EMPTY key
+    // Construct PunchHoleRequest with the CORRECT key from TEST_CONFIG.md
     let punch_hole = PunchHoleRequest {
         id: "308235080".to_string(),
         nat_type: 0,
-        licence_key: "".to_string(),
+        licence_key: "SWc0NIWF0wR7kd8rHdGNaCHXtp7dirUImEtrVmRfQdc=".to_string(),
         conn_type: 0,
         token: "".to_string(),
         version: "1.3.7".to_string(),
@@ -34,17 +34,28 @@ async fn test_udp_punch_empty_key() -> Result<()> {
     let mut buf = Vec::new();
     rendezvous_msg.encode(&mut buf)?;
     
-    println!("Sending PunchHoleRequest with EMPTY key...");
+    println!("Sending PunchHoleRequest with AUTHORIZED key to {}...", server_addr);
     socket.send_to(&buf, server_addr)?;
     
     let mut recv_buf = [0u8; 4096];
     match socket.recv_from(&mut recv_buf) {
         Ok((size, addr)) => {
             println!("Received response from {}:", addr);
-            let decoded = RendezvousMessage::decode(&recv_buf[..size]);
-            println!("Decoded: {:?}", decoded);
+            let hex_dump = recv_buf[..size]
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<String>>()
+                .join(" ");
+            println!("Hex: {}", hex_dump);
+            
+            match RendezvousMessage::decode(&recv_buf[..size]) {
+                Ok(decoded) => println!("Decoded: {:?}", decoded),
+                Err(e) => println!("Failed to decode: {}", e),
+            }
         }
-        Err(e) => println!("Failed to get response with EMPTY key: {}", e),
+        Err(e) => {
+            println!("No response within 15 seconds (likely IGNORED due to missing session state): {}", e);
+        }
     }
     
     Ok(())

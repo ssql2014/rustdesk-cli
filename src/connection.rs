@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result, bail};
 use prost::Message as ProstMessage;
+use rand_core::{OsRng, RngCore};
 
 use crate::crypto::{self, EncryptedStream, KeyExchangeResult};
 use crate::proto::hbb::{
@@ -86,10 +87,22 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
 
     // Register ourselves as a peer (required before punch-hole).
     let my_id = format!("cli-{}", std::process::id());
-    client
+    let register_response = client
         .register_peer(&my_id, &[])
         .await
         .context("RegisterPeer failed")?;
+
+    if register_response.request_pk {
+        let mut uuid = [0_u8; 16];
+        let mut public_key = [0_u8; 32];
+        OsRng.fill_bytes(&mut uuid);
+        OsRng.fill_bytes(&mut public_key);
+
+        client
+            .register_pk(&my_id, &uuid, &public_key)
+            .await
+            .context("RegisterPk failed")?;
+    }
 
     // Try to punch hole to target.
     let ph_response = client

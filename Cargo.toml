@@ -12,6 +12,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 prost = "0.13"
+libc = "0.2"
+
+# NaCl crypto (pure Rust) — for RustDesk handshake
+# Ed25519 identity keys + X25519 key exchange + XSalsa20-Poly1305 encryption
+crypto_box = "0.9"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 # NOTE: hbb_common from rustdesk repo has heavy dependencies and build requirements.
 # We'll vendor the specific protobuf definitions we need instead.

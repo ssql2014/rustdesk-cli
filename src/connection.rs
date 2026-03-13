@@ -35,6 +35,10 @@ pub struct ConnectionConfig {
     pub peer_id: String,
     /// Password for authentication.
     pub password: String,
+    /// Seconds to wait after starting heartbeat before sending PunchHole.
+    /// The server may need sustained heartbeats before accepting PunchHole
+    /// requests (Nova §28).  Default: 5.
+    pub warmup_secs: u64,
 }
 
 /// Outcome of a successful connection.
@@ -110,14 +114,24 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
     let heartbeat = client.start_heartbeat(&my_id);
     tokio::task::yield_now().await;
 
+    // State warm-up: the server may need several sustained heartbeats
+    // before it will respond to PunchHoleRequests (Nova §28).
+    let warmup = config.warmup_secs;
+    if warmup > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_secs(warmup)).await;
+    }
+
     // Wrap remaining discovery in an async block so we always abort the
     // heartbeat, even on error paths.
     let result = async {
-        // Try to punch hole to target.
-        let ph_response = client
-            .punch_hole(&config.peer_id, &config.server_key)
-            .await
-            .context("PunchHoleRequest failed")?;
+        // Try to punch hole to target (15s timeout — server may be slow).
+        let ph_response = tokio::time::timeout(
+            tokio::time::Duration::from_secs(15),
+            client.punch_hole(&config.peer_id, &config.server_key),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("PunchHoleRequest timed out after 15 seconds"))?
+        .context("PunchHoleRequest failed")?;
 
         // Check for immediate PunchHole failure before proceeding to relay.
         check_punch_hole_failure(&ph_response)?;
@@ -502,6 +516,7 @@ mod tests {
             server_key: "SWc0NIWF0wR7kd8rHdGNaCHXtp7dirUImEtrVmRfQdc=".to_string(),
             peer_id: "308235080".to_string(),
             password: "Evas@2026".to_string(),
+            warmup_secs: 5,
         };
 
         match connect_to_peer(&config).await {

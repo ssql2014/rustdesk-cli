@@ -63,8 +63,10 @@ async fn live_rendezvous_server_register_and_punch_hole() -> Result<()> {
     eprintln!("[3] Registration complete. Starting heartbeat...");
 
     let heartbeat = client.start_heartbeat(&my_id);
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    eprintln!("[4] Heartbeat started. Checking if target peer {TARGET_PEER_ID} is online...");
+    // State warm-up: wait for sustained heartbeats before sending requests
+    // (Nova §28 — server may need 5-10s of heartbeats to accept PunchHole).
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    eprintln!("[4] Heartbeat warm-up complete. Checking if target peer {TARGET_PEER_ID} is online...");
 
     // Send OnlineRequest
     let online_req = RendezvousMessage {

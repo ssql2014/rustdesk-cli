@@ -463,6 +463,7 @@ mod tests {
             server_key: "SWc0NIWF0wR7kd8rHdGNaCHXtp7dirUImEtrVmRfQdc=".to_string(),
             peer_id: "308235080".to_string(),
             password: "Evas@2026".to_string(),
+            warmup_secs: 5,
         };
 
         match text_connect(&config).await {

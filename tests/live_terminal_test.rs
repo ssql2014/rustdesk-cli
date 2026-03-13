@@ -37,6 +37,7 @@ fn test_config() -> ConnectionConfig {
         server_key: SERVER_KEY.to_string(),
         peer_id: TARGET_PEER_ID.to_string(),
         password: TARGET_PASSWORD.to_string(),
+        warmup_secs: 5,
     }
 }
 

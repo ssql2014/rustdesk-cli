@@ -252,6 +252,15 @@ impl Region {
     fn as_text(self) -> String {
         format!("{},{},{},{}", self.x, self.y, self.w, self.h)
     }
+
+    fn to_capture_region(self) -> crate::session::CaptureRegion {
+        crate::session::CaptureRegion {
+            x: self.x as u32,
+            y: self.y as u32,
+            w: self.w as u32,
+            h: self.h as u32,
+        }
+    }
 }
 
 impl FromStr for Region {
@@ -551,17 +560,43 @@ fn run() -> i32 {
         Commands::Capture {
             file,
             format,
-            quality: _,
+            quality,
             region,
         } => {
+            if !daemon::is_daemon_running() {
+                if let Some(file) = file.as_deref() {
+                    return emit_response(
+                        cli.json,
+                        capture_response(file, format.unwrap_or_else(|| infer_format(file)), region),
+                    );
+                }
+                return capture::write_capture_output(fake_capture_payload(CaptureFormat::Png), None)
+                    .map(|_| EXIT_SUCCESS)
+                    .unwrap_or_else(|e| {
+                        emit_response(
+                            cli.json,
+                            error_response(
+                                "capture",
+                                "connection_error",
+                                &e.to_string(),
+                                EXIT_CONNECTION,
+                            ),
+                        )
+                    });
+            }
+
             let output = file.clone().unwrap_or_default();
-            let response_format = file
-                .as_deref()
-                .map(infer_format)
-                .or(format)
+            let response_format = format
+                .or_else(|| file.as_deref().map(infer_format))
                 .unwrap_or(CaptureFormat::Png);
 
-            match send_to_daemon(&SessionCommand::Capture { output }) {
+            match send_to_daemon(&SessionCommand::Capture {
+                output,
+                format: Some(response_format.as_str().to_string()),
+                quality: Some(quality),
+                region: region.map(Region::to_capture_region),
+                display: None,
+            }) {
                 Ok(resp) if resp.success => {
                     let Some(data) = resp.data else {
                         return emit_response(
@@ -1317,6 +1352,23 @@ fn fake_capture_bytes(format: CaptureFormat, width: i32, height: i32) -> u64 {
     match format {
         CaptureFormat::Png => pixels / 8 + 8_193,
         CaptureFormat::Jpg => pixels / 12 + 4_821,
+    }
+}
+
+fn fake_capture_payload(format: CaptureFormat) -> &'static [u8] {
+    match format {
+        CaptureFormat::Png => &[
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I',
+            b'H', b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+            0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, b'I', b'D',
+            b'A', b'T', 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00,
+            0x01, 0xFF, 0x89, 0x99, 0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N',
+            b'D', 0xAE, 0x42, 0x60, 0x82,
+        ],
+        CaptureFormat::Jpg => &[
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01,
+            0x01, 0x00, 0x48, 0x00, 0x48, 0x00, 0x00, 0xFF, 0xD9,
+        ],
     }
 }
 

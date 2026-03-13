@@ -338,8 +338,24 @@ pub async fn run_daemon(
                             Err(e) => SessionResponse::error(format!("clipboard set failed: {e:#}")),
                         }
                     }
-                    SessionCommand::Capture { .. } => {
-                        match capture::request_screenshot(&mut encrypted).await {
+                    SessionCommand::Capture {
+                        format,
+                        quality,
+                        region,
+                        display,
+                        ..
+                    } => {
+                        match capture::request_screenshot(
+                            &mut encrypted,
+                            &capture::CaptureOptions {
+                                format,
+                                quality,
+                                region,
+                                display,
+                            },
+                        )
+                        .await
+                        {
                             Ok(bytes) => SessionResponse::ok_with_data(
                                 "Screenshot captured",
                                 serde_json::json!({

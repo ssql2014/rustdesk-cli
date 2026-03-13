@@ -1,21 +1,33 @@
 //! Screenshot capture helpers over an encrypted RustDesk session.
 
 use std::{
+    io::Cursor,
     fs,
     io::{self, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
+use image::{DynamicImage, GenericImageView, ImageFormat, codecs::jpeg::JpegEncoder};
 use prost::Message as ProstMessage;
 
 use crate::crypto::EncryptedStream;
 use crate::proto::hbb::{Message, ScreenshotRequest, message};
+use crate::session::CaptureRegion;
 use crate::transport::Transport;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureOptions {
+    pub format: Option<String>,
+    pub quality: Option<u8>,
+    pub region: Option<CaptureRegion>,
+    pub display: Option<i32>,
+}
 
 /// Request a screenshot from display 0 and return the raw image bytes.
 pub async fn request_screenshot<T: Transport>(
     stream: &mut EncryptedStream<T>,
+    options: &CaptureOptions,
 ) -> Result<Vec<u8>> {
     let sid = format!(
         "rustdesk-cli-{}-{}",
@@ -25,7 +37,7 @@ pub async fn request_screenshot<T: Transport>(
             .unwrap_or_default()
             .as_nanos()
     );
-    request_screenshot_with_sid(stream, 0, &sid).await
+    request_screenshot_with_sid(stream, options.display.unwrap_or(0), &sid, options).await
 }
 
 /// Request a screenshot for the specified display and session id.
@@ -33,6 +45,7 @@ pub async fn request_screenshot_with_sid<T: Transport>(
     stream: &mut EncryptedStream<T>,
     display: i32,
     sid: &str,
+    options: &CaptureOptions,
 ) -> Result<Vec<u8>> {
     let msg = Message {
         union: Some(message::Union::ScreenshotRequest(ScreenshotRequest {
@@ -56,11 +69,75 @@ pub async fn request_screenshot_with_sid<T: Transport>(
                 if !response.msg.is_empty() {
                     bail!("screenshot failed: {}", response.msg);
                 }
-                return Ok(response.data);
+                return process_screenshot_bytes(&response.data, options);
             }
             _ => continue,
         }
     }
+}
+
+pub fn process_screenshot_bytes(bytes: &[u8], options: &CaptureOptions) -> Result<Vec<u8>> {
+    let needs_processing = options.region.is_some()
+        || options
+            .format
+            .as_deref()
+            .is_some_and(|format| !format.eq_ignore_ascii_case("png"))
+        || options.quality.is_some();
+
+    if !needs_processing {
+        return Ok(bytes.to_vec());
+    }
+
+    let mut image = image::load_from_memory(bytes).context("decoding screenshot image")?;
+    if let Some(region) = &options.region {
+        image = crop_image(image, region)?;
+    }
+
+    encode_image(&image, options)
+}
+
+fn crop_image(image: DynamicImage, region: &CaptureRegion) -> Result<DynamicImage> {
+    let (width, height) = image.dimensions();
+    let x2 = region
+        .x
+        .checked_add(region.w)
+        .context("capture region x overflow")?;
+    let y2 = region
+        .y
+        .checked_add(region.h)
+        .context("capture region y overflow")?;
+    if x2 > width || y2 > height {
+        bail!(
+            "capture region {},{},{},{} exceeds image bounds {}x{}",
+            region.x,
+            region.y,
+            region.w,
+            region.h,
+            width,
+            height
+        );
+    }
+
+    Ok(image.crop_imm(region.x, region.y, region.w, region.h))
+}
+
+fn encode_image(image: &DynamicImage, options: &CaptureOptions) -> Result<Vec<u8>> {
+    let format = options.format.as_deref().unwrap_or("png");
+    let mut out = Cursor::new(Vec::new());
+
+    if format.eq_ignore_ascii_case("jpg") || format.eq_ignore_ascii_case("jpeg") {
+        let quality = options.quality.unwrap_or(90);
+        let mut encoder = JpegEncoder::new_with_quality(&mut out, quality);
+        encoder
+            .encode_image(image)
+            .context("encoding screenshot as JPEG")?;
+    } else {
+        image
+            .write_to(&mut out, ImageFormat::Png)
+            .context("encoding screenshot as PNG")?;
+    }
+
+    Ok(out.into_inner())
 }
 
 /// Save image bytes to a file, or to stdout if no file path is given.
@@ -223,9 +300,72 @@ mod tests {
             Result::<()>::Ok(())
         });
 
-        let bytes = request_screenshot_with_sid(&mut client, 0, "sid-1").await?;
+        let bytes = request_screenshot_with_sid(
+            &mut client,
+            0,
+            "sid-1",
+            &CaptureOptions {
+                format: None,
+                quality: None,
+                region: None,
+                display: Some(0),
+            },
+        )
+        .await?;
         assert_eq!(bytes, b"png-bytes");
         server_task.await.expect("server task should join")?;
+        Ok(())
+    }
+
+    #[test]
+    fn process_screenshot_bytes_crops_png_region() -> Result<()> {
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(4, 3, |x, y| {
+            image::Rgba([x as u8, y as u8, 0, 255])
+        }));
+        let mut encoded = Cursor::new(Vec::new());
+        image.write_to(&mut encoded, ImageFormat::Png)?;
+
+        let processed = process_screenshot_bytes(
+            &encoded.into_inner(),
+            &CaptureOptions {
+                format: Some("png".to_string()),
+                quality: Some(80),
+                region: Some(CaptureRegion {
+                    x: 1,
+                    y: 1,
+                    w: 2,
+                    h: 1,
+                }),
+                display: Some(2),
+            },
+        )?;
+
+        let cropped = image::load_from_memory(&processed)?;
+        assert_eq!(cropped.dimensions(), (2, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn process_screenshot_bytes_reencodes_as_jpeg() -> Result<()> {
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        let mut encoded = Cursor::new(Vec::new());
+        image.write_to(&mut encoded, ImageFormat::Png)?;
+
+        let processed = process_screenshot_bytes(
+            &encoded.into_inner(),
+            &CaptureOptions {
+                format: Some("jpg".to_string()),
+                quality: Some(70),
+                region: None,
+                display: None,
+            },
+        )?;
+
+        assert!(processed.starts_with(&[0xFF, 0xD8, 0xFF]));
         Ok(())
     }
 

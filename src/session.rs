@@ -33,6 +33,14 @@ pub struct PeerInfoState {
     pub displays: Vec<DisplayInfo>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureRegion {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
 /// Commands that the CLI sends to the daemon over UDS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionCommand {
@@ -52,6 +60,10 @@ pub enum SessionCommand {
     },
     Capture {
         output: String,
+        format: Option<String>,
+        quality: Option<u8>,
+        region: Option<CaptureRegion>,
+        display: Option<i32>,
     },
     Type {
         text: String,
@@ -221,7 +233,7 @@ impl Session {
                 ))
             }
 
-            SessionCommand::Capture { output } => {
+            SessionCommand::Capture { output, .. } => {
                 self.require_connected()?;
                 // TODO: Request a keyframe from the video stream, decode, encode as PNG.
                 Ok((
@@ -724,6 +736,10 @@ mod tests {
             },
             SessionCommand::Capture {
                 output: "shot.png".to_string(),
+                format: None,
+                quality: None,
+                region: None,
+                display: None,
             },
             SessionCommand::Type {
                 text: "hello".to_string(),

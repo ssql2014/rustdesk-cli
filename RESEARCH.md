@@ -649,5 +649,49 @@ If `ScreenshotRequest` is unsupported by a specific host version, the client can
 2.  Waiting for the first **Keyframe** (I-frame).
 3.  Decoding that single frame using `libvpx` (VP9) or `openh264`.
 4.  Saving the resulting RGBA buffer as a PNG.
-*Note: This is significantly more complex to implement than the dedicated screenshot protocol.*
+---
+
+## 21. Zstd Implementation Guide
+
+This guide provides a practical roadmap for implementing zstd compression in the terminal and clipboard channels to reduce bandwidth usage.
+
+### 1. Cargo.toml Changes
+Add the `zstd` crate to the `[dependencies]` section:
+```toml
+zstd = "0.13"
+```
+
+### 2. API Usage
+Use the high-level `encode_all` and `decode_all` functions for simple `Vec<u8>` transformations.
+
+- **Compression**:
+  ```rust
+  // Level 0 uses the default (typically 3)
+  let compressed_data = zstd::encode_all(&raw_data[..], 0)?;
+  ```
+- **Decompression**:
+  ```rust
+  let decompressed_data = zstd::decode_all(&compressed_data[..])?;
+  ```
+
+### 3. Recommended Threshold
+To balance CPU overhead and bandwidth savings, only compress payloads that exceed a specific size.
+- **Threshold**: **1024 bytes**.
+- **Logic**: If `raw_data.len() < 1024`, send raw bytes and set `compressed: false`. Otherwise, compress and set `compressed: true`.
+
+### 4. Integration with TerminalData
+When sending or receiving `TerminalData` in `src/terminal.rs`:
+
+**Sending (Client → Host):**
+1. Check if input string/bytes exceed the threshold.
+2. If yes, compress the data.
+3. Populate `TerminalData { data: compressed_bytes, compressed: true, .. }`.
+
+**Receiving (Host → Client):**
+1. Check the `compressed` field in the incoming `TerminalData` message.
+2. If `true`, call `zstd::decode_all(&msg.data)`.
+3. If `false`, use `msg.data` directly as raw bytes.
+
+### 5. Error Handling
+Always handle decompression errors gracefully. If `decode_all` fails (e.g., due to a corrupted packet), the session should log the error and potentially reconnect to ensure terminal state consistency.
 

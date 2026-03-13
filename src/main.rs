@@ -98,6 +98,9 @@ enum Commands {
     Capture {
         /// Output file path
         file: Option<String>,
+        /// Display index to capture
+        #[arg(long)]
+        display: Option<i32>,
         /// Image format
         #[arg(long, value_enum)]
         format: Option<CaptureFormat>,
@@ -564,6 +567,7 @@ fn run() -> i32 {
         }
         Commands::Capture {
             file,
+            display,
             format,
             quality,
             region,
@@ -572,7 +576,12 @@ fn run() -> i32 {
                 if let Some(file) = file.as_deref() {
                     return emit_response(
                         cli.json,
-                        capture_response(file, format.unwrap_or_else(|| infer_format(file)), region),
+                        capture_response(
+                            file,
+                            format.unwrap_or_else(|| infer_format(file)),
+                            region,
+                            display,
+                        ),
                     );
                 }
                 return capture::write_capture_output(fake_capture_payload(CaptureFormat::Png), None)
@@ -600,7 +609,7 @@ fn run() -> i32 {
                 format: Some(response_format.as_str().to_string()),
                 quality: Some(quality),
                 region: region.map(Region::to_capture_region),
-                display: None,
+                display,
             }) {
                 Ok(resp) if resp.success => {
                     let Some(data) = resp.data else {
@@ -651,7 +660,13 @@ fn run() -> i32 {
                     } else {
                         emit_response(
                             cli.json,
-                            capture_result_response(file.as_deref(), response_format, region, bytes.len()),
+                            capture_result_response(
+                                file.as_deref(),
+                                response_format,
+                                region,
+                                display,
+                                bytes.len(),
+                            ),
                         )
                     }
                 }
@@ -1033,7 +1048,12 @@ fn status_connected_response(peer_id: &str) -> Response {
     }
 }
 
-fn capture_response(file: &str, format: CaptureFormat, region: Option<Region>) -> Response {
+fn capture_response(
+    file: &str,
+    format: CaptureFormat,
+    region: Option<Region>,
+    display: Option<i32>,
+) -> Response {
     let (width, height) = match region {
         Some(region) => (region.w, region.h),
         None => (DEFAULT_WIDTH, DEFAULT_HEIGHT),
@@ -1047,8 +1067,11 @@ fn capture_response(file: &str, format: CaptureFormat, region: Option<Region>) -
     if let Some(region) = region {
         text.push_str(&format!(" region={}", region.as_text()));
     }
+    if let Some(display) = display {
+        text.push_str(&format!(" display={display}"));
+    }
 
-    let json = if let Some(region) = region {
+    let mut json = if let Some(region) = region {
         json!({
             "ok": true,
             "command": "capture",
@@ -1071,6 +1094,12 @@ fn capture_response(file: &str, format: CaptureFormat, region: Option<Region>) -
         })
     };
 
+    if let Some(display) = display {
+        if let Some(object) = json.as_object_mut() {
+            object.insert("display".to_string(), json!(display));
+        }
+    }
+
     Response {
         text,
         json,
@@ -1082,6 +1111,7 @@ fn capture_result_response(
     file: Option<&str>,
     format: CaptureFormat,
     region: Option<Region>,
+    display: Option<i32>,
     bytes: usize,
 ) -> Response {
     let mut json = json!({
@@ -1103,6 +1133,11 @@ fn capture_result_response(
     if let Some(region) = region {
         if let Some(object) = json.as_object_mut() {
             object.insert("region".to_string(), region.to_json());
+        }
+    }
+    if let Some(display) = display {
+        if let Some(object) = json.as_object_mut() {
+            object.insert("display".to_string(), json!(display));
         }
     }
 
@@ -1291,7 +1326,8 @@ fn step_to_response(step: &BatchStep) -> Response {
                 .and_then(parse_capture_format)
                 .unwrap_or_else(|| infer_format(file));
             let region = flag_value(&step.args, "--region").and_then(|raw| raw.parse::<Region>().ok());
-            capture_response(file, format, region)
+            let display = flag_value(&step.args, "--display").and_then(|raw| raw.parse::<i32>().ok());
+            capture_response(file, format, region, display)
         }
         "type" => type_response(step.args.first().map(String::as_str).unwrap_or("")),
         "key" => {
@@ -1474,7 +1510,7 @@ fn parse_batch_steps(tokens: &[String]) -> Result<Vec<BatchStep>, String> {
             }
             "capture" => {
                 let (args, next_index) =
-                    parse_flagged_step(tokens, index + 1, &["--format", "--quality", "--region"], 0)?;
+                    parse_flagged_step(tokens, index + 1, &["--display", "--format", "--quality", "--region"], 0)?;
                 steps.push(BatchStep { command, args });
                 index = next_index;
             }

@@ -141,6 +141,17 @@ fn json_capture_contract() {
 }
 
 #[test]
+fn json_capture_display_contract() {
+    let value = run_json_any_exit(&["--json", "capture", "shot.png", "--display", "1"]);
+    assert_eq!(value["command"], "capture");
+    if value["ok"] == true {
+        assert_eq!(value["display"], 1);
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
+}
+
+#[test]
 #[ignore = "requires a live daemon connection to capture real screenshots"]
 fn capture_without_file_writes_png_to_stdout() {
     let output = bin()

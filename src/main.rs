@@ -329,6 +329,8 @@ fn run_daemon_mode(args: &[String]) {
     let id_server = daemon_arg_value(args, "--id-server");
     let relay_server = daemon_arg_value(args, "--relay-server");
     let key = daemon_arg_value(args, "--key");
+    let connect_timeout =
+        daemon_arg_value(args, "--connect-timeout").and_then(|s| s.parse::<u64>().ok());
     let timeout = daemon_arg_value(args, "--timeout").and_then(|s| s.parse::<u64>().ok());
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     if let Err(e) = rt.block_on(daemon::run_daemon(
@@ -338,6 +340,7 @@ fn run_daemon_mode(args: &[String]) {
         id_server,
         relay_server,
         key,
+        connect_timeout,
         timeout,
     )) {
         eprintln!("daemon error: {e}");

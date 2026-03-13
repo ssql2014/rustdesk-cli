@@ -46,6 +46,8 @@
 | Screenshot capture is exposed as top-level `Message::ScreenshotRequest` / `Message::ScreenshotResponse`, not a `Misc` variant | The real capture path should send a screenshot request on the encrypted stream and wait for the matching `sid` in the response loop |
 | The current daemon UDS protocol is JSON-line only, so screenshot bytes cannot cross it as raw binary | The smallest compatible end-to-end capture path is to base64-encode screenshot bytes in daemon `SessionResponse.data` and let the CLI decode them before writing to file/stdout |
 | The current CLI↔daemon UDS protocol only reads a single JSON line per request | Intermediate reconnect status `SessionResponse`s cannot be surfaced to the CLI without a protocol change, so the reconnect helper emits them internally and retries the command before sending the final response |
+| There is no clear post-auth RustDesk “disconnect” message on the encrypted `Message` channel in the current code/proto usage | Graceful daemon shutdown should close the encrypted transport cleanly and remove lock/socket files rather than inventing a protocol message |
+| The public `connect --timeout` flag is already used as connection timeout | To avoid changing that behavior, daemon idle timeout should use a separate internal startup arg (`--timeout` for daemon mode, `--connect-timeout` for internal connect timeout propagation) |
 
 ## Issues Encountered
 | Issue | Resolution |

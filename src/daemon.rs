@@ -19,6 +19,7 @@ use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::capture;
 use crate::connection::{self, ConnectionConfig};
@@ -37,7 +38,7 @@ use crate::transport::{TcpTransport, Transport};
 pub const SOCKET_PATH: &str = "/tmp/rustdesk-cli.sock";
 pub const LOCK_PATH: &str = "/tmp/rustdesk-cli.lock";
 const ERROR_PATH: &str = "/tmp/rustdesk-cli.error";
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const EXEC_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const EXEC_PROMPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const EXEC_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -130,7 +131,7 @@ pub fn spawn_daemon(
         cmd.arg("--key").arg(key);
     }
     if let Some(t) = timeout {
-        cmd.arg("--timeout").arg(t.to_string());
+        cmd.arg("--connect-timeout").arg(t.to_string());
     }
 
     // Detach: redirect stdio so parent can exit
@@ -194,6 +195,7 @@ pub async fn run_daemon(
     id_server: Option<String>,
     relay_server: Option<String>,
     key: Option<String>,
+    connect_timeout: Option<u64>,
     timeout: Option<u64>,
 ) -> Result<()> {
     // Clean up stale socket
@@ -218,7 +220,8 @@ pub async fn run_daemon(
 
     // Real connection: rendezvous → relay → crypto → auth.
     // Timeout prevents hanging on unreachable servers or bad credentials.
-    let timeout_secs = timeout.unwrap_or(30);
+    let timeout_secs = connect_timeout.unwrap_or(30);
+    let idle_timeout = Duration::from_secs(timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT.as_secs()));
     let conn_result = match connect_with_timeout(&config, timeout_secs).await {
         Ok(r) => r,
         Err(ConnectWithTimeoutError::Connect(e)) => {
@@ -280,16 +283,28 @@ pub async fn run_daemon(
     });
 
     let mut last_activity = Instant::now();
+    let mut sigterm = signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("failed to register SIGINT handler")?;
 
     loop {
-        // Accept with idle timeout
         let accept = tokio::time::timeout(
-            IDLE_TIMEOUT.saturating_sub(last_activity.elapsed()),
+            idle_timeout.saturating_sub(last_activity.elapsed()),
             listener.accept(),
         );
 
-        match accept.await {
-            Ok(Ok((stream, _addr))) => {
+        enum DaemonEvent {
+            Accept(std::result::Result<std::result::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr), std::io::Error>, tokio::time::error::Elapsed>),
+            Signal(&'static str),
+        }
+
+        let event = tokio::select! {
+            accept = accept => DaemonEvent::Accept(accept),
+            _ = sigterm.recv() => DaemonEvent::Signal("SIGTERM"),
+            _ = sigint.recv() => DaemonEvent::Signal("SIGINT"),
+        };
+
+        match event {
+            DaemonEvent::Accept(Ok(Ok((stream, _addr)))) => {
                 last_activity = Instant::now();
 
                 let (reader, mut writer) = stream.into_split();
@@ -330,8 +345,7 @@ pub async fn run_daemon(
                                     encrypted = new_conn.encrypted;
                                 }
                                 Err(reconnect_err) => {
-                                    let _ = encrypted.close().await;
-                                    cleanup();
+                                    graceful_shutdown(&mut encrypted).await?;
                                     return Err(reconnect_err);
                                 }
                             }
@@ -364,8 +378,7 @@ pub async fn run_daemon(
                                     "connection lost: {command_err:#}; reconnect failed: {reconnect_err:#}"
                                 ));
                                 let _ = send_response(&mut writer, &resp).await;
-                                let _ = encrypted.close().await;
-                                cleanup();
+                                graceful_shutdown(&mut encrypted).await?;
                                 return Err(reconnect_err);
                             }
                         }
@@ -376,19 +389,22 @@ pub async fn run_daemon(
                 let _ = send_response(&mut writer, &response).await;
 
                 if is_disconnect {
-                    let _ = encrypted.close().await;
-                    cleanup();
+                    graceful_shutdown(&mut encrypted).await?;
                     return Ok(());
                 }
             }
-            Ok(Err(e)) => {
+            DaemonEvent::Accept(Ok(Err(e))) => {
                 eprintln!("daemon: accept error: {e}");
             }
-            Err(_) => {
+            DaemonEvent::Accept(Err(_)) => {
                 // Idle timeout
                 eprintln!("daemon: idle timeout, shutting down");
-                let _ = encrypted.close().await;
-                cleanup();
+                graceful_shutdown(&mut encrypted).await?;
+                return Ok(());
+            }
+            DaemonEvent::Signal(name) => {
+                eprintln!("daemon: received {name}, shutting down");
+                graceful_shutdown(&mut encrypted).await?;
                 return Ok(());
             }
         }
@@ -598,6 +614,7 @@ fn build_connection_config(
         server_key: key.unwrap_or("").to_string(),
         peer_id: peer_id.to_string(),
         password: password.unwrap_or("").to_string(),
+        warmup_secs: 5,
     }
 }
 
@@ -1048,6 +1065,14 @@ fn cleanup() {
     let _ = fs::remove_file(SOCKET_PATH);
     let _ = fs::remove_file(ERROR_PATH);
     LockFile::remove();
+}
+
+async fn graceful_shutdown(
+    encrypted: &mut EncryptedStream<TcpTransport>,
+) -> Result<()> {
+    encrypted.close().await.context("closing encrypted transport")?;
+    cleanup();
+    Ok(())
 }
 
 fn write_startup_error(message: &str) -> Result<()> {

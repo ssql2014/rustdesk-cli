@@ -168,6 +168,31 @@
   - `findings.md` (updated)
   - `progress.md` (updated)
 
+## Session: 2026-03-14 (Daemon Signal Shutdown)
+
+### Phase 1: Discovery
+- **Status:** complete
+- Actions taken:
+  - Reviewed the daemon startup path and confirmed the fixed idle timeout was hard-coded in `src/daemon.rs`.
+  - Verified there is no clear encrypted-session disconnect message currently used after authentication.
+  - Confirmed public `connect --timeout` already means connect timeout, so daemon idle timeout needed to remain an internal argument to avoid breaking CLI semantics.
+- Files created/modified:
+  - `findings.md` (updated)
+
+### Phase 2: Implementation
+- **Status:** complete
+- Actions taken:
+  - Added SIGTERM/SIGINT handling via `tokio::signal::unix`.
+  - Added graceful daemon shutdown that closes the encrypted transport and removes socket/lock/error files.
+  - Wired a configurable daemon idle timeout into the existing accept loop with `tokio::select!`.
+  - Split internal daemon args into `--connect-timeout` and daemon `--timeout` so connect timeout semantics stay intact.
+  - Ran `cargo test` successfully.
+- Files created/modified:
+  - `src/daemon.rs` (updated)
+  - `src/main.rs` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
 ### Phase 4: Testing & Verification
 - **Status:** complete
 - Actions taken:

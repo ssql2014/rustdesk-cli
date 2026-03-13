@@ -121,6 +121,31 @@
   - `Cargo.toml` (updated)
   - `tests/cli_test.rs` (created)
 
+## Session: 2026-03-14 (Real Screenshot Capture)
+
+### Phase 1: Requirements & Discovery
+- **Status:** complete
+- **Started:** 2026-03-14
+- Actions taken:
+  - Read `proto/message.proto` to identify the exact screenshot protobufs.
+  - Inspected `src/main.rs`, `src/daemon.rs`, and `src/text_session.rs` to find the current stubbed capture path and encrypted stream ownership.
+- Files created/modified:
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 2: Implementation
+- **Status:** complete
+- Actions taken:
+  - Added `src/capture.rs` with `ScreenshotRequest`/`ScreenshotResponse` send/receive helpers, output writing, and base64 helpers.
+  - Wired daemon `Capture` handling through the new module and updated the CLI capture branch to decode and save/write real bytes.
+  - Ran `cargo build` and fixed the leftover unused import warning in `src/main.rs`.
+- Files created/modified:
+  - `src/capture.rs` (created)
+  - `src/daemon.rs` (updated)
+  - `src/main.rs` (updated)
+  - `task_plan.md` (updated)
+  - `progress.md` (updated)
+
 ### Phase 4: Testing & Verification
 - **Status:** complete
 - Actions taken:

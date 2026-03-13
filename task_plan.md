@@ -4,7 +4,7 @@
 Lock down the `rustdesk-cli` CLI contract with integration tests that verify help output, JSON responses, batch mode, exit codes, and `--region` parsing against the current stubbed implementation.
 
 ## Current Phase
-Phase 5
+Phase 2: Real Screenshot Capture
 
 ## Phases
 ### Phase 1: Requirements & Discovery
@@ -60,6 +60,25 @@ Phase 5
 ## Notes
 - Re-read this plan before major decisions.
 - Keep `DESIGN.md` as the source of truth for output format and flags.
+
+## 2026-03-14 Real Screenshot Capture
+
+### Goal
+Replace the stubbed capture path with real `ScreenshotRequest` / `ScreenshotResponse` handling over the encrypted RustDesk stream and keep the existing CLI/daemon shape compiling.
+
+### Phases
+#### Phase 1: Discovery
+- [x] Read `proto/message.proto` for the exact screenshot protobufs
+- [x] Inspect current capture handling in `src/main.rs` and `src/daemon.rs`
+- [x] Confirm how encrypted stream helpers are structured in `src/terminal.rs`
+- **Status:** complete
+
+#### Phase 2: Implementation
+- [x] Add `src/capture.rs` with screenshot send/receive helpers
+- [x] Wire daemon capture handling through the new module
+- [x] Update CLI capture handling to consume real image bytes
+- [x] Run `cargo build`
+- **Status:** complete
 
 ## 2026-03-14 Unit Test Expansion
 

@@ -793,6 +793,37 @@ The `rustdesk-cli` connection hangs because it uses the correct license key from
 2.  Potentially send a `TestNatRequest` or `OnlineRequest` to establish "presence".
 3.  Include the `udp_port` (local bound port) in the `PunchHoleRequest`.
 
-### 4. Recommendation for implementation
-To unblock development, the client should implement a **heartbeat loop** immediately after registration. Additionally, the `RendezvousClient` should be updated to use `recv_from` rather than `recv` to better handle potential source-port variations from complex NAT/firewall setups.
+---
+
+## 25. Rendezvous Heartbeat Mechanism
+
+To maintain an "Online" status on the signaling server (`hbbs`) and keep NAT mappings alive, the client must implement a periodic heartbeat loop.
+
+### 1. Heartbeat Message Types
+RustDesk does not use a dedicated "Ping" message. Instead, it periodically re-sends registration messages:
+- **`RegisterPeer`**: The primary heartbeat message. It announces the client's ID and current socket address.
+- **`RegisterPk`**: Used as a heartbeat if the encryption keys have not been confirmed or if the server explicitly requested a public key in a previous `RegisterPeerResponse`.
+
+### 2. Heartbeat Interval
+- **Default**: The standard interval is **30 seconds** (`REG_INTERVAL`).
+- **Dynamic Override**: The server can specify a custom keep-alive interval in the **`keep_alive`** field of the `RegisterPkResponse`. The client should honor this value (usually in seconds) if it is greater than 0.
+- **NAT Persistence**: For clients behind aggressive NATs, a shorter interval (e.g., 10-15 seconds) may be necessary to prevent the UDP port mapping from expiring.
+
+### 3. Server Responses
+The server acknowledges heartbeats with the corresponding response variant:
+- **`RegisterPeerResponse`**: May contain `request_pk: true`, indicating the client must switch to `RegisterPk`.
+- **`RegisterPkResponse`**: Returns the registration result (`OK`, `UUID_MISMATCH`, etc.) and the updated `keep_alive` interval.
+- **Failure to Respond**: If the client misses 3 consecutive responses, it should consider the connection lost and attempt to re-bind the socket.
+
+### 4. Role in Connection Flow
+The heartbeat loop is critical for unblocking **Phase 1 (Rendezvous)**:
+1.  **Initial Registration**: Client sends `RegisterPk`.
+2.  **State Establishment**: Server marks client as "Online".
+3.  **Maintenance**: Heartbeat loop starts in the background.
+4.  **Authorized Requests**: Only when the server sees an active, heartbeating session will it respond to `PunchHoleRequest` with the correct license key. (See **Section 24** for details on "Selective Silence").
+
+### 5. Other Keep-alive Related Messages
+- **`TestNatRequest`**: Occasionally sent to verify if the NAT type has changed.
+- **`OnlineRequest`**: Used by the client to check the status of peers in its address book; receiving an `OnlineResponse` also serves as proof of server reachability.
+- **`PunchHoleSent`**: Not a heartbeat; it is a signaling message sent by the *target* peer to notify `hbbs` that it has started its side of the hole-punching attempt.
 

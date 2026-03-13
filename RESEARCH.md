@@ -346,3 +346,70 @@ To save a decoded frame as a PNG in the CLI client:
 3.  **Encoding**: Use a Rust crate like `png` or `image` to encode the raw RGBA buffer into a PNG file.
     *   **Note**: Since RustDesk is "P2P-first," the client must wait for a **Keyframe** (I-frame) before it can successfully decode and display the first image. Subsequent delta frames require the previous state.
 
+---
+
+## 12. Relay Binding & Session Handshake
+
+When a direct P2P connection fails, the client must use the relay server (`hbbr`) and perform a cryptographic handshake to establish an end-to-end encrypted (E2EE) session.
+
+### Relay Binding Sequence (`hbbr`)
+The relay server acts as a transparent bridge. The "binding" ensures that the Controller and Controlled sides are connected to the same session.
+
+1.  **Transport**: Connect via TCP to `hbbr` (default port 21117).
+2.  **Framing**: All messages are prefixed with a 4-byte little-endian length header.
+3.  **Binding Message**: The client sends a `RendezvousMessage` containing a `RequestRelay` sub-message.
+    *   `uuid`: The unique session ID provided by `hbbs` in the `RelayResponse`.
+    *   `id`: The target peer's ID.
+    *   `token`: The relay token provided by `hbbs`.
+4.  **Verification**: If the `uuid` is valid and the peer has also connected, `hbbr` binds the two sockets and starts forwarding raw bytes.
+
+### Secure Channel Handshake (NaCl Phase 2)
+Once a transport (Direct or Relay) is established, the E2EE tunnel is initialized.
+
+1.  **Identity Exchange**:
+    *   **Host → Client**: Sends a `Message` containing `SignedId` (Host's ID and Ed25519 Public Key).
+    *   **Verification**: The client verifies the signature using the server's long-term public key (the "Key" string from settings).
+2.  **Key Exchange**:
+    *   **Client**: Generates an ephemeral Curve25519 key pair and a random 32-byte symmetric **Session Key**.
+    *   **Client → Host**: Sends a `Message` containing `PublicKey`.
+        *   `asymmetric_value`: Client's ephemeral public key (bytes).
+        *   `symmetric_value`: The Session Key encrypted using NaCl `box_seal` (Host's PK, Client's SK, zeroed nonce).
+3.  **Session Encryption**:
+    *   From this point forward, every `Message` is encrypted using NaCl `secretbox` with the established Session Key.
+    *   **Nonce**: 24 bytes (First 8 bytes = sequence number (u64, LE), remaining 16 bytes = 0).
+
+### Authentication (Phase 3)
+1.  **Challenge**: Host sends an encrypted `Hash` message containing a `salt` and a `challenge` string.
+2.  **Login**: Client sends an encrypted `LoginRequest`.
+    *   `password`: `SHA256(SHA256(plaintext_pw + salt) + challenge)`.
+    *   `my_id`: Client ID.
+    *   `session_id`: Random `u64`.
+3.  **Session Start**: Host responds with an encrypted `LoginResponse` containing `PeerInfo` (displays, resolution, features).
+
+---
+
+## 13. TCP Hole Punching Sequence
+
+In environments where UDP is restricted, RustDesk attempts TCP hole punching to establish a direct P2P connection before falling back to a relay.
+
+### Coordinated Simultaneous Open
+TCP hole punching relies on both peers attempting to connect to each other at the same time using the same local port that was used to communicate with the rendezvous server (`hbbs`).
+
+1.  **Socket Binding**: The client must bind its local TCP socket to the same local port used for its UDP registration/discovery. This requires setting `SO_REUSEADDR` and `SO_REUSEPORT` on the socket before calling `connect`.
+2.  **Signaling**:
+    *   **Client A → `hbbs` (`PunchHoleRequest`)**: Request a connection to Peer B.
+    *   **`hbbs` → Peer B (`PunchHole`)**: Forward the request with Peer A's public address.
+    *   **Peer B → `hbbs` (`PunchHoleSent`)**: Peer B starts its `connect` attempt to Peer A and notifies the server.
+    *   **`hbbs` → Client A (`PunchHoleResponse`)**: Server provides Peer B's public address to Client A.
+3.  **Simultaneous Connect**:
+    *   Both peers call `connect()` to each other's public IP:port.
+    *   If the NAT devices are endpoint-independent (Full Cone or Restricted), the outgoing SYN from Peer A will "punch" a hole that allows Peer B's incoming SYN to pass through, and vice versa.
+4.  **Simultaneous Open**: The TCP stack on both sides sees a SYN followed by an incoming SYN, transitioning directly to the `ESTABLISHED` state via a "simultaneous open" handshake (SYN → SYN+ACK).
+
+### Intranet Optimization (`FetchLocalAddr`)
+If both peers are on the same local network, `hbbs` will detect this and facilitate a direct LAN connection.
+1.  **`hbbs` → Peer B (`FetchLocalAddr`)**: Server asks for B's internal IP.
+2.  **Peer B → `hbbs` (`LocalAddr`)**: B provides its local IP (e.g., `192.168.1.50`).
+3.  **`hbbs` → Client A (`LocalAddr`)**: Server provides B's local IP to A.
+4.  **Direct Connect**: Client A attempts a standard TCP connection to Peer B's local IP, bypassing NAT traversal entirely.
+

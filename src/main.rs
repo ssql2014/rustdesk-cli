@@ -18,6 +18,7 @@ mod terminal;
 mod text_session;
 #[allow(dead_code)]
 mod transport;
+mod version;
 mod session;
 
 use std::{process, str::FromStr};
@@ -38,6 +39,7 @@ const DEFAULT_HEIGHT: i32 = 1080;
 #[derive(Parser)]
 #[command(name = "rustdesk-cli")]
 #[command(about = "Command-line RustDesk client for AI agents")]
+#[command(version = crate::version::VERSION)]
 struct Cli {
     /// Emit machine-readable JSON output
     #[arg(long, global = true)]

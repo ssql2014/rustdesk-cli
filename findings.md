@@ -24,6 +24,8 @@
 | Stub `status` as disconnected and other commands as successful placeholders | Avoids inventing fake persistent state while preserving the designed output contract |
 | Use helper functions in tests to parse stdout into `serde_json::Value` | Keeps repeated assertions compact and readable |
 | Put the new session/protocol unit tests inside `src/session.rs` and `src/protocol.rs` | This crate has no `lib.rs`, so inline unit tests keep private APIs directly testable |
+| Represent drag as press, move-with-button-held, then release | This matches the `drag` contract in `DESIGN.md` while staying within the existing `MouseEvent` shape |
+| Represent scroll as repeated mouse wheel press/release pairs based on `delta` sign and magnitude | The current protocol only has `mask` and `is_move`, so repeated wheel masks are the simplest compatible encoding |
 
 ## Issues Encountered
 | Issue | Resolution |

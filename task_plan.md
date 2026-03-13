@@ -83,3 +83,28 @@ Add focused unit tests for session state transitions and protocol helpers, then 
 - [x] Fix any compile/test failures
 - [x] Confirm both unit and integration suites pass
 - **Status:** complete
+
+## 2026-03-14 Drag And Scroll Session Commands
+
+### Goal
+Add session-layer drag and scroll commands that emit the expected mouse protocol messages, then verify they pass with the existing unit and integration coverage.
+
+### Phases
+#### Phase 1: Discovery
+- [x] Read `src/session.rs`
+- [x] Read `src/protocol.rs`
+- [x] Read `DESIGN.md`
+- [x] Confirm where `SessionCommand` is used
+- **Status:** complete
+
+#### Phase 2: Implementation
+- [x] Add `Drag` and `Scroll` to `SessionCommand`
+- [x] Add scroll mask constants to `MouseEvent`
+- [x] Implement drag and scroll dispatch behavior
+- [x] Add unit tests for the new commands
+- **Status:** complete
+
+#### Phase 3: Verification
+- [x] Run `cargo test`
+- [x] Confirm unit and integration suites still pass
+- **Status:** complete

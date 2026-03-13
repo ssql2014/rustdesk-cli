@@ -202,3 +202,45 @@
 | Session unit tests | `cargo test session::tests` | New session tests compile and pass | 7 session tests passed | ✓ |
 | Protocol unit tests | `cargo test protocol::tests` | New protocol tests compile and pass | 3 protocol tests passed | ✓ |
 | Full crate test suite | `cargo test` | Unit + integration tests all pass | 25 tests passed | ✓ |
+
+## Session: 2026-03-14 (Drag And Scroll Session Commands)
+
+### Phase 1: Requirements & Discovery
+- **Status:** complete
+- **Started:** 2026-03-14 00:22
+- Actions taken:
+  - Read `src/session.rs`, `src/protocol.rs`, and the relevant `DESIGN.md` input-control sections.
+  - Confirmed `SessionCommand` is consumed by the daemon and that inline unit tests remain the right place for session-layer verification.
+- Files created/modified:
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 2: Implementation
+- **Status:** complete
+- Actions taken:
+  - Added `Drag` and `Scroll` to `SessionCommand`.
+  - Added `MouseEvent::SCROLL_UP` and `MouseEvent::SCROLL_DOWN`.
+  - Implemented drag as press, move-with-button-held, and release.
+  - Implemented scroll as repeated wheel press/release pairs driven by `delta`.
+  - Added unit tests for drag and scroll and extended the disconnected-command coverage to include both.
+- Files created/modified:
+  - `src/session.rs` (updated)
+  - `src/protocol.rs` (updated)
+
+### Phase 3: Testing & Verification
+- **Status:** complete
+- Actions taken:
+  - Ran `cargo test`.
+  - Verified all 12 unit tests and 15 integration tests pass.
+- Files created/modified:
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+## Test Results (Drag And Scroll Session Commands)
+| Test | Input | Expected | Actual | Status |
+|------|-------|----------|--------|--------|
+| Drag session unit test | `cargo test session::tests::drag_generates_press_move_release_sequence` | Drag emits press, move, release messages | Passed | ✓ |
+| Scroll session unit test | `cargo test session::tests::scroll_generates_scroll_up_events_for_positive_delta` | Scroll emits repeated wheel events for positive delta | Passed | ✓ |
+| Full crate test suite | `cargo test` | All unit and integration tests pass | 27 tests passed | ✓ |

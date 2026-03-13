@@ -132,18 +132,32 @@ pub async fn open_terminal<T: Transport>(
     }
 }
 
+/// Compression threshold: payloads larger than this are zstd-compressed.
+const COMPRESS_THRESHOLD: usize = 1024;
+
 /// Send stdin data to the remote terminal.
+///
+/// Payloads exceeding [`COMPRESS_THRESHOLD`] bytes are zstd-compressed
+/// (level 3) and sent with `compressed: true`.
 pub async fn send_terminal_data<T: Transport>(
     stream: &mut EncryptedStream<T>,
     terminal_id: i32,
     data: &[u8],
 ) -> Result<()> {
+    let (payload, compressed) = if data.len() > COMPRESS_THRESHOLD {
+        let compressed_data =
+            zstd::encode_all(data, 3).context("zstd compression failed")?;
+        (compressed_data, true)
+    } else {
+        (data.to_vec(), false)
+    };
+
     send_action(
         stream,
         terminal_action::Union::Data(TerminalData {
             terminal_id,
-            data: data.to_vec(),
-            compressed: false,
+            data: payload,
+            compressed,
         }),
     )
     .await
@@ -159,7 +173,15 @@ pub async fn recv_terminal_data<T: Transport>(
         .context("receiving terminal data")?;
 
     match resp {
-        terminal_response::Union::Data(td) => Ok(TerminalEvent::Data(td.data)),
+        terminal_response::Union::Data(td) => {
+            let data = if td.compressed {
+                zstd::decode_all(td.data.as_slice())
+                    .context("zstd decompression of terminal data failed")?
+            } else {
+                td.data
+            };
+            Ok(TerminalEvent::Data(data))
+        }
         terminal_response::Union::Closed(c) => Ok(TerminalEvent::Closed {
             exit_code: c.exit_code,
         }),
@@ -578,6 +600,102 @@ mod tests {
         match event {
             TerminalEvent::Data(data) => assert_eq!(data, b"hello"),
             other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn small_payload_is_not_compressed() {
+        let (ct, st) = DuplexTransport::pair();
+        let key = [44u8; 32];
+        let mut client = EncryptedStream::new(ct, &key);
+        let mut server = EncryptedStream::new(st, &key);
+
+        let small_data = b"short payload";
+
+        let client_task = tokio::spawn(async move {
+            send_terminal_data(&mut client, 1, small_data).await.unwrap();
+            client
+        });
+
+        let server_task = tokio::spawn(async move {
+            let msg = recv_msg(&mut server).await.unwrap();
+            let action = match msg.union {
+                Some(message::Union::TerminalAction(ta)) => ta.union.unwrap(),
+                other => panic!("expected TerminalAction, got {other:?}"),
+            };
+            match action {
+                terminal_action::Union::Data(td) => {
+                    assert!(!td.compressed, "small payload should not be compressed");
+                    assert_eq!(td.data, small_data);
+                }
+                other => panic!("expected Data, got {other:?}"),
+            }
+            server
+        });
+
+        let _client = client_task.await.unwrap();
+        let _server = server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_payload_is_compressed_and_roundtrips() {
+        let (ct, st) = DuplexTransport::pair();
+        let key = [77u8; 32];
+        let mut client = EncryptedStream::new(ct, &key);
+        let mut server = EncryptedStream::new(st, &key);
+
+        // Create a payload larger than COMPRESS_THRESHOLD (1024 bytes).
+        let large_data: Vec<u8> = (0..2048).map(|i| (i % 256) as u8).collect();
+        let large_clone = large_data.clone();
+        let server_expected_len = large_data.len();
+
+        // Client sends large data; server verifies compressed flag and
+        // sends it back as a compressed TerminalResponse so client can
+        // verify decompression round-trip.
+        let client_task = tokio::spawn(async move {
+            send_terminal_data(&mut client, 1, &large_data).await.unwrap();
+            let event = recv_terminal_data(&mut client).await.unwrap();
+            (event, client)
+        });
+
+        let server_task = tokio::spawn(async move {
+            let msg = recv_msg(&mut server).await.unwrap();
+            let action = match msg.union {
+                Some(message::Union::TerminalAction(ta)) => ta.union.unwrap(),
+                other => panic!("expected TerminalAction, got {other:?}"),
+            };
+            let (wire_data, was_compressed) = match action {
+                terminal_action::Union::Data(td) => {
+                    assert!(td.compressed, "large payload should be compressed");
+                    assert!(
+                        td.data.len() < server_expected_len,
+                        "compressed data should be smaller: {} vs {}",
+                        td.data.len(),
+                        server_expected_len,
+                    );
+                    (td.data, td.compressed)
+                }
+                other => panic!("expected Data, got {other:?}"),
+            };
+
+            // Echo back as a compressed TerminalResponse.
+            let resp = terminal_response_msg(terminal_response::Union::Data(TerminalData {
+                terminal_id: 1,
+                data: wire_data,
+                compressed: was_compressed,
+            }));
+            send_msg(&mut server, &resp).await.unwrap();
+            server
+        });
+
+        let (event, _client) = client_task.await.unwrap();
+        let _server = server_task.await.unwrap();
+
+        match event {
+            TerminalEvent::Data(data) => {
+                assert_eq!(data, large_clone, "decompressed data should match original");
+            }
+            other => panic!("expected Data event, got {other:?}"),
         }
     }
 }

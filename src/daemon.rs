@@ -89,6 +89,7 @@ pub fn spawn_daemon(
     id_server: Option<&str>,
     relay_server: Option<&str>,
     key: Option<&str>,
+    timeout: Option<u64>,
 ) -> Result<()> {
     if is_daemon_running() {
         anyhow::bail!("Daemon already running. Disconnect first, or use other commands.");
@@ -118,6 +119,9 @@ pub fn spawn_daemon(
     if let Some(key) = key {
         cmd.arg("--key").arg(key);
     }
+    if let Some(t) = timeout {
+        cmd.arg("--timeout").arg(t.to_string());
+    }
 
     // Detach: redirect stdio so parent can exit
     cmd.stdin(std::process::Stdio::null())
@@ -126,15 +130,19 @@ pub fn spawn_daemon(
 
     cmd.spawn().context("Failed to spawn daemon process")?;
 
-    // Wait briefly for the daemon to create its lock file
-    for _ in 0..50 {
+    // Wait for the daemon to create its lock file.
+    // Lock file is written AFTER connect_to_peer succeeds, so we need
+    // to wait at least as long as the connection timeout plus margin.
+    let wait_secs = timeout.unwrap_or(30) + 5;
+    let wait_iters = (wait_secs * 10) as usize; // 100ms per iteration
+    for _ in 0..wait_iters {
         if Path::new(LOCK_PATH).exists() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    anyhow::bail!("Daemon started but lock file not created within 5 seconds")
+    anyhow::bail!("Daemon started but lock file not created within {wait_secs} seconds")
 }
 
 /// Send a command to the running daemon and return the response.
@@ -169,6 +177,7 @@ pub async fn run_daemon(
     id_server: Option<String>,
     relay_server: Option<String>,
     key: Option<String>,
+    timeout: Option<u64>,
 ) -> Result<()> {
     // Clean up stale socket
     let _ = fs::remove_file(SOCKET_PATH);
@@ -178,9 +187,6 @@ pub async fn run_daemon(
 
     // Set socket permissions to owner-only
     fs::set_permissions(SOCKET_PATH, fs::Permissions::from_mode(0o600))?;
-
-    // Write lock file
-    LockFile::write(SOCKET_PATH)?;
 
     // Build connection config from daemon arguments.
     let config = build_connection_config(
@@ -193,14 +199,30 @@ pub async fn run_daemon(
     );
 
     // Real connection: rendezvous → relay → crypto → auth.
-    let conn_result = match connection::connect_to_peer(&config).await {
-        Ok(r) => r,
-        Err(e) => {
+    // Timeout prevents hanging on unreachable servers or bad credentials.
+    let timeout_secs = timeout.unwrap_or(30);
+    let conn_result = match tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        connection::connect_to_peer(&config),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             eprintln!("daemon: connect failed: {e:#}");
             cleanup();
             return Ok(());
         }
+        Err(_) => {
+            eprintln!("daemon: connect timed out after {timeout_secs}s");
+            cleanup();
+            return Ok(());
+        }
     };
+
+    // Lock file signals readiness — written AFTER auth succeeds so the
+    // CLI won't see "connected" until the peer is actually reachable.
+    LockFile::write(SOCKET_PATH)?;
 
     let mut encrypted = conn_result.encrypted;
     let peer_info = conn_result.peer_info;

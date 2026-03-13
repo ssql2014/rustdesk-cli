@@ -302,6 +302,7 @@ fn run_daemon_mode(args: &[String]) {
     let id_server = daemon_arg_value(args, "--id-server");
     let relay_server = daemon_arg_value(args, "--relay-server");
     let key = daemon_arg_value(args, "--key");
+    let timeout = daemon_arg_value(args, "--timeout").and_then(|s| s.parse::<u64>().ok());
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     if let Err(e) = rt.block_on(daemon::run_daemon(
         peer_id,
@@ -310,6 +311,7 @@ fn run_daemon_mode(args: &[String]) {
         id_server,
         relay_server,
         key,
+        timeout,
     )) {
         eprintln!("daemon error: {e}");
         process::exit(1);
@@ -333,7 +335,7 @@ fn run() -> i32 {
             id_server,
             relay_server,
             key,
-            timeout: _,
+            timeout,
         } => match daemon::spawn_daemon(
             &id,
             password.as_deref(),
@@ -341,6 +343,7 @@ fn run() -> i32 {
             id_server.as_deref(),
             relay_server.as_deref(),
             key.as_deref(),
+            Some(timeout),
         ) {
             Ok(()) => emit_response(cli.json, connect_response(&id, server.as_deref())),
             Err(e) => emit_response(

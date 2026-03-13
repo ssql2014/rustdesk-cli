@@ -350,10 +350,19 @@ fn run() -> i32 {
         },
         Commands::Disconnect => {
             let was_connected = daemon::is_daemon_running();
-            if was_connected {
-                let _ = send_to_daemon(&SessionCommand::Disconnect);
+            if !was_connected {
+                return emit_response(
+                    cli.json,
+                    error_response(
+                        "disconnect",
+                        "session_error",
+                        "No active session",
+                        2,
+                    ),
+                );
             }
-            emit_response(cli.json, disconnect_response(was_connected))
+            let _ = send_to_daemon(&SessionCommand::Disconnect);
+            emit_response(cli.json, disconnect_response(true))
         }
         Commands::Shell => match send_to_daemon(&SessionCommand::Shell) {
             Ok(resp) if resp.success => emit_response(cli.json, shell_response()),
@@ -679,21 +688,35 @@ fn error_response(command: &str, code: &str, message: &str, exit_code: i32) -> R
 }
 
 fn emit_response(json_mode: bool, response: Response) -> i32 {
+    let is_error = response.exit_code != EXIT_SUCCESS;
+
     if json_mode {
-        println!("{}", serde_json::to_string(&response.json).expect("serialize response"));
+        let rendered = serde_json::to_string(&response.json).expect("serialize response");
+        println!("{rendered}");
     } else if !response.text.is_empty() {
-        println!("{}", response.text);
+        if is_error {
+            eprintln!("{}", response.text);
+        } else {
+            println!("{}", response.text);
+        }
     }
 
     response.exit_code
 }
 
 fn emit_batch_response(json_mode: bool, response: BatchResponse) -> i32 {
+    let is_error = response.exit_code != EXIT_SUCCESS;
+
     if json_mode {
-        println!("{}", serde_json::to_string(&response.json).expect("serialize batch response"));
+        let rendered = serde_json::to_string(&response.json).expect("serialize batch response");
+        println!("{rendered}");
     } else {
         for line in response.lines {
-            println!("{line}");
+            if is_error {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
         }
     }
 

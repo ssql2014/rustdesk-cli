@@ -60,12 +60,12 @@ fn json_connect_produces_valid_json() {
 
 #[test]
 fn json_disconnect_matches_contract() {
-    let value = run_json(&["--json", "disconnect"]);
+    // With no active session, disconnect returns session_error (exit 2)
+    let value = run_json_any_exit(&["--json", "disconnect"]);
 
-    assert_eq!(value["ok"], true);
+    assert_eq!(value["ok"], false);
     assert_eq!(value["command"], "disconnect");
-    // was_connected depends on daemon state
-    assert!(value["was_connected"].is_boolean());
+    assert_eq!(value["error"]["code"], "session_error");
 }
 
 #[test]
@@ -239,8 +239,9 @@ fn json_do_matches_contract() {
 
 #[test]
 fn commands_without_daemon_exit_correctly() {
-    // disconnect and status always exit 0 (idempotent / always succeeds)
-    bin().args(["disconnect"]).assert().code(0);
+    // disconnect with no session returns exit 2 (session error per SPEC)
+    bin().args(["disconnect"]).assert().code(2);
+    // status always exit 0 (idempotent / always succeeds)
     bin().args(["status"]).assert().code(0);
     // batch 'do' uses stubs
     bin()

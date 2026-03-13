@@ -149,17 +149,23 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
             }
         };
 
-        // Request relay — always needed (we don't do direct P2P).
+        // Request relay (10s timeout to avoid hanging forever when peer is offline).
         let relay_target = relay_hint.as_deref().unwrap_or(&config.relay_server);
-        let relay_response = client
-            .request_relay_for(
+        let relay_response = tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            client.request_relay_for(
                 &config.peer_id,
                 relay_target,
                 &socket_hint,
                 &config.server_key,
-            )
-            .await
-            .context("RequestRelay failed")?;
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!(
+            "RequestRelay timed out — peer {} may be offline or unreachable",
+            config.peer_id
+        ))?
+        .context("RequestRelay failed")?;
 
         let uuid = relay_response.uuid;
         let relay_addr = if relay_response.relay_server.is_empty() {

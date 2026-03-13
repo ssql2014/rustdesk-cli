@@ -62,7 +62,7 @@ where
 {
     pub async fn send(&mut self, msg: &[u8]) -> Result<()> {
         let len = u32::try_from(msg.len())?;
-        self.stream.write_all(&len.to_be_bytes()).await?;
+        self.stream.write_all(&len.to_le_bytes()).await?;
         self.stream.write_all(msg).await?;
         self.stream.flush().await?;
         Ok(())
@@ -71,7 +71,7 @@ where
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         let mut header = [0_u8; 4];
         self.stream.read_exact(&mut header).await?;
-        let len = u32::from_be_bytes(header) as usize;
+        let len = u32::from_le_bytes(header) as usize;
 
         let mut payload = vec![0_u8; len];
         self.stream.read_exact(&mut payload).await?;

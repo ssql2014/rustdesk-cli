@@ -50,8 +50,19 @@ impl RendezvousClient {
             })),
         };
 
-        match self.send_request(&request).await?.union {
-            Some(rendezvous_message::Union::RegisterPeerResponse(response)) => Ok(response),
+        // Use direct send+recv (not send_request) because the expected
+        // RegisterPeerResponse is the same type that send_request skips
+        // when filtering heartbeat noise.
+        let mut buf = Vec::new();
+        request.encode(&mut buf)?;
+        self.socket.send(&buf).await?;
+
+        let mut recv_buf = vec![0_u8; 4096];
+        let size = self.socket.recv(&mut recv_buf).await?;
+        let response = RendezvousMessage::decode(&recv_buf[..size])?;
+
+        match response.union {
+            Some(rendezvous_message::Union::RegisterPeerResponse(r)) => Ok(r),
             other => bail!("unexpected rendezvous response to RegisterPeer: {other:?}"),
         }
     }
@@ -131,22 +142,46 @@ impl RendezvousClient {
         }
     }
 
+    /// Send raw bytes on the UDP socket (for diagnostics / manual protocol).
+    pub async fn raw_send(&self, buf: &[u8]) -> Result<()> {
+        self.socket.send(buf).await?;
+        Ok(())
+    }
+
+    /// Receive raw bytes from the UDP socket (for diagnostics / manual protocol).
+    pub async fn raw_recv(&self, buf: &mut [u8]) -> Result<usize> {
+        let size = self.socket.recv(buf).await?;
+        Ok(size)
+    }
+
     async fn send_request(&self, message: &RendezvousMessage) -> Result<RendezvousMessage> {
         let mut buf = Vec::new();
         message.encode(&mut buf)?;
         self.socket.send(&buf).await?;
 
+        // Loop to skip RegisterPeerResponse messages that may arrive from
+        // the background heartbeat task sharing this socket.
         let mut recv_buf = vec![0_u8; 4096];
-        let size = self.socket.recv(&mut recv_buf).await?;
-        Ok(RendezvousMessage::decode(&recv_buf[..size])?)
+        loop {
+            let size = self.socket.recv(&mut recv_buf).await?;
+            let response = RendezvousMessage::decode(&recv_buf[..size])?;
+            if matches!(
+                response.union,
+                Some(rendezvous_message::Union::RegisterPeerResponse(_))
+            ) {
+                continue;
+            }
+            return Ok(response);
+        }
     }
 }
 
 /// Spawn a heartbeat task that sends RegisterPeer at the given interval.
+/// The first message is sent immediately (the interval's instant first tick)
+/// to ensure the server considers the client active before PunchHole.
 fn spawn_heartbeat(socket: Arc<UdpSocket>, id: String, period: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(period);
-        interval.tick().await; // consume the immediate first tick
         loop {
             interval.tick().await;
             let msg = RendezvousMessage {

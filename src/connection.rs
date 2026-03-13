@@ -105,7 +105,10 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
     }
 
     // Start heartbeat to maintain presence on the rendezvous server.
+    // The first heartbeat fires immediately; yield to let it send before
+    // we proceed with PunchHole.
     let heartbeat = client.start_heartbeat(&my_id);
+    tokio::task::yield_now().await;
 
     // Wrap remaining discovery in an async block so we always abort the
     // heartbeat, even on error paths.

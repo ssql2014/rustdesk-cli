@@ -25,7 +25,7 @@ use crate::capture;
 use crate::connection::{self, ConnectionConfig};
 use crate::crypto::EncryptedStream;
 use crate::proto::hbb::{
-    CaptureDisplays, ImageQuality, Message, Misc, OptionMessage, TestDelay,
+    CaptureDisplays, ImageQuality, Message, Misc, OptionMessage, SupportedDecoding, TestDelay,
     message, misc, option_message,
 };
 use crate::protocol::DisplayInfo;
@@ -706,27 +706,38 @@ fn build_connection_config(
 }
 
 // ---------------------------------------------------------------------------
-// Internal: OptionMessage for text-mode
+// Internal: OptionMessage for headless/screenshot mode (§30)
 // ---------------------------------------------------------------------------
 
-/// Send `OptionMessage` to configure the remote peer for text-mode:
-/// - `disable_audio = Yes`
+/// Build the `OptionMessage` for headless operation (§30):
+/// - `custom_fps = 0` — disable continuous streaming, on-demand frames only
+/// - `image_quality = Best` (4) — maximum clarity for screenshots
+/// - `disable_audio = Yes` — no audio scraper needed
+/// - `disable_clipboard = Yes` — reduce session complexity
 /// - `disable_camera = Yes`
 /// - `terminal_persistent = Yes`
-/// - `disable_clipboard = No` (explicitly opt-in to clipboard sync)
-/// - `image_quality = Low`
+/// - `supported_decoding` with `ability_vp9 = 1`
+fn build_option_message() -> OptionMessage {
+    OptionMessage {
+        image_quality: ImageQuality::Best as i32,
+        custom_fps: 0,
+        disable_audio: option_message::BoolOption::Yes as i32,
+        disable_clipboard: option_message::BoolOption::Yes as i32,
+        disable_camera: option_message::BoolOption::Yes as i32,
+        terminal_persistent: option_message::BoolOption::Yes as i32,
+        supported_decoding: Some(SupportedDecoding {
+            ability_vp9: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Send the headless `OptionMessage` to the remote peer.
 async fn send_option_message(
     stream: &mut EncryptedStream<TcpTransport>,
 ) -> Result<()> {
-    let opt = OptionMessage {
-        image_quality: ImageQuality::Low as i32,
-        disable_audio: option_message::BoolOption::Yes as i32,
-        disable_clipboard: option_message::BoolOption::No as i32,
-        disable_camera: option_message::BoolOption::Yes as i32,
-        terminal_persistent: option_message::BoolOption::Yes as i32,
-        ..Default::default()
-    };
-
+    let opt = build_option_message();
     let msg = Message {
         union: Some(message::Union::Misc(Misc {
             union: Some(misc::Union::Option(opt)),
@@ -1718,5 +1729,18 @@ mod tests {
 
         let fresh = Instant::now() - Duration::from_secs(5);
         assert!(!is_keepalive_expired(fresh, timeout));
+    }
+
+    #[test]
+    fn build_option_message_headless_config() {
+        let opt = build_option_message();
+        assert_eq!(opt.image_quality, ImageQuality::Best as i32);
+        assert_eq!(opt.custom_fps, 0);
+        assert_eq!(opt.disable_audio, option_message::BoolOption::Yes as i32);
+        assert_eq!(opt.disable_clipboard, option_message::BoolOption::Yes as i32);
+        assert_eq!(opt.disable_camera, option_message::BoolOption::Yes as i32);
+        assert_eq!(opt.terminal_persistent, option_message::BoolOption::Yes as i32);
+        let decoding = opt.supported_decoding.expect("supported_decoding should be set");
+        assert_eq!(decoding.ability_vp9, 1);
     }
 }

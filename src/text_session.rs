@@ -202,7 +202,7 @@ mod tests {
     use super::*;
     use crate::crypto::EncryptedStream;
     use crate::proto::hbb::{
-        TerminalData, TerminalResponse,
+        SupportedDecoding, TerminalData, TerminalResponse,
         terminal_response,
     };
     use crate::transport::FramedTransport;
@@ -268,13 +268,18 @@ mod tests {
         let mut server = EncryptedStream::new(st, &key);
 
         let client_task = tokio::spawn(async move {
-            // We can't call send_option_message directly (it requires TcpTransport),
-            // so test the message construction manually.
+            // Mirror the headless config from daemon::build_option_message (§30).
             let opt = OptionMessage {
-                image_quality: ImageQuality::Low as i32,
+                image_quality: ImageQuality::Best as i32,
+                custom_fps: 0,
                 disable_audio: option_message::BoolOption::Yes as i32,
+                disable_clipboard: option_message::BoolOption::Yes as i32,
                 disable_camera: option_message::BoolOption::Yes as i32,
                 terminal_persistent: option_message::BoolOption::Yes as i32,
+                supported_decoding: Some(SupportedDecoding {
+                    ability_vp9: 1,
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             let msg = Message {
@@ -291,13 +296,17 @@ mod tests {
             match msg.union {
                 Some(message::Union::Misc(misc)) => match misc.union {
                     Some(misc::Union::Option(opt)) => {
+                        assert_eq!(opt.image_quality, ImageQuality::Best as i32);
+                        assert_eq!(opt.custom_fps, 0);
                         assert_eq!(opt.disable_audio, option_message::BoolOption::Yes as i32);
-                        assert_eq!(opt.image_quality, ImageQuality::Low as i32);
+                        assert_eq!(opt.disable_clipboard, option_message::BoolOption::Yes as i32);
                         assert_eq!(opt.disable_camera, option_message::BoolOption::Yes as i32);
                         assert_eq!(
                             opt.terminal_persistent,
                             option_message::BoolOption::Yes as i32
                         );
+                        let decoding = opt.supported_decoding.expect("supported_decoding should be set");
+                        assert_eq!(decoding.ability_vp9, 1);
                     }
                     other => panic!("expected Option, got {other:?}"),
                 },

@@ -175,5 +175,66 @@ If Phase 1 (`PunchHole`) fails (e.g., due to symmetric NAT):
 1.  **Client → `hbbs` (`RequestRelay`)**: Client asks for a relay server.
 2.  **`hbbs` → Client (`RelayResponse`)**: Server provides the `hbbr` address and a unique `uuid` token.
 3.  **Client/Host → `hbbr` (Connection)**: Both parties connect to the relay server using the same `uuid`.
-4.  **`hbbr` (Binding)**: The relay server bridges the two TCP streams.
-5.  **E2EE Tunnel**: The parties perform the same **Phase 2 (NaCl Handshake)** over the relay. `hbbr` only sees encrypted traffic and cannot decrypt it.
+*   **`hbbr` (Binding)**: The relay server bridges the two TCP streams.
+*   **E2EE Tunnel**: The parties perform the same **Phase 2 (NaCl Handshake)** over the relay. `hbbr` only sees encrypted traffic and cannot decrypt it.
+
+---
+
+## 9. Crypto Implementation Details
+
+This section details the specific cryptographic algorithms and message structures used by the RustDesk protocol.
+
+### Password Hashing Algorithm
+Authentication uses a two-stage SHA256 hashing process to verify the password without sending it in plain text.
+
+1.  **Stage 1 (Local Hash)**:
+    `password_bytes = SHA256(password_str + hash_message.salt)`
+2.  **Stage 2 (Handshake Hash)**:
+    `final_hash = SHA256(password_bytes + hash_message.challenge)`
+
+The `final_hash` (32 bytes) is what is sent in the `LoginRequest.password` field.
+
+### Key Conversion (Ed25519 to Curve25519)
+RustDesk uses **Ed25519** for long-term identity and signing, but **Curve25519 (X25519)** for key exchange.
+*   **Sign PK to Box PK**: `sodiumoxide::crypto::sign::ed25519_pk_to_curve25519`
+*   **Sign SK to Box SK**: `sodiumoxide::crypto::sign::ed25519_sk_to_curve25519`
+*   The server's public key (provided as base64 in the "Key" field) is initially an Ed25519 public key. It MUST be converted to a Curve25519 key to decrypt the initial handshake box.
+
+### Ephemeral Key Exchange Flow
+1.  **Peer Hello**: The host sends a `SignedId` message containing its identity and public key.
+2.  **Verification**: The client verifies the signature using the server's long-term public key.
+3.  **Client Key Generation**: The client generates an ephemeral Curve25519 key pair (`box_::gen_keypair`).
+4.  **Symmetric Key Generation**: The client generates a random 32-byte symmetric key (`secretbox::gen_key`).
+5.  **Sealing the Key**:
+    *   The client creates an encrypted "box" using `box_::seal`.
+    *   **Nonce**: A **zeroed nonce** (`[0u8; 24]`) is used for this specific handshake step.
+    *   **Recipient PK**: The host's public key from the `SignedId` message.
+    *   **Sender SK**: The client's ephemeral private key.
+6.  **`PublicKey` Message**: The client sends a message containing:
+    *   `asymmetric_value`: The client's ephemeral public key.
+    *   `symmetric_value`: The sealed (encrypted) symmetric key.
+7.  **Session Key**: The decrypted symmetric key becomes the session key for all subsequent `secretbox` encryption.
+
+### Nonce Strategy for Secretbox
+Once the symmetric session key is established, every packet is encrypted using `secretbox::seal`.
+*   **Nonce Generation**: A 24-byte nonce is used.
+*   **Structure**: The first 8 bytes of the nonce contain the **sequence number** (u64, little-endian). The remaining 16 bytes are zeroed.
+*   **Increment**: There are two separate sequence numbers (counters): one for outgoing (encryption) and one for incoming (decryption). Both start at 0 and are incremented **before** use (the first packet uses sequence `1`).
+
+### Rust Crates Used
+*   **`sodiumoxide`**: Primary crypto library (wrapping libsodium).
+*   **`sha2`**: For SHA256 hashing.
+*   **`prost`**: For Protobuf serialization.
+
+### `LoginRequest` Protobuf Fields
+The following fields are typically populated in a `LoginRequest`:
+*   `username` (1): The ID of the target host.
+*   `password` (2): The `final_hash` computed above (bytes).
+*   `my_id` (4): The client's local ID (e.g., `123456789` or `123456789@rendezvous`).
+*   `my_name` (5): The client's display name.
+*   `my_platform` (13): The client's OS (e.g., `macOS`, `Linux`, `Windows`).
+*   `session_id` (10): A random `u64` session identifier.
+*   `version` (11): The client version string (e.g., `1.3.7`).
+*   `os_login` (12): Optional `OSLogin` sub-message for system-level authentication.
+*   `hwid` (14): Hardware ID (bytes) for "trusted device" features.
+

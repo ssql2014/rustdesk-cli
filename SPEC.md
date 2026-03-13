@@ -1,7 +1,7 @@
 # rustdesk-cli — Product Spec
 
 **Owner:** Ada (PM, Team Evas)
-**Status:** Draft v1
+**Status:** Draft v2 (updated per DESIGN.md)
 **Date:** 2026-03-13
 
 ## Problem
@@ -31,7 +31,8 @@ rustdesk-cli click <x> <y> [--button left|right|middle] [--double]
 rustdesk-cli move <x> <y>
 rustdesk-cli drag <x1> <y1> <x2> <y2>
 rustdesk-cli scroll <x> <y> <delta>
-rustdesk-cli info                          # screen resolution, connection status
+rustdesk-cli status                        # connection state, screen resolution
+rustdesk-cli do <step...>                  # batch mode: chain commands in one invocation
 ```
 
 ### Usage Patterns

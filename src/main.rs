@@ -13,6 +13,8 @@ mod rendezvous;
 #[allow(dead_code)]
 mod terminal;
 #[allow(dead_code)]
+mod text_session;
+#[allow(dead_code)]
 mod transport;
 mod session;
 
@@ -72,6 +74,19 @@ enum Commands {
     },
     /// Disconnect from current peer
     Disconnect,
+    /// Open an interactive remote terminal
+    Shell,
+    /// Execute a command on the remote machine
+    Exec {
+        /// Command to execute remotely
+        #[arg(long)]
+        command: String,
+    },
+    /// Get or set remote clipboard text
+    Clipboard {
+        #[command(subcommand)]
+        command: ClipboardCommands,
+    },
     /// Show connection status
     Status,
     /// Capture a screenshot from the remote display
@@ -134,6 +149,18 @@ enum Commands {
         /// Batch steps, parsed as repeated rustdesk-cli verbs
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         steps: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClipboardCommands {
+    /// Get remote clipboard text
+    Get,
+    /// Set remote clipboard text
+    Set {
+        /// Clipboard text to send
+        #[arg(long)]
+        text: String,
     },
 }
 
@@ -328,6 +355,116 @@ fn run() -> i32 {
             }
             emit_response(cli.json, disconnect_response(was_connected))
         }
+        Commands::Shell => match send_to_daemon(&SessionCommand::Shell) {
+            Ok(resp) if resp.success => emit_response(cli.json, shell_response()),
+            Ok(resp) => emit_response(
+                cli.json,
+                error_response(
+                    "shell",
+                    "connection_error",
+                    resp.message.as_deref().unwrap_or("shell failed"),
+                    EXIT_CONNECTION,
+                ),
+            ),
+            Err(e) => emit_response(
+                cli.json,
+                error_response(
+                    "shell",
+                    "connection_error",
+                    &e.to_string(),
+                    EXIT_CONNECTION,
+                ),
+            ),
+        },
+        Commands::Exec { command } => match send_to_daemon(&SessionCommand::Exec {
+            command: command.clone(),
+        }) {
+            Ok(resp) if resp.success => {
+                let data = resp.data.unwrap_or_else(|| json!({}));
+                let output = data
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stub exec output");
+                let exit_code = data
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32;
+                emit_response(cli.json, exec_response(&command, output, exit_code))
+            }
+            Ok(resp) => emit_response(
+                cli.json,
+                error_response(
+                    "exec",
+                    "connection_error",
+                    resp.message.as_deref().unwrap_or("exec failed"),
+                    EXIT_CONNECTION,
+                ),
+            ),
+            Err(e) => emit_response(
+                cli.json,
+                error_response(
+                    "exec",
+                    "connection_error",
+                    &e.to_string(),
+                    EXIT_CONNECTION,
+                ),
+            ),
+        },
+        Commands::Clipboard { command } => match command {
+            ClipboardCommands::Get => match send_to_daemon(&SessionCommand::ClipboardGet) {
+                Ok(resp) if resp.success => {
+                    let data = resp.data.unwrap_or_else(|| json!({}));
+                    let text = data
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("stub clipboard text");
+                    emit_response(cli.json, clipboard_get_response(text))
+                }
+                Ok(resp) => emit_response(
+                    cli.json,
+                    error_response(
+                        "clipboard",
+                        "connection_error",
+                        resp.message.as_deref().unwrap_or("clipboard get failed"),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "clipboard",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+            },
+            ClipboardCommands::Set { text } => {
+                match send_to_daemon(&SessionCommand::ClipboardSet {
+                    text: text.clone(),
+                }) {
+                    Ok(resp) if resp.success => emit_response(cli.json, clipboard_set_response(&text)),
+                    Ok(resp) => emit_response(
+                        cli.json,
+                        error_response(
+                            "clipboard",
+                            "connection_error",
+                            resp.message.as_deref().unwrap_or("clipboard set failed"),
+                            EXIT_CONNECTION,
+                        ),
+                    ),
+                    Err(e) => emit_response(
+                        cli.json,
+                        error_response(
+                            "clipboard",
+                            "connection_error",
+                            &e.to_string(),
+                            EXIT_CONNECTION,
+                        ),
+                    ),
+                }
+            }
+        },
         Commands::Status => {
             if daemon::is_daemon_running() {
                 match send_to_daemon(&SessionCommand::Status) {
@@ -593,6 +730,61 @@ fn disconnect_response(was_connected: bool) -> Response {
     }
 }
 
+fn shell_response() -> Response {
+    Response {
+        text: "shell mode=interactive".to_string(),
+        json: json!({
+            "ok": true,
+            "command": "shell",
+            "mode": "interactive"
+        }),
+        exit_code: EXIT_SUCCESS,
+    }
+}
+
+fn exec_response(command: &str, output: &str, exit_code: i32) -> Response {
+    Response {
+        text: format!("exec exit_code={exit_code} output={output}"),
+        json: json!({
+            "ok": true,
+            "command": "exec",
+            "requested": command,
+            "output": output,
+            "exit_code": exit_code
+        }),
+        exit_code: EXIT_SUCCESS,
+    }
+}
+
+fn clipboard_get_response(text: &str) -> Response {
+    Response {
+        text: format!("clipboard text={text}"),
+        json: json!({
+            "ok": true,
+            "command": "clipboard",
+            "action": "get",
+            "text": text
+        }),
+        exit_code: EXIT_SUCCESS,
+    }
+}
+
+fn clipboard_set_response(text: &str) -> Response {
+    let chars = text.chars().count();
+
+    Response {
+        text: format!("clipboard_set chars={chars}"),
+        json: json!({
+            "ok": true,
+            "command": "clipboard",
+            "action": "set",
+            "chars": chars,
+            "redacted": true
+        }),
+        exit_code: EXIT_SUCCESS,
+    }
+}
+
 fn status_response() -> Response {
     Response {
         text: "disconnected".to_string(),
@@ -796,6 +988,30 @@ fn step_to_response(step: &BatchStep) -> Response {
             connect_response(id, server)
         }
         "disconnect" => disconnect_response(false),
+        "shell" => shell_response(),
+        "exec" => {
+            let command = flag_value(&step.args, "--command").unwrap_or("");
+            exec_response(command, "stub exec output", 0)
+        }
+        "clipboard" => {
+            let action = first_non_flag_arg(&step.args).unwrap_or("get");
+            match action {
+                "get" => clipboard_get_response("stub clipboard text"),
+                "set" => clipboard_set_response(flag_value(&step.args, "--text").unwrap_or("")),
+                _ => Response {
+                    text: "unknown clipboard action".to_string(),
+                    json: json!({
+                        "ok": false,
+                        "command": "clipboard",
+                        "error": {
+                            "code": "connection_error",
+                            "message": "unknown clipboard action"
+                        }
+                    }),
+                    exit_code: EXIT_CONNECTION,
+                },
+            }
+        }
         "status" => status_response(),
         "capture" => {
             let file = first_non_flag_arg(&step.args).unwrap_or("screenshot.png");
@@ -876,7 +1092,7 @@ fn parse_batch_steps(tokens: &[String]) -> Result<Vec<BatchStep>, String> {
         }
 
         match command.as_str() {
-            "disconnect" | "status" => {
+            "disconnect" | "status" | "shell" => {
                 steps.push(BatchStep {
                     command,
                     args: Vec::new(),
@@ -923,8 +1139,21 @@ fn parse_batch_steps(tokens: &[String]) -> Result<Vec<BatchStep>, String> {
                 steps.push(BatchStep { command, args });
                 index = next_index;
             }
+            "clipboard" => {
+                let (args, next_index) = parse_clipboard_step(tokens, index + 1)?;
+                steps.push(BatchStep { command, args });
+                index = next_index;
+            }
             "connect" => {
                 let (args, next_index) = parse_flagged_step(tokens, index + 1, &["--password", "--server", "--timeout"], 1)?;
+                steps.push(BatchStep { command, args });
+                index = next_index;
+            }
+            "exec" => {
+                let (args, next_index) = parse_flagged_step(tokens, index + 1, &["--command"], 0)?;
+                if flag_value(&args, "--command").is_none() {
+                    return Err("exec requires --command <CMD>".to_string());
+                }
                 steps.push(BatchStep { command, args });
                 index = next_index;
             }
@@ -986,6 +1215,30 @@ fn parse_click_step(tokens: &[String], mut index: usize) -> Result<(Vec<String>,
     Ok((args, index))
 }
 
+fn parse_clipboard_step(tokens: &[String], mut index: usize) -> Result<(Vec<String>, usize), String> {
+    if index >= tokens.len() {
+        return Err("clipboard requires an action".to_string());
+    }
+
+    let action = tokens[index].clone();
+    index += 1;
+
+    match action.as_str() {
+        "get" => Ok((vec![action], index)),
+        "set" => {
+            let (mut args, next_index) = parse_flagged_step(tokens, index, &["--text"], 0)?;
+            if flag_value(&args, "--text").is_none() {
+                return Err("clipboard set requires --text <TEXT>".to_string());
+            }
+
+            let mut full_args = vec![action];
+            full_args.append(&mut args);
+            Ok((full_args, next_index))
+        }
+        _ => Err(format!("unknown clipboard action '{action}'")),
+    }
+}
+
 fn parse_flagged_step(
     tokens: &[String],
     mut index: usize,
@@ -1030,7 +1283,18 @@ fn parse_flagged_step(
 fn is_step_command(token: &str) -> bool {
     matches!(
         token,
-        "connect" | "disconnect" | "status" | "capture" | "type" | "key" | "click" | "move" | "drag"
+        "connect"
+            | "disconnect"
+            | "shell"
+            | "exec"
+            | "clipboard"
+            | "status"
+            | "capture"
+            | "type"
+            | "key"
+            | "click"
+            | "move"
+            | "drag"
     )
 }
 

@@ -42,6 +42,14 @@ pub enum SessionCommand {
         server: Option<String>,
     },
     Disconnect,
+    Shell,
+    Exec {
+        command: String,
+    },
+    ClipboardGet,
+    ClipboardSet {
+        text: String,
+    },
     Capture {
         output: String,
     },
@@ -153,6 +161,61 @@ impl Session {
                 Ok((
                     SessionResponse::ok(format!("Disconnected from {peer_id}")),
                     vec![ProtocolMessage::Disconnect],
+                ))
+            }
+
+            SessionCommand::Shell => {
+                self.require_connected()?;
+                Ok((
+                    SessionResponse::ok_with_data(
+                        "Opened remote shell",
+                        serde_json::json!({
+                            "mode": "interactive",
+                        }),
+                    ),
+                    vec![],
+                ))
+            }
+
+            SessionCommand::Exec { command } => {
+                self.require_connected()?;
+                Ok((
+                    SessionResponse::ok_with_data(
+                        format!("Executed `{command}`"),
+                        serde_json::json!({
+                            "command": command,
+                            "output": "stub exec output",
+                            "exit_code": 0,
+                        }),
+                    ),
+                    vec![],
+                ))
+            }
+
+            SessionCommand::ClipboardGet => {
+                self.require_connected()?;
+                Ok((
+                    SessionResponse::ok_with_data(
+                        "Clipboard text retrieved",
+                        serde_json::json!({
+                            "text": "stub clipboard text",
+                        }),
+                    ),
+                    vec![],
+                ))
+            }
+
+            SessionCommand::ClipboardSet { text } => {
+                self.require_connected()?;
+                Ok((
+                    SessionResponse::ok_with_data(
+                        "Clipboard text updated",
+                        serde_json::json!({
+                            "chars": text.chars().count(),
+                            "redacted": true,
+                        }),
+                    ),
+                    vec![],
                 ))
             }
 
@@ -381,6 +444,80 @@ mod tests {
     }
 
     #[test]
+    fn shell_returns_interactive_mode_payload() {
+        let mut session = connected_session();
+
+        let (response, messages) = session
+            .dispatch(SessionCommand::Shell)
+            .expect("shell should succeed");
+
+        assert!(response.success);
+        assert_eq!(response.message.as_deref(), Some("Opened remote shell"));
+        assert!(messages.is_empty());
+
+        let data = response.data.expect("shell should include data");
+        assert_eq!(data["mode"], serde_json::json!("interactive"));
+    }
+
+    #[test]
+    fn exec_returns_stub_output_payload() {
+        let mut session = connected_session();
+
+        let (response, messages) = session
+            .dispatch(SessionCommand::Exec {
+                command: "whoami".to_string(),
+            })
+            .expect("exec should succeed");
+
+        assert!(response.success);
+        assert_eq!(response.message.as_deref(), Some("Executed `whoami`"));
+        assert!(messages.is_empty());
+
+        let data = response.data.expect("exec should include data");
+        assert_eq!(data["command"], serde_json::json!("whoami"));
+        assert_eq!(data["output"], serde_json::json!("stub exec output"));
+        assert_eq!(data["exit_code"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn clipboard_get_returns_stub_text() {
+        let mut session = connected_session();
+
+        let (response, messages) = session
+            .dispatch(SessionCommand::ClipboardGet)
+            .expect("clipboard get should succeed");
+
+        assert!(response.success);
+        assert_eq!(
+            response.message.as_deref(),
+            Some("Clipboard text retrieved")
+        );
+        assert!(messages.is_empty());
+
+        let data = response.data.expect("clipboard get should include data");
+        assert_eq!(data["text"], serde_json::json!("stub clipboard text"));
+    }
+
+    #[test]
+    fn clipboard_set_reports_redacted_character_count() {
+        let mut session = connected_session();
+
+        let (response, messages) = session
+            .dispatch(SessionCommand::ClipboardSet {
+                text: "copied text".to_string(),
+            })
+            .expect("clipboard set should succeed");
+
+        assert!(response.success);
+        assert_eq!(response.message.as_deref(), Some("Clipboard text updated"));
+        assert!(messages.is_empty());
+
+        let data = response.data.expect("clipboard set should include data");
+        assert_eq!(data["chars"], serde_json::json!(11));
+        assert_eq!(data["redacted"], serde_json::json!(true));
+    }
+
+    #[test]
     fn type_generates_key_event_sequence_for_each_character() {
         let mut session = connected_session();
 
@@ -566,6 +703,14 @@ mod tests {
     fn disconnected_session_rejects_commands_that_require_connection() {
         let commands = [
             SessionCommand::Disconnect,
+            SessionCommand::Shell,
+            SessionCommand::Exec {
+                command: "pwd".to_string(),
+            },
+            SessionCommand::ClipboardGet,
+            SessionCommand::ClipboardSet {
+                text: "clipboard".to_string(),
+            },
             SessionCommand::Capture {
                 output: "shot.png".to_string(),
             },

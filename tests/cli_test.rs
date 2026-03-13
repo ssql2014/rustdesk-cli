@@ -26,6 +26,9 @@ fn help_lists_all_subcommands() {
         .stdout(
             contains("connect")
                 .and(contains("disconnect"))
+                .and(contains("shell"))
+                .and(contains("exec"))
+                .and(contains("clipboard"))
                 .and(contains("status"))
                 .and(contains("capture"))
                 .and(contains("type"))
@@ -35,6 +38,15 @@ fn help_lists_all_subcommands() {
                 .and(contains("drag"))
                 .and(contains("do")),
         );
+}
+
+#[test]
+fn clipboard_help_lists_get_and_set() {
+    bin()
+        .args(["clipboard", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("get").and(contains("set")));
 }
 
 #[test]
@@ -54,6 +66,55 @@ fn json_disconnect_matches_contract() {
     assert_eq!(value["command"], "disconnect");
     // was_connected depends on daemon state
     assert!(value["was_connected"].is_boolean());
+}
+
+#[test]
+fn json_shell_contract() {
+    let value = run_json_any_exit(&["--json", "shell"]);
+    assert_eq!(value["command"], "shell");
+    if value["ok"] == true {
+        assert_eq!(value["mode"], "interactive");
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
+}
+
+#[test]
+fn json_exec_contract() {
+    let value = run_json_any_exit(&["--json", "exec", "--command", "whoami"]);
+    assert_eq!(value["command"], "exec");
+    if value["ok"] == true {
+        assert_eq!(value["requested"], "whoami");
+        assert_eq!(value["output"], "stub exec output");
+        assert_eq!(value["exit_code"], 0);
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
+}
+
+#[test]
+fn json_clipboard_get_contract() {
+    let value = run_json_any_exit(&["--json", "clipboard", "get"]);
+    assert_eq!(value["command"], "clipboard");
+    if value["ok"] == true {
+        assert_eq!(value["action"], "get");
+        assert_eq!(value["text"], "stub clipboard text");
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
+}
+
+#[test]
+fn json_clipboard_set_contract() {
+    let value = run_json_any_exit(&["--json", "clipboard", "set", "--text", "hello"]);
+    assert_eq!(value["command"], "clipboard");
+    if value["ok"] == true {
+        assert_eq!(value["action"], "set");
+        assert_eq!(value["chars"], 5);
+        assert_eq!(value["redacted"], true);
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
 }
 
 #[test]
@@ -235,6 +296,45 @@ fn do_verifies_output_format_for_all_commands() {
 
     // disconnect format
     assert_eq!(steps[4]["command"], "disconnect");
+}
+
+#[test]
+fn do_verifies_output_format_for_text_mode_pivot_commands() {
+    let value = run_json(&[
+        "--json",
+        "do",
+        "shell",
+        "exec",
+        "--command",
+        "pwd",
+        "clipboard",
+        "get",
+        "clipboard",
+        "set",
+        "--text",
+        "hello",
+    ]);
+
+    assert_eq!(value["ok"], true);
+    let steps = value["steps"].as_array().expect("steps array");
+    assert_eq!(steps.len(), 4);
+
+    assert_eq!(steps[0]["command"], "shell");
+    assert_eq!(steps[0]["mode"], "interactive");
+
+    assert_eq!(steps[1]["command"], "exec");
+    assert_eq!(steps[1]["requested"], "pwd");
+    assert_eq!(steps[1]["output"], "stub exec output");
+    assert_eq!(steps[1]["exit_code"], 0);
+
+    assert_eq!(steps[2]["command"], "clipboard");
+    assert_eq!(steps[2]["action"], "get");
+    assert_eq!(steps[2]["text"], "stub clipboard text");
+
+    assert_eq!(steps[3]["command"], "clipboard");
+    assert_eq!(steps[3]["action"], "set");
+    assert_eq!(steps[3]["chars"], 5);
+    assert_eq!(steps[3]["redacted"], true);
 }
 
 #[test]

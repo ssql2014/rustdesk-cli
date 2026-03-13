@@ -189,3 +189,31 @@ Add an ignored integration test that exercises the real RustDesk ID server over 
 - [x] Fix live test assumptions based on actual server response
 - [x] Confirm ignored live test passes
 - **Status:** complete
+
+## 2026-03-14 Live Relay Test And Connect Flags
+
+### Goal
+Extend the ignored live-server coverage to include relay TCP reachability and add `--id-server`, `--relay-server`, and `--key` to the `connect` CLI flow through daemon startup.
+
+### Phases
+#### Phase 1: Discovery
+- [x] Read `TEST_CONFIG.md`
+- [x] Read `src/main.rs`
+- [x] Read `src/daemon.rs`
+- [x] Read `src/rendezvous.rs`
+- [x] Check where `connect` flags are threaded and rendered
+- **Status:** complete
+
+#### Phase 2: Implementation
+- [x] Extend `tests/live_server_test.rs` with a relay TCP test
+- [x] Add `request_relay_for` to carry relay hints from punch-hole output
+- [x] Add `--id-server`, `--relay-server`, and `--key` flags to the `connect` command
+- [x] Thread the new connect flags through `spawn_daemon` and `run_daemon`
+- **Status:** complete
+
+#### Phase 3: Verification
+- [x] Run `cargo test`
+- [x] Run `cargo test --test live_server_test -- --ignored`
+- [x] Adjust the live relay test based on observed hbbs behavior
+- [x] Confirm both normal and ignored suites pass
+- **Status:** complete

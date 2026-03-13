@@ -413,3 +413,75 @@ If both peers are on the same local network, `hbbs` will detect this and facilit
 3.  **`hbbs` → Client A (`LocalAddr`)**: Server provides B's local IP to A.
 4.  **Direct Connect**: Client A attempts a standard TCP connection to Peer B's local IP, bypassing NAT traversal entirely.
 
+---
+
+## 14. Pure-Rust NaCl Key Conversion
+
+To maintain compatibility with the official RustDesk client (which uses `sodiumoxide`) while keeping the `rustdesk-cli` build simple and pure-Rust, we must correctly convert Ed25519 identity keys to Curve25519 (X25519) encryption keys.
+
+### Public Key Conversion (Ed25519 → X25519)
+The `ed25519-dalek` crate's `VerifyingKey` can be mapped to an `x25519-dalek` `PublicKey` using the birational map between the Edwards and Montgomery forms.
+
+```rust
+use ed25519_dalek::VerifyingKey;
+use x25519_dalek::PublicKey as X25519PublicKey;
+
+fn convert_pk(ed_pk_bytes: &[u8]) -> X25519PublicKey {
+    let ed_pk = VerifyingKey::from_bytes(ed_pk_bytes.try_into().unwrap()).unwrap();
+    let x_pk_bytes = ed_pk.to_montgomery().to_bytes();
+    X25519PublicKey::from(x_pk_bytes)
+}
+```
+
+### Secret Key Conversion (Ed25519 → X25519)
+Converting the secret key (seed) requires hashing the seed with **SHA-512** and taking the first 32 bytes as the Montgomery scalar.
+
+```rust
+use ed25519_dalek::SigningKey;
+use x25519_dalek::StaticSecret;
+use sha2::{Sha512, Digest};
+
+fn convert_sk(ed_sk: &SigningKey) -> StaticSecret {
+    let mut hasher = Sha512::new();
+    hasher.update(ed_sk.to_bytes());
+    let hash = hasher.finalize();
+    
+    let mut x_sk_bytes = [0u8; 32];
+    x_sk_bytes.copy_from_slice(&hash[..32]);
+    StaticSecret::from(x_sk_bytes)
+}
+```
+
+### Encryption Compatibility
+- **Handshake Box**: Use `crypto_box::Box` with the converted keys and a **zeroed nonce** (`[0u8; 24]`) to seal the symmetric session key.
+- **Session Messages**: Use `xsalsa20poly1305::XSalsa20Poly1305` with the session key and a nonce containing the **little-endian sequence number** (first 8 bytes).
+- **Password Hashing**: Use `sha2::Sha256` for the challenge-response hash: `SHA256(SHA256(pw + salt) + challenge)`.
+
+---
+
+## 15. Input Event Details
+
+Injecting keyboard and mouse input correctly requires understanding the coordinate system and input modes.
+
+### Mouse Events
+- **Coordinate System**: RustDesk uses absolute coordinates $(x, y)$ corresponding to the remote screen resolution (e.g., $1920 \times 1080$).
+- **Button Masks**:
+    - `Left`: 1
+    - `Right`: 2
+    - `Middle`: 4
+    - `Scroll Up`: 8
+    - `Scroll Down`: 16
+- **`is_move` Flag**: Set to `true` for pointer motion, `false` for button press/release.
+
+### Keyboard Modes (`KeyEvent`)
+- **Map Mode (`0`)**: Sends raw hardware scancodes. The remote machine interprets these based on its *own* keyboard layout. This is brittle for CLI agents.
+- **Translate Mode (`2`)**: Recommended for the CLI client. The client sends the intended character or virtual key, and the host ensures that specific character is typed, regardless of layout differences.
+- **Special Keys**: Use the `control_key` enum in `KeyEvent`.
+    - Example: `Return`, `Escape`, `Backspace`, `Tab`, `Shift`, `Control`, `Alt`, `Meta` (Windows/Command).
+    - When sending a special key, the `chr` field is typically omitted, and `control_key` is populated.
+
+### Implementation Strategy for `rustdesk-cli`
+- **`type` command**: Use `Translate` mode and send a sequence of `down: true` and `down: false` events for each character.
+- **`key` command**: Use `control_key` for modifiers and special keys.
+- **`click` command**: Send a `down: true` event followed immediately by a `down: false` event at the same coordinates.
+

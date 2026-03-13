@@ -7,9 +7,12 @@
 //! 4. Password authentication (two-stage SHA256)
 //! 5. LoginResponse / PeerInfo parsing
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use prost::Message as ProstMessage;
 use rand_core::{OsRng, RngCore};
+use tokio::time::timeout;
 
 use crate::crypto::{self, EncryptedStream, KeyExchangeResult};
 use crate::proto::hbb::{
@@ -282,7 +285,10 @@ async fn handshake_and_auth(
     // --- NaCl key exchange ---
 
     // Step 1: Receive SignedId from host.
-    let raw = transport.recv().await.context("waiting for SignedId")?;
+    let raw = timeout(Duration::from_secs(10), transport.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for SignedId from peer"))?
+        .context("waiting for SignedId")?;
     let msg = Message::decode(raw.as_slice()).context("decode SignedId message")?;
 
     match msg.union {
@@ -314,7 +320,10 @@ async fn handshake_and_auth(
     // --- Authentication ---
 
     // Step 5: Receive Hash (salt + challenge) — encrypted.
-    let hash_raw = encrypted.recv().await.context("waiting for Hash")?;
+    let hash_raw = timeout(Duration::from_secs(10), encrypted.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for Hash challenge from peer"))?
+        .context("waiting for Hash")?;
     let hash_msg = Message::decode(hash_raw.as_slice()).context("decode Hash message")?;
 
     let hash = match hash_msg.union {
@@ -349,9 +358,9 @@ async fn handshake_and_auth(
     encrypted.send(&buf).await?;
 
     // Step 8: Receive LoginResponse — encrypted.
-    let resp_raw = encrypted
-        .recv()
+    let resp_raw = timeout(Duration::from_secs(10), encrypted.recv())
         .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for LoginResponse from peer"))?
         .context("waiting for LoginResponse")?;
     let resp_msg = Message::decode(resp_raw.as_slice()).context("decode LoginResponse")?;
 

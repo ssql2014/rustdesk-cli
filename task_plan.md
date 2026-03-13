@@ -60,3 +60,26 @@ Phase 5
 ## Notes
 - Re-read this plan before major decisions.
 - Keep `DESIGN.md` as the source of truth for output format and flags.
+
+## 2026-03-14 Unit Test Expansion
+
+### Goal
+Add focused unit tests for session state transitions and protocol helpers, then verify they pass alongside the existing CLI integration suite.
+
+### Phases
+#### Phase 1: Discovery
+- [x] Read `src/session.rs`
+- [x] Read `src/protocol.rs`
+- [x] Confirm current integration test coverage in `tests/cli_test.rs`
+- **Status:** complete
+
+#### Phase 2: Implementation
+- [x] Add `#[cfg(test)]` coverage in `src/session.rs`
+- [x] Add `#[cfg(test)]` coverage in `src/protocol.rs`
+- **Status:** complete
+
+#### Phase 3: Verification
+- [x] Run `cargo test`
+- [x] Fix any compile/test failures
+- [x] Confirm both unit and integration suites pass
+- **Status:** complete

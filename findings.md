@@ -23,6 +23,7 @@
 | Use one output helper path for text and JSON | Reduces drift between command modes |
 | Stub `status` as disconnected and other commands as successful placeholders | Avoids inventing fake persistent state while preserving the designed output contract |
 | Use helper functions in tests to parse stdout into `serde_json::Value` | Keeps repeated assertions compact and readable |
+| Put the new session/protocol unit tests inside `src/session.rs` and `src/protocol.rs` | This crate has no `lib.rs`, so inline unit tests keep private APIs directly testable |
 
 ## Issues Encountered
 | Issue | Resolution |
@@ -30,6 +31,7 @@
 | No existing project docs or code to infer conventions from | Design from the user’s requested command list and agent-centric constraints |
 | The scaffold has no shared output model | Add structured payload builders and final render helpers in `main.rs` |
 | No existing CLI tests | Add an integration suite against the built binary with `assert_cmd` |
+| `char::encode_utf8()` returns `&mut str`, which did not compare directly against `Option<&str>` in a test assertion | Switched the expectation to `ch.to_string()` and compared via `as_str()` |
 
 ## Resources
 - `/Users/qlss/Documents/Projects/rustdesk-cli`

@@ -11,6 +11,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -41,6 +42,12 @@ const EXEC_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const EXEC_PROMPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const EXEC_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 const SHELL_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+const RECONNECT_MAX_ATTEMPTS: usize = 3;
+const RECONNECT_BACKOFFS: [Duration; RECONNECT_MAX_ATTEMPTS] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
 
 /// Lock file contents — written by the daemon, read by the CLI.
 #[derive(Debug, Serialize, Deserialize)]
@@ -212,14 +219,9 @@ pub async fn run_daemon(
     // Real connection: rendezvous → relay → crypto → auth.
     // Timeout prevents hanging on unreachable servers or bad credentials.
     let timeout_secs = timeout.unwrap_or(30);
-    let conn_result = match tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        connection::connect_to_peer(&config),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
+    let conn_result = match connect_with_timeout(&config, timeout_secs).await {
+        Ok(r) => r,
+        Err(ConnectWithTimeoutError::Connect(e)) => {
             let message = format!("{e:#}");
             let _ = write_startup_error(&message);
             eprintln!("daemon: connect failed: {message}");
@@ -227,8 +229,8 @@ pub async fn run_daemon(
             let _ = write_startup_error(&message);
             return Ok(());
         }
-        Err(_) => {
-            let message = format!("connect timed out after {timeout_secs}s");
+        Err(ConnectWithTimeoutError::TimedOut(secs)) => {
+            let message = format!("connect timed out after {secs}s");
             let _ = write_startup_error(&message);
             eprintln!("daemon: {message}");
             cleanup();
@@ -315,62 +317,60 @@ pub async fn run_daemon(
                 if matches!(cmd, SessionCommand::Shell) {
                     if let Err(e) = shell_session(&mut encrypted, buf_reader, writer).await {
                         eprintln!("daemon: shell session error: {e:#}");
+                        if should_reconnect(&e) {
+                            match reconnect_encrypted_stream(&config, &mut session, |resp| {
+                                eprintln!(
+                                    "daemon: {}",
+                                    resp.message.as_deref().unwrap_or("reconnecting...")
+                                );
+                            })
+                            .await
+                            {
+                                Ok(new_conn) => {
+                                    encrypted = new_conn.encrypted;
+                                }
+                                Err(reconnect_err) => {
+                                    let _ = encrypted.close().await;
+                                    cleanup();
+                                    return Err(reconnect_err);
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
 
-                let response = match cmd {
-                    SessionCommand::Exec { command } => {
-                        match exec_command(&mut encrypted, &command).await {
-                            Ok(resp) => resp,
-                            Err(e) => SessionResponse::error(format!("exec failed: {e:#}")),
+                let response = match execute_daemon_command(&mut encrypted, &mut session, cmd.clone()).await {
+                    Ok(resp) => resp,
+                    Err(command_err) => {
+                        if !should_reconnect(&command_err) {
+                            SessionResponse::error(format!("{command_err:#}"))
+                        } else {
+                        let reconnect_result = reconnect_encrypted_stream(&config, &mut session, |_resp| {})
+                            .await;
+
+                        match reconnect_result {
+                            Ok(new_conn) => {
+                                encrypted = new_conn.encrypted;
+                                match execute_daemon_command(&mut encrypted, &mut session, cmd).await {
+                                    Ok(resp) => resp,
+                                    Err(retry_err) => SessionResponse::error(format!(
+                                        "command failed after reconnect: {retry_err:#}"
+                                    )),
+                                }
+                            }
+                            Err(reconnect_err) => {
+                                let resp = SessionResponse::error(format!(
+                                    "connection lost: {command_err:#}; reconnect failed: {reconnect_err:#}"
+                                ));
+                                let _ = send_response(&mut writer, &resp).await;
+                                let _ = encrypted.close().await;
+                                cleanup();
+                                return Err(reconnect_err);
+                            }
+                        }
                         }
                     }
-                    SessionCommand::ClipboardGet => {
-                        match clipboard_get(&mut encrypted).await {
-                            Ok(resp) => resp,
-                            Err(e) => SessionResponse::error(format!("clipboard get failed: {e:#}")),
-                        }
-                    }
-                    SessionCommand::ClipboardSet { text } => {
-                        match clipboard_set(&mut encrypted, &text).await {
-                            Ok(resp) => resp,
-                            Err(e) => SessionResponse::error(format!("clipboard set failed: {e:#}")),
-                        }
-                    }
-                    SessionCommand::Capture {
-                        format,
-                        quality,
-                        region,
-                        display,
-                        ..
-                    } => {
-                        match capture::request_screenshot(
-                            &mut encrypted,
-                            &capture::CaptureOptions {
-                                format,
-                                quality,
-                                region,
-                                display,
-                            },
-                        )
-                        .await
-                        {
-                            Ok(bytes) => SessionResponse::ok_with_data(
-                                "Screenshot captured",
-                                serde_json::json!({
-                                    "bytes_b64": capture::base64_encode(&bytes),
-                                    "bytes": bytes.len(),
-                                    "format": "png",
-                                }),
-                            ),
-                            Err(e) => SessionResponse::error(format!("capture failed: {e:#}")),
-                        }
-                    }
-                    other => match session.dispatch(other) {
-                        Ok((resp, _msgs)) => resp,
-                        Err(e) => SessionResponse::error(e.to_string()),
-                    },
                 };
 
                 let _ = send_response(&mut writer, &response).await;
@@ -393,6 +393,166 @@ pub async fn run_daemon(
             }
         }
     }
+}
+
+async fn connect_with_timeout(
+    config: &ConnectionConfig,
+    timeout_secs: u64,
+) -> std::result::Result<connection::ConnectionResult, ConnectWithTimeoutError> {
+    tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        connection::connect_to_peer(config),
+    )
+    .await
+    .map_err(|_| ConnectWithTimeoutError::TimedOut(timeout_secs))?
+    .map_err(ConnectWithTimeoutError::Connect)
+}
+
+enum ConnectWithTimeoutError {
+    Connect(anyhow::Error),
+    TimedOut(u64),
+}
+
+async fn execute_daemon_command(
+    encrypted: &mut EncryptedStream<TcpTransport>,
+    session: &mut Session,
+    cmd: SessionCommand,
+) -> Result<SessionResponse> {
+    match cmd {
+        SessionCommand::Exec { command } => exec_command(encrypted, &command).await,
+        SessionCommand::ClipboardGet => clipboard_get(encrypted).await,
+        SessionCommand::ClipboardSet { text } => clipboard_set(encrypted, &text).await,
+        SessionCommand::Capture {
+            format,
+            quality,
+            region,
+            display,
+            ..
+        } => {
+            let bytes = capture::request_screenshot(
+                encrypted,
+                &capture::CaptureOptions {
+                    format,
+                    quality,
+                    region,
+                    display,
+                },
+            )
+            .await?;
+            Ok(SessionResponse::ok_with_data(
+                "Screenshot captured",
+                serde_json::json!({
+                    "bytes_b64": capture::base64_encode(&bytes),
+                    "bytes": bytes.len(),
+                    "format": "png",
+                }),
+            ))
+        }
+        other => {
+            let (resp, _msgs) = session.dispatch(other)?;
+            Ok(resp)
+        }
+    }
+}
+
+fn reconnecting_response(attempt: usize, backoff: Duration) -> SessionResponse {
+    SessionResponse::error(format!(
+        "reconnecting... attempt {attempt}/{RECONNECT_MAX_ATTEMPTS} in {}s",
+        backoff.as_secs()
+    ))
+}
+
+async fn reconnect_with_retry<T, F, Fut, N>(
+    mut connect: F,
+    mut notify: N,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+    N: FnMut(&SessionResponse),
+{
+    reconnect_with_retry_backoffs(&RECONNECT_BACKOFFS, &mut connect, &mut notify).await
+}
+
+async fn reconnect_with_retry_backoffs<T, F, Fut, N>(
+    backoffs: &[Duration],
+    connect: &mut F,
+    notify: &mut N,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+    N: FnMut(&SessionResponse),
+{
+    let mut last_error = None;
+
+    for (idx, backoff) in backoffs.iter().copied().enumerate() {
+        let attempt = idx + 1;
+        let reconnecting = reconnecting_response(attempt, backoff);
+        notify(&reconnecting);
+        tokio::time::sleep(backoff).await;
+
+        match connect().await {
+            Ok(value) => return Ok(value),
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("reconnect failed")))
+}
+
+async fn reconnect_encrypted_stream<N>(
+    config: &ConnectionConfig,
+    session: &mut Session,
+    notify: N,
+) -> Result<connection::ConnectionResult>
+where
+    N: FnMut(&SessionResponse),
+{
+    let conn = reconnect_with_retry(|| connection::connect_to_peer(config), notify).await?;
+    let mut encrypted = conn.encrypted;
+    send_option_message(&mut encrypted).await?;
+
+    session.state = ConnectionState::Connected;
+    session.peer_info = Some(PeerInfoState {
+        peer_id: conn.peer_info.username.clone(),
+        username: conn.peer_info.username.clone(),
+        hostname: conn.peer_info.hostname.clone(),
+        displays: conn
+            .peer_info
+            .displays
+            .iter()
+            .map(|d| DisplayInfo {
+                x: d.x,
+                y: d.y,
+                width: d.width,
+                height: d.height,
+            })
+            .collect(),
+    });
+
+    Ok(connection::ConnectionResult {
+        peer_info: conn.peer_info,
+        encrypted,
+    })
+}
+
+fn should_reconnect(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    [
+        "decryption failed",
+        "broken pipe",
+        "connection reset",
+        "connection aborted",
+        "unexpected eof",
+        "failed to fill whole buffer",
+        "connection refused",
+        "transport",
+        "closed",
+        "timed out",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +1063,11 @@ fn write_startup_error(message: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     const SENTINEL: &str = "__RDCLI_00000000000000000000000000000001__";
 
@@ -973,6 +1138,103 @@ mod tests {
         let (stdout, exit_code) = parse_exec_output(raw, SENTINEL);
         assert_eq!(stdout, "some partial output");
         assert_eq!(exit_code, -1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_with_retry_retries_then_succeeds() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let backoffs = [
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(4),
+        ];
+
+        let task = {
+            let attempts = attempts.clone();
+            let notices = notices.clone();
+            tokio::spawn(async move {
+                let mut connect = || {
+                        let attempts = attempts.clone();
+                        async move {
+                            let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                            if attempt < 3 {
+                                anyhow::bail!("connection reset by peer");
+                            }
+                            Ok::<_, anyhow::Error>("recovered")
+                        }
+                    };
+                let mut notify = |resp: &SessionResponse| {
+                        notices
+                            .lock()
+                            .expect("notice mutex")
+                            .push(resp.message.clone().unwrap_or_default());
+                    };
+                reconnect_with_retry_backoffs(&backoffs, &mut connect, &mut notify)
+                .await
+            })
+        };
+
+        let result = task.await.expect("retry task join").expect("retry should succeed");
+
+        assert_eq!(result, "recovered");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let notices = notices.lock().expect("notice mutex");
+        assert_eq!(notices.len(), 3);
+        assert!(notices[0].contains("reconnecting... attempt 1/3 in 0s"));
+        assert!(notices[1].contains("reconnecting... attempt 2/3 in 0s"));
+        assert!(notices[2].contains("reconnecting... attempt 3/3 in 0s"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_with_retry_returns_last_error_after_max_attempts() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let backoffs = [
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(4),
+        ];
+
+        let task: tokio::task::JoinHandle<Result<()>> = {
+            let attempts = attempts.clone();
+            let notices = notices.clone();
+            tokio::spawn(async move {
+                let mut connect = || {
+                        let attempts = attempts.clone();
+                        async move {
+                            let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                            anyhow::bail!("transport closed on attempt {attempt}");
+                        }
+                    };
+                let mut notify = |resp: &SessionResponse| {
+                        notices
+                            .lock()
+                            .expect("notice mutex")
+                            .push(resp.message.clone().unwrap_or_default());
+                    };
+                reconnect_with_retry_backoffs::<(), _, _, _>(&backoffs, &mut connect, &mut notify)
+                .await
+            })
+        };
+
+        let err = task
+            .await
+            .expect("retry task join")
+            .expect_err("retry should fail");
+
+        assert!(format!("{err:#}").contains("attempt 3"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(notices.lock().expect("notice mutex").len(), 3);
+    }
+
+    #[test]
+    fn should_reconnect_matches_transport_failures() {
+        let err = anyhow::anyhow!("Decryption failed: invalid ciphertext");
+        assert!(should_reconnect(&err));
+
+        let err = anyhow::anyhow!("terminal error during exec: permission denied");
+        assert!(!should_reconnect(&err));
     }
 
     // -- Shell session test helpers --

@@ -45,6 +45,7 @@
 | Deterministic `exec` completion should not depend on parsing the remote prompt | The robust design is an ephemeral terminal per exec plus a daemon-generated sentinel marker that carries exit status and defines the command boundary |
 | Screenshot capture is exposed as top-level `Message::ScreenshotRequest` / `Message::ScreenshotResponse`, not a `Misc` variant | The real capture path should send a screenshot request on the encrypted stream and wait for the matching `sid` in the response loop |
 | The current daemon UDS protocol is JSON-line only, so screenshot bytes cannot cross it as raw binary | The smallest compatible end-to-end capture path is to base64-encode screenshot bytes in daemon `SessionResponse.data` and let the CLI decode them before writing to file/stdout |
+| The current CLI↔daemon UDS protocol only reads a single JSON line per request | Intermediate reconnect status `SessionResponse`s cannot be surfaced to the CLI without a protocol change, so the reconnect helper emits them internally and retries the command before sending the final response |
 
 ## Issues Encountered
 | Issue | Resolution |

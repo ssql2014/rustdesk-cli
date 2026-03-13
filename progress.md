@@ -146,6 +146,28 @@
   - `task_plan.md` (updated)
   - `progress.md` (updated)
 
+## Session: 2026-03-14 (Daemon Reconnect Retry)
+
+### Phase 1: Discovery
+- **Status:** complete
+- Actions taken:
+  - Inspected the current daemon event loop and command dispatch paths in `src/daemon.rs`.
+  - Confirmed the CLI reads only one JSON response line per request, which constrains how reconnect status can be surfaced.
+- Files created/modified:
+  - `findings.md` (updated)
+
+### Phase 2: Implementation
+- **Status:** complete
+- Actions taken:
+  - Added a reconnect helper with exponential backoff (1s, 2s, 4s) and transport-error detection.
+  - Retried daemon-backed commands after reconnect and refreshed the encrypted stream/session peer info on success.
+  - Added daemon unit tests for retry success, retry exhaustion, and reconnect error classification.
+  - Ran `cargo test` successfully outside the sandbox after sandboxed Cargo runs hit transient `target/debug/.fingerprint` write failures.
+- Files created/modified:
+  - `src/daemon.rs` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
 ### Phase 4: Testing & Verification
 - **Status:** complete
 - Actions taken:

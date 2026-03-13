@@ -100,7 +100,7 @@ impl RendezvousClient {
                 token: String::new(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 udp_port,
-                force_relay: false,
+                force_relay: true,
                 upnp_port: 0,
                 socket_addr_v6: Vec::new(),
             })),
@@ -113,7 +113,7 @@ impl RendezvousClient {
     }
 
     pub async fn request_relay(&self) -> Result<RelayResponse> {
-        self.request_relay_for("", "", &[]).await
+        self.request_relay_for("", "", &[], "").await
     }
 
     pub async fn request_relay_for(
@@ -121,6 +121,7 @@ impl RendezvousClient {
         target_id: &str,
         relay_server: &str,
         socket_addr: &[u8],
+        licence_key: &str,
     ) -> Result<RelayResponse> {
         let request = RendezvousMessage {
             union: Some(rendezvous_message::Union::RequestRelay(RequestRelay {
@@ -129,7 +130,7 @@ impl RendezvousClient {
                 socket_addr: socket_addr.to_vec(),
                 relay_server: relay_server.to_string(),
                 secure: true,
-                licence_key: String::new(),
+                licence_key: licence_key.to_string(),
                 conn_type: ConnType::DefaultConn as i32,
                 token: String::new(),
                 control_permissions: None,
@@ -308,7 +309,7 @@ mod tests {
                     assert_eq!(request.id, "target-9");
                     assert_eq!(request.nat_type, NatType::UnknownNat as i32);
                     assert_eq!(request.conn_type, ConnType::DefaultConn as i32);
-                    assert!(!request.force_relay);
+                    assert!(request.force_relay);
                     assert!(request.udp_port > 0);
                 }
                 other => panic!("expected PunchHoleRequest, got {other:?}"),
@@ -413,6 +414,7 @@ mod tests {
                     assert_eq!(request.id, "target-9");
                     assert_eq!(request.relay_server, "relay.example.com:21117");
                     assert_eq!(request.socket_addr, vec![1, 2, 3, 4]);
+                    assert_eq!(request.licence_key, "test-key");
                     assert!(request.secure);
                 }
                 other => panic!("expected RequestRelay, got {other:?}"),
@@ -439,7 +441,7 @@ mod tests {
 
         let client = RendezvousClient::connect(&server_addr.to_string()).await?;
         let response = client
-            .request_relay_for("target-9", "relay.example.com:21117", &[1, 2, 3, 4])
+            .request_relay_for("target-9", "relay.example.com:21117", &[1, 2, 3, 4], "test-key")
             .await?;
 
         assert_eq!(response.uuid, "relay-uuid");

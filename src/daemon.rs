@@ -712,7 +712,7 @@ fn build_connection_config(
         server_key: key.unwrap_or("").to_string(),
         peer_id: peer_id.to_string(),
         password: password.unwrap_or("").to_string(),
-        warmup_secs: 5,
+        warmup_secs: 2,
     }
 }
 

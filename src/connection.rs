@@ -37,7 +37,7 @@ pub struct ConnectionConfig {
     pub password: String,
     /// Seconds to wait after starting heartbeat before sending PunchHole.
     /// The server may need sustained heartbeats before accepting PunchHole
-    /// requests (Nova §28).  Default: 5.
+    /// requests (Nova §28).  Default: 2.
     pub warmup_secs: u64,
 }
 
@@ -124,38 +124,46 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
     // Wrap remaining discovery in an async block so we always abort the
     // heartbeat, even on error paths.
     let result = async {
-        // Try to punch hole to target (15s timeout — server may be slow).
-        let ph_response = tokio::time::timeout(
-            tokio::time::Duration::from_secs(15),
+        // Try PunchHole first (5s timeout).  If the server responds we
+        // extract its relay_server hint.  If it times out or fails (NAT
+        // traversal hanging) we fall back to direct relay request.
+        let (relay_hint, socket_hint) = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
             client.punch_hole(&config.peer_id, &config.server_key),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("PunchHoleRequest timed out after 15 seconds"))?
-        .context("PunchHoleRequest failed")?;
-
-        // Check for immediate PunchHole failure before proceeding to relay.
-        check_punch_hole_failure(&ph_response)?;
-
-        // Determine relay info from punch-hole response.
-        let relay_server = if ph_response.relay_server.is_empty() {
-            None
-        } else {
-            Some(ph_response.relay_server.clone())
+        {
+            Ok(Ok(ph_response)) => {
+                // PunchHole succeeded — check for hard failures.
+                check_punch_hole_failure(&ph_response)?;
+                let relay = if ph_response.relay_server.is_empty() {
+                    None
+                } else {
+                    Some(ph_response.relay_server.clone())
+                };
+                (relay, ph_response.socket_addr.clone())
+            }
+            Ok(Err(_)) | Err(_) => {
+                // PunchHole failed or timed out — fall back to relay.
+                (None, Vec::new())
+            }
         };
 
-        // Request relay — we always go through relay for now.
+        // Request relay — always needed (we don't do direct P2P).
+        let relay_target = relay_hint.as_deref().unwrap_or(&config.relay_server);
         let relay_response = client
             .request_relay_for(
                 &config.peer_id,
-                relay_server.as_deref().unwrap_or(&config.relay_server),
-                &ph_response.socket_addr,
+                relay_target,
+                &socket_hint,
+                &config.server_key,
             )
             .await
             .context("RequestRelay failed")?;
 
         let uuid = relay_response.uuid;
         let relay_addr = if relay_response.relay_server.is_empty() {
-            relay_server
+            relay_hint
         } else {
             Some(relay_response.relay_server)
         };
@@ -539,7 +547,7 @@ mod tests {
             server_key: "SWc0NIWF0wR7kd8rHdGNaCHXtp7dirUImEtrVmRfQdc=".to_string(),
             peer_id: "308235080".to_string(),
             password: "Evas@2026".to_string(),
-            warmup_secs: 5,
+            warmup_secs: 2,
         };
 
         match connect(&config).await {

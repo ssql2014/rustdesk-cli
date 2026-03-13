@@ -63,6 +63,7 @@ async fn live_e2e_connect_auth_probe() -> Result<()> {
             TARGET_PEER_ID,
             relay_server_hint,
             &punch_hole_response.socket_addr,
+            SERVER_KEY,
         ),
     )
     .await;

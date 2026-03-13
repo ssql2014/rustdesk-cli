@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+mod crypto;
+#[allow(dead_code)]
 mod daemon;
 #[allow(dead_code)]
 mod proto;
@@ -48,9 +50,18 @@ enum Commands {
         /// Password for the peer
         #[arg(long)]
         password: Option<String>,
-        /// Override rendezvous/relay server address
+        /// Override combined rendezvous/relay server address
         #[arg(long)]
         server: Option<String>,
+        /// Override RustDesk ID/rendezvous server address
+        #[arg(long = "id-server")]
+        id_server: Option<String>,
+        /// Override RustDesk relay server address
+        #[arg(long = "relay-server")]
+        relay_server: Option<String>,
+        /// Override RustDesk server public key
+        #[arg(long)]
+        key: Option<String>,
         /// Connection timeout in seconds
         #[arg(long, default_value_t = 15)]
         timeout: u64,
@@ -257,8 +268,18 @@ fn run_daemon_mode(args: &[String]) {
         .expect("--daemon requires --peer-id");
     let password = daemon_arg_value(args, "--password");
     let server = daemon_arg_value(args, "--server");
+    let id_server = daemon_arg_value(args, "--id-server");
+    let relay_server = daemon_arg_value(args, "--relay-server");
+    let key = daemon_arg_value(args, "--key");
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    if let Err(e) = rt.block_on(daemon::run_daemon(peer_id, password, server)) {
+    if let Err(e) = rt.block_on(daemon::run_daemon(
+        peer_id,
+        password,
+        server,
+        id_server,
+        relay_server,
+        key,
+    )) {
         eprintln!("daemon error: {e}");
         process::exit(1);
     }
@@ -278,8 +299,18 @@ fn run() -> i32 {
             id,
             password,
             server,
+            id_server,
+            relay_server,
+            key,
             timeout: _,
-        } => match daemon::spawn_daemon(&id, password.as_deref(), server.as_deref()) {
+        } => match daemon::spawn_daemon(
+            &id,
+            password.as_deref(),
+            server.as_deref(),
+            id_server.as_deref(),
+            relay_server.as_deref(),
+            key.as_deref(),
+        ) {
             Ok(()) => emit_response(cli.json, connect_response(&id, server.as_deref())),
             Err(e) => emit_response(
                 cli.json,

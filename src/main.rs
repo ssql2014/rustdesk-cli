@@ -1,3 +1,12 @@
+#[allow(dead_code)]
+mod daemon;
+#[allow(dead_code)]
+mod proto;
+#[allow(dead_code)]
+mod protocol;
+#[allow(dead_code)]
+mod session;
+
 use std::{process, str::FromStr};
 
 use clap::{Parser, Subcommand, ValueEnum};

@@ -22,3 +22,10 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # NOTE: hbb_common from rustdesk repo has heavy dependencies and build requirements.
 # We'll vendor the specific protobuf definitions we need instead.
 # hbb_common = { git = "https://github.com/rustdesk/rustdesk" }
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"

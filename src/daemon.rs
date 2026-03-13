@@ -25,7 +25,7 @@ use crate::capture;
 use crate::connection::{self, ConnectionConfig};
 use crate::crypto::EncryptedStream;
 use crate::proto::hbb::{
-    ImageQuality, Message, Misc, OptionMessage,
+    CaptureDisplays, ImageQuality, Message, Misc, OptionMessage, TestDelay,
     message, misc, option_message,
 };
 use crate::protocol::DisplayInfo;
@@ -258,6 +258,14 @@ pub async fn run_daemon(
         return Ok(());
     }
 
+    // Session init (§29): CaptureDisplays + refresh_video.
+    if let Err(e) = send_session_init(&mut encrypted).await {
+        eprintln!("daemon: failed to send session init: {e:#}");
+        let _ = encrypted.close().await;
+        cleanup();
+        return Ok(());
+    }
+
     // Initialize session control-plane state with real peer info.
     let mut session = Session::new();
     session.state = ConnectionState::Connected;
@@ -294,16 +302,57 @@ pub async fn run_daemon(
 
         enum DaemonEvent {
             Accept(std::result::Result<std::result::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr), std::io::Error>, tokio::time::error::Elapsed>),
+            PeerMessage(Result<Vec<u8>>),
             Signal(&'static str),
         }
 
         let event = tokio::select! {
             accept = accept => DaemonEvent::Accept(accept),
+            peer_data = encrypted.recv() => DaemonEvent::PeerMessage(peer_data),
             _ = sigterm.recv() => DaemonEvent::Signal("SIGTERM"),
             _ = sigint.recv() => DaemonEvent::Signal("SIGINT"),
         };
 
         match event {
+            DaemonEvent::PeerMessage(Ok(data)) => {
+                match handle_peer_message(&mut encrypted, &data).await {
+                    Ok(true) => {} // continue
+                    Ok(false) => {
+                        // Peer requested disconnect (close_reason).
+                        graceful_shutdown(&mut encrypted).await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("daemon: error handling peer message: {e:#}");
+                    }
+                }
+                continue;
+            }
+            DaemonEvent::PeerMessage(Err(e)) => {
+                eprintln!("daemon: peer connection error: {e:#}");
+                // Connection lost — attempt reconnect.
+                match reconnect_encrypted_stream(&config, &mut session, |resp| {
+                    eprintln!(
+                        "daemon: {}",
+                        resp.message.as_deref().unwrap_or("reconnecting...")
+                    );
+                })
+                .await
+                {
+                    Ok(new_conn) => {
+                        encrypted = new_conn.encrypted;
+                        // Re-send session init after reconnect.
+                        if let Err(e) = send_session_init(&mut encrypted).await {
+                            eprintln!("daemon: failed to re-send session init: {e:#}");
+                        }
+                    }
+                    Err(reconnect_err) => {
+                        graceful_shutdown(&mut encrypted).await?;
+                        return Err(reconnect_err);
+                    }
+                }
+                continue;
+            }
             DaemonEvent::Accept(Ok(Ok((stream, _addr)))) => {
                 last_activity = Instant::now();
 
@@ -648,6 +697,74 @@ async fn send_option_message(
     let mut buf = Vec::new();
     msg.encode(&mut buf)?;
     stream.send(&buf).await.context("sending OptionMessage")
+}
+
+/// Send session initialization messages after auth (§29):
+/// - `CaptureDisplays { add: [0] }` to start capturing display 0
+/// - `Misc { refresh_video: true }` to force an immediate keyframe
+async fn send_session_init(
+    stream: &mut EncryptedStream<TcpTransport>,
+) -> Result<()> {
+    // CaptureDisplays: tell the host to start capturing display 0.
+    let capture_msg = Message {
+        union: Some(message::Union::Misc(Misc {
+            union: Some(misc::Union::CaptureDisplays(CaptureDisplays {
+                add: vec![0],
+                ..Default::default()
+            })),
+        })),
+    };
+    let mut buf = Vec::new();
+    capture_msg.encode(&mut buf)?;
+    stream.send(&buf).await.context("sending CaptureDisplays")?;
+
+    // Misc { refresh_video: true }: force host encoder to produce a keyframe.
+    let refresh_msg = Message {
+        union: Some(message::Union::Misc(Misc {
+            union: Some(misc::Union::RefreshVideo(true)),
+        })),
+    };
+    buf.clear();
+    refresh_msg.encode(&mut buf)?;
+    stream.send(&buf).await.context("sending refresh_video")?;
+
+    Ok(())
+}
+
+/// Handle an incoming message from the encrypted stream.
+/// Returns `true` if the session should continue, `false` if it should shut down.
+async fn handle_peer_message(
+    encrypted: &mut EncryptedStream<TcpTransport>,
+    data: &[u8],
+) -> Result<bool> {
+    let msg = Message::decode(data)?;
+    match msg.union {
+        Some(message::Union::TestDelay(td)) => {
+            // Echo TestDelay back with from_client=true to maintain the session (§29).
+            let echo = Message {
+                union: Some(message::Union::TestDelay(TestDelay {
+                    time: td.time,
+                    from_client: true,
+                    last_delay: td.last_delay,
+                    target_bitrate: td.target_bitrate,
+                })),
+            };
+            let mut buf = Vec::new();
+            echo.encode(&mut buf)?;
+            encrypted.send(&buf).await.context("echoing TestDelay")?;
+        }
+        Some(message::Union::Misc(ref misc_msg)) => {
+            if let Some(misc::Union::CloseReason(ref reason)) = misc_msg.union {
+                eprintln!("daemon: peer sent close_reason: {reason}");
+                return Ok(false);
+            }
+            // Other Misc messages are ignored for now.
+        }
+        _ => {
+            // Ignore other message types (video frames, audio, etc.)
+        }
+    }
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1187,16 @@ fn cleanup() {
 async fn graceful_shutdown(
     encrypted: &mut EncryptedStream<TcpTransport>,
 ) -> Result<()> {
+    // Send close_reason before closing (§29 clean disconnect).
+    let close_msg = Message {
+        union: Some(message::Union::Misc(Misc {
+            union: Some(misc::Union::CloseReason("".to_string())),
+        })),
+    };
+    let mut buf = Vec::new();
+    if close_msg.encode(&mut buf).is_ok() {
+        let _ = encrypted.send(&buf).await;
+    }
     encrypted.close().await.context("closing encrypted transport")?;
     cleanup();
     Ok(())

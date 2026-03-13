@@ -696,28 +696,37 @@ When sending or receiving `TerminalData` in `src/terminal.rs`:
 
 ## 22. Connection Timeout Debugging
 
-Investigation into why `connect_to_peer` times out after 30s against peer `308235080` despite verified TCP connectivity.
+Investigation into why `connect_to_peer` times out after 30s against peer `308235080` despite verified TCP connectivity and the endianness fix.
 
-### 1. The Hanged Step: Phase 3 (Handshake)
-The connection flow completes Phase 1 (Rendezvous) and Phase 2 (Relay Connect) but hangs at the beginning of Phase 3 (`handshake_and_auth`), specifically when waiting for the `SignedId` message from the host.
+### 1. The Hanged Step: Rendezvous Discovery
+The connection process fails during Phase 1 (Rendezvous). Specifically, the `PunchHoleRequest` sent to the ID server (`hbbs`) returns a failure code, which prevents the client from obtaining a valid `uuid` for the relay session.
 
-### 2. Root Cause: Endianness Mismatch in Framing
-The `RESEARCH.md` (Section 16) specifies that all TCP messages must be prefixed with a **4-byte little-endian** length header. However, the current implementation in `src/transport.rs` uses **big-endian** (`to_be_bytes` / `from_be_bytes`).
+### 2. Root Cause: Protocol Implementation Gaps
+Despite the transport fix, the `RendezvousClient` in `src/rendezvous.rs` has several critical omissions that cause the self-hosted server to reject the connection:
 
-**Impact:**
-- When the client sends a small binding message (e.g., 100 bytes), it sends `00 00 00 64`.
-- The relay server (`hbbr`), expecting little-endian, interprets this as `0x64000000` (approx. **1.6 GB**).
-- The server sits waiting for 1.6 GB of data that never arrives.
-- The client sits waiting for a response (`SignedId`) that the server will never send because it's still "reading" the first message.
-- Result: A silent hang until the 30s global timeout expires.
+- **Missing License Key**: The `PunchHoleRequest` is sent with an empty `licence_key` field. Probing the server reveals a `failure: 3` (`LICENSE_MISMATCH`) response. The server at `115.238.185.55` requires the "Key" from `TEST_CONFIG.md` to be provided in this field to authorize the connection.
+- **Missing RegisterPk**: The client uses `RegisterPeer` but never sends `RegisterPk`. For secure sessions, the RustDesk protocol requires the client to register its public key with the ID server before attempting to connect to peers.
+- **Empty UUID in Relay Bind**: Because `PunchHoleRequest` fails (or `RequestRelay` times out), the client attempts to connect to the relay server (`hbbr`) using an empty `uuid`. The relay server immediately closes the connection (`early eof`), causing the client's `recv()` to hang or fail when waiting for the `SignedId` handshake.
 
 ### 3. Rendezvous Client Verification
-- **Protocol**: The `RendezvousClient` in `src/rendezvous.rs` correctly uses **UDP** (`UdpSocket`) for communication with the `id-server`.
-- **Logic**: It correctly sends raw Protobuf payloads without length headers (as expected for UDP).
+- **Transport**: The client correctly uses **UDP** for the ID server.
+- **Endianness**: The transport now correctly uses **little-endian** framing for TCP, but this only matters once a valid relay session is established.
 
 ### 4. Peer Status Verification
-- **PunchHoleResponse**: The code currently ignores the `failure` field in `PunchHoleResponse`. If the peer were offline, this field would contain `OFFLINE (2)`.
-- **UUID Generation**: Since Phase 1 returns a valid `uuid` from `hbbs`, the signaling server at least recognizes the session request, suggesting the target peer is registered.
+- **Peer Online**: The server returns `LICENSE_MISMATCH` (3) rather than `ID_NOT_EXIST` (0) or `OFFLINE` (2). This confirms that peer `308235080` is registered and online, but our connection request is being rejected due to missing credentials.
+
+### 5. e2e_connect_test.rs Insights
+The test confirms the protocol break:
+1. `PunchHoleRequest` receives `failure: 3`.
+2. `RequestRelay` fails or returns an empty `uuid`.
+3. The TCP connection to `hbbr` is successful, but the `bind_request` contains no session context.
+4. The relay server drops the stream, leading to the `early eof` error.
+
+### Summary for Implementation
+To resolve the timeout, the following changes are required:
+1. Update `PunchHoleRequest` to include the `server_key` as the `licence_key`.
+2. Implement and send `RegisterPk` before `RegisterPeer`.
+3. Add a check for the `failure` field in `PunchHoleResponse` to bail early with a descriptive error instead of timing out.
 
 ---
 

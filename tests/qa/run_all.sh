@@ -116,12 +116,12 @@ for opt in password server id-server relay-server key timeout; do
     fi
 done
 
-# T2.3: connect --timeout default is 15
+# T2.3: connect --timeout default is 30
 out=$(run "$BIN" connect --help)
-if echo "$out" | grep -q "default: 15"; then
-    pass "T2.3 connect --timeout default is 15"
+if echo "$out" | grep -q "default: 30"; then
+    pass "T2.3 connect --timeout default is 30"
 else
-    fail "T2.3 connect --timeout default" "expected default: 15 in help"
+    fail "T2.3 connect --timeout default" "expected default: 30 in help"
 fi
 
 # =============================================================================

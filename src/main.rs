@@ -74,7 +74,7 @@ enum Commands {
         #[arg(long)]
         key: Option<String>,
         /// Connection timeout in seconds
-        #[arg(long, default_value_t = 15)]
+        #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
     /// Disconnect from current peer

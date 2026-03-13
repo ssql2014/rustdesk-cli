@@ -287,6 +287,18 @@ pub async fn run_daemon(
                             Err(e) => SessionResponse::error(format!("exec failed: {e:#}")),
                         }
                     }
+                    SessionCommand::ClipboardGet => {
+                        match clipboard_get(&mut encrypted).await {
+                            Ok(resp) => resp,
+                            Err(e) => SessionResponse::error(format!("clipboard get failed: {e:#}")),
+                        }
+                    }
+                    SessionCommand::ClipboardSet { text } => {
+                        match clipboard_set(&mut encrypted, &text).await {
+                            Ok(resp) => resp,
+                            Err(e) => SessionResponse::error(format!("clipboard set failed: {e:#}")),
+                        }
+                    }
                     other => match session.dispatch(other) {
                         Ok((resp, _msgs)) => resp,
                         Err(e) => SessionResponse::error(e.to_string()),
@@ -615,6 +627,55 @@ fn parse_exec_output(raw: &str, sentinel: &str) -> (String, i32) {
 /// 1. Opens a terminal via `terminal::open_terminal`
 /// 2. Sends a JSON ack (or error) to the CLI over UDS
 /// 3. Loops: UDS lines → `send_terminal_data`, terminal output → UDS
+/// Get clipboard text from the remote peer by running a shell command.
+///
+/// Tries xclip (Linux) then pbpaste (macOS), falling back to empty string.
+async fn clipboard_get(
+    encrypted: &mut EncryptedStream<TcpTransport>,
+) -> Result<SessionResponse> {
+    let cmd = "xclip -selection clipboard -o 2>/dev/null || pbpaste 2>/dev/null || echo -n ''";
+    let exec_resp = exec_command(encrypted, cmd).await?;
+
+    // Extract stdout from exec response to reshape into clipboard contract.
+    let text = exec_resp
+        .data
+        .as_ref()
+        .and_then(|d| d["stdout"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(SessionResponse::ok_with_data(
+        "Clipboard text retrieved",
+        serde_json::json!({
+            "text": text,
+        }),
+    ))
+}
+
+/// Set clipboard text on the remote peer by running a shell command.
+///
+/// Pipes the text through xclip (Linux) or pbcopy (macOS).
+async fn clipboard_set(
+    encrypted: &mut EncryptedStream<TcpTransport>,
+    text: &str,
+) -> Result<SessionResponse> {
+    // Shell-escape by using a heredoc to avoid issues with quotes/special chars.
+    let cmd = format!(
+        "cat <<'__RDCLI_CLIP_EOF__' | xclip -selection clipboard 2>/dev/null || \
+         cat <<'__RDCLI_CLIP_EOF__' | pbcopy 2>/dev/null\n\
+         {text}\n__RDCLI_CLIP_EOF__"
+    );
+    exec_command(encrypted, &cmd).await?;
+
+    Ok(SessionResponse::ok_with_data(
+        "Clipboard text updated",
+        serde_json::json!({
+            "chars": text.chars().count(),
+            "redacted": true,
+        }),
+    ))
+}
+
 /// 4. On UDS EOF or terminal close/error, closes the terminal
 ///
 /// Note: The `tokio::select!` loop cancels `recv_terminal_data` when

@@ -184,7 +184,8 @@ impl Session {
                         format!("Executed `{command}`"),
                         serde_json::json!({
                             "command": command,
-                            "output": "stub exec output",
+                            "stdout": "stub exec output",
+                            "stderr": "",
                             "exit_code": 0,
                         }),
                     ),
@@ -475,7 +476,8 @@ mod tests {
 
         let data = response.data.expect("exec should include data");
         assert_eq!(data["command"], serde_json::json!("whoami"));
-        assert_eq!(data["output"], serde_json::json!("stub exec output"));
+        assert_eq!(data["stdout"], serde_json::json!("stub exec output"));
+        assert_eq!(data["stderr"], serde_json::json!(""));
         assert_eq!(data["exit_code"], serde_json::json!(0));
     }
 

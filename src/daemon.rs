@@ -29,11 +29,15 @@ use crate::protocol::DisplayInfo;
 use crate::session::{
     ConnectionState, PeerInfoState, Session, SessionCommand, SessionResponse,
 };
+use crate::terminal::{self, TerminalEvent};
 use crate::transport::TcpTransport;
 
 pub const SOCKET_PATH: &str = "/tmp/rustdesk-cli.sock";
 pub const LOCK_PATH: &str = "/tmp/rustdesk-cli.lock";
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const EXEC_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+const EXEC_PROMPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const EXEC_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Lock file contents — written by the daemon, read by the CLI.
 #[derive(Debug, Serialize, Deserialize)]
@@ -265,9 +269,17 @@ pub async fn run_daemon(
 
                 let is_disconnect = matches!(cmd, SessionCommand::Disconnect);
 
-                let response = match session.dispatch(cmd) {
-                    Ok((resp, _msgs)) => resp,
-                    Err(e) => SessionResponse::error(e.to_string()),
+                let response = match cmd {
+                    SessionCommand::Exec { command } => {
+                        match exec_command(&mut encrypted, &command).await {
+                            Ok(resp) => resp,
+                            Err(e) => SessionResponse::error(format!("exec failed: {e:#}")),
+                        }
+                    }
+                    other => match session.dispatch(other) {
+                        Ok((resp, _msgs)) => resp,
+                        Err(e) => SessionResponse::error(e.to_string()),
+                    },
                 };
 
                 let _ = send_response(&mut writer, &response).await;
@@ -371,6 +383,218 @@ async fn send_option_message(
 }
 
 // ---------------------------------------------------------------------------
+// Internal: exec via ephemeral terminal + sentinel
+// ---------------------------------------------------------------------------
+
+/// Execute a command on the remote peer via an ephemeral terminal.
+///
+/// 1. Open a terminal (24×80)
+/// 2. Drain initial prompt/banner (short idle timeout)
+/// 3. Send the command followed by a sentinel echo for completion detection
+/// 4. Collect output until the sentinel appears or timeout
+/// 5. Close the terminal
+/// 6. Return SessionResponse with stdout, stderr, and exit_code
+async fn exec_command(
+    encrypted: &mut EncryptedStream<TcpTransport>,
+    command: &str,
+) -> Result<SessionResponse> {
+    // Generate unique sentinel marker using timestamp nanos.
+    let sentinel_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sentinel = format!("__RDCLI_{sentinel_id:032x}__");
+
+    // 1. Open ephemeral terminal.
+    let terminal_info = tokio::time::timeout(
+        EXEC_TERMINAL_OPEN_TIMEOUT,
+        terminal::open_terminal(encrypted, 24, 80),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("terminal open timed out"))??;
+
+    let tid = terminal_info.terminal_id;
+
+    // 2. Drain initial prompt/banner with idle timeout.
+    loop {
+        match tokio::time::timeout(
+            EXEC_PROMPT_DRAIN_TIMEOUT,
+            terminal::recv_terminal_data(encrypted),
+        )
+        .await
+        {
+            Ok(Ok(TerminalEvent::Data(_))) => {
+                // Keep draining.
+            }
+            Ok(Ok(TerminalEvent::Closed { exit_code })) => {
+                return Ok(SessionResponse::ok_with_data(
+                    "Terminal closed before exec",
+                    serde_json::json!({
+                        "command": command,
+                        "stdout": "",
+                        "stderr": "",
+                        "exit_code": exit_code,
+                        "timed_out": false,
+                    }),
+                ));
+            }
+            Ok(Ok(TerminalEvent::Error(msg))) => {
+                let _ = terminal::close_terminal(encrypted, tid).await;
+                anyhow::bail!("terminal error during prompt drain: {msg}");
+            }
+            Ok(Err(e)) => {
+                let _ = terminal::close_terminal(encrypted, tid).await;
+                anyhow::bail!("recv error during prompt drain: {e:#}");
+            }
+            Err(_) => break, // Idle timeout — prompt fully drained.
+        }
+    }
+
+    // 3. Send command + sentinel echo.
+    // The sentinel echo prints a unique marker followed by $? (the exit code).
+    // Two separate lines ensure the user command terminates before the echo runs.
+    let wrapped = format!("{command}\necho '{sentinel}'$?\n");
+    terminal::send_terminal_data(encrypted, tid, wrapped.as_bytes()).await?;
+
+    // 4. Collect output until sentinel appears or completion timeout.
+    let mut collected = Vec::new();
+    let mut timed_out = false;
+    let deadline = tokio::time::Instant::now() + EXEC_COMPLETION_TIMEOUT;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+
+        match tokio::time::timeout(
+            remaining,
+            terminal::recv_terminal_data(encrypted),
+        )
+        .await
+        {
+            Ok(Ok(TerminalEvent::Data(data))) => {
+                collected.extend_from_slice(&data);
+                // Check if sentinel output has appeared.
+                if find_sentinel_output(&String::from_utf8_lossy(&collected), &sentinel).is_some() {
+                    break;
+                }
+            }
+            Ok(Ok(TerminalEvent::Closed { exit_code })) => {
+                // Terminal closed before sentinel — return partial output.
+                let stdout = String::from_utf8_lossy(&collected).trim().to_string();
+                let _ = terminal::close_terminal(encrypted, tid).await;
+                return Ok(SessionResponse::ok_with_data(
+                    format!("Executed `{command}`"),
+                    serde_json::json!({
+                        "command": command,
+                        "stdout": stdout,
+                        "stderr": "",
+                        "exit_code": exit_code,
+                        "timed_out": false,
+                    }),
+                ));
+            }
+            Ok(Ok(TerminalEvent::Error(msg))) => {
+                let _ = terminal::close_terminal(encrypted, tid).await;
+                anyhow::bail!("terminal error during exec: {msg}");
+            }
+            Ok(Err(e)) => {
+                let _ = terminal::close_terminal(encrypted, tid).await;
+                anyhow::bail!("recv error during exec: {e:#}");
+            }
+            Err(_) => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+
+    // 5. Close the ephemeral terminal.
+    let _ = terminal::close_terminal(encrypted, tid).await;
+
+    // 6. Parse output — extract stdout and exit code from sentinel.
+    let raw = String::from_utf8_lossy(&collected);
+    let (stdout, exit_code) = parse_exec_output(&raw, &sentinel);
+
+    Ok(SessionResponse::ok_with_data(
+        format!("Executed `{command}`"),
+        serde_json::json!({
+            "command": command,
+            "stdout": stdout,
+            "stderr": "",
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+        }),
+    ))
+}
+
+/// Find the sentinel output line (sentinel followed by digit(s) = exit code).
+///
+/// Distinguishes from the echoed command which shows `echo '<sentinel>'$?`
+/// (sentinel followed by `'$?`, not digits).
+fn find_sentinel_output(raw: &str, sentinel: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(pos) = raw[search_from..].find(sentinel) {
+        let abs_pos = search_from + pos;
+        let after = &raw[abs_pos + sentinel.len()..];
+        if after.starts_with(|c: char| c.is_ascii_digit()) {
+            return Some(abs_pos);
+        }
+        search_from = abs_pos + sentinel.len();
+    }
+    None
+}
+
+/// Parse the collected terminal output, extracting real command output and exit code.
+///
+/// Terminal output structure after prompt drain:
+/// ```text
+/// <echoed command>\r\n
+/// echo '<sentinel>'$?\r\n       ← echoed sentinel command
+/// <actual command output>\r\n
+/// <sentinel><exit_code>\r\n     ← sentinel output
+/// <next prompt>
+/// ```
+fn parse_exec_output(raw: &str, sentinel: &str) -> (String, i32) {
+    // 1. Find sentinel output (sentinel + digits = echo result).
+    let Some(sentinel_pos) = find_sentinel_output(raw, sentinel) else {
+        // Sentinel not found (timeout) — return raw output, exit code -1.
+        return (raw.trim().to_string(), -1);
+    };
+
+    // 2. Parse exit code from digits after sentinel.
+    let after = &raw[sentinel_pos + sentinel.len()..];
+    let code_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let exit_code = code_str.parse::<i32>().unwrap_or(-1);
+
+    // 3. Find the echoed echo command to locate where real output starts.
+    let echo_cmd = format!("echo '{sentinel}'");
+    let output_start = raw
+        .find(&echo_cmd)
+        .and_then(|pos| raw[pos..].find('\n').map(|nl| pos + nl + 1))
+        .unwrap_or(0);
+
+    // 4. Sentinel output starts at the beginning of its line.
+    let sentinel_line_start = raw[..sentinel_pos]
+        .rfind('\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+
+    // 5. Extract stdout between echoed echo command and sentinel output line.
+    let stdout = if output_start < sentinel_line_start {
+        raw[output_start..sentinel_line_start]
+            .trim_end_matches(['\r', '\n'])
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    (stdout, exit_code)
+}
+
+// ---------------------------------------------------------------------------
 // Internal: helpers
 // ---------------------------------------------------------------------------
 
@@ -387,4 +611,84 @@ async fn send_response(
 fn cleanup() {
     let _ = fs::remove_file(SOCKET_PATH);
     LockFile::remove();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SENTINEL: &str = "__RDCLI_00000000000000000000000000000001__";
+
+    #[test]
+    fn find_sentinel_output_matches_digit_suffix() {
+        let raw = format!("echo '{SENTINEL}'$?\r\n{SENTINEL}0\r\n$ ");
+        let pos = find_sentinel_output(&raw, SENTINEL);
+        assert!(pos.is_some());
+        // Should match the second occurrence (followed by digit "0").
+        let after = &raw[pos.unwrap() + SENTINEL.len()..];
+        assert!(after.starts_with('0'));
+    }
+
+    #[test]
+    fn find_sentinel_output_skips_echoed_command() {
+        // The echoed command has sentinel inside quotes followed by '$?', not digits.
+        let raw = format!("echo '{SENTINEL}'$?\r\n");
+        assert!(find_sentinel_output(&raw, SENTINEL).is_none());
+    }
+
+    #[test]
+    fn find_sentinel_output_returns_none_when_missing() {
+        assert!(find_sentinel_output("hello world\n", SENTINEL).is_none());
+    }
+
+    #[test]
+    fn parse_exec_output_extracts_stdout_and_exit_code() {
+        let raw = format!(
+            "whoami\r\necho '{SENTINEL}'$?\r\nroot\r\n{SENTINEL}0\r\n$ "
+        );
+        let (stdout, exit_code) = parse_exec_output(&raw, SENTINEL);
+        assert_eq!(stdout, "root");
+        assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn parse_exec_output_handles_nonzero_exit_code() {
+        let raw = format!(
+            "false\r\necho '{SENTINEL}'$?\r\n{SENTINEL}1\r\n$ "
+        );
+        let (stdout, exit_code) = parse_exec_output(&raw, SENTINEL);
+        assert_eq!(stdout, "");
+        assert_eq!(exit_code, 1);
+    }
+
+    #[test]
+    fn parse_exec_output_handles_multi_digit_exit_code() {
+        let raw = format!(
+            "exit 127\r\necho '{SENTINEL}'$?\r\n{SENTINEL}127\r\n$ "
+        );
+        let (_stdout, exit_code) = parse_exec_output(&raw, SENTINEL);
+        assert_eq!(exit_code, 127);
+    }
+
+    #[test]
+    fn parse_exec_output_multiline_stdout() {
+        let raw = format!(
+            "ls\r\necho '{SENTINEL}'$?\r\nfile1.txt\r\nfile2.txt\r\nfile3.txt\r\n{SENTINEL}0\r\n$ "
+        );
+        let (stdout, exit_code) = parse_exec_output(&raw, SENTINEL);
+        assert_eq!(stdout, "file1.txt\r\nfile2.txt\r\nfile3.txt");
+        assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn parse_exec_output_no_sentinel_returns_raw_and_minus_one() {
+        let raw = "some partial output\r\n";
+        let (stdout, exit_code) = parse_exec_output(raw, SENTINEL);
+        assert_eq!(stdout, "some partial output");
+        assert_eq!(exit_code, -1);
+    }
 }

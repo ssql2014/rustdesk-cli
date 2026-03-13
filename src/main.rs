@@ -381,15 +381,19 @@ fn run() -> i32 {
         }) {
             Ok(resp) if resp.success => {
                 let data = resp.data.unwrap_or_else(|| json!({}));
-                let output = data
-                    .get("output")
+                let stdout = data
+                    .get("stdout")
                     .and_then(Value::as_str)
-                    .unwrap_or("stub exec output");
+                    .unwrap_or("");
+                let stderr = data
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let exit_code = data
                     .get("exit_code")
                     .and_then(Value::as_i64)
                     .unwrap_or(0) as i32;
-                emit_response(cli.json, exec_response(&command, output, exit_code))
+                emit_response(cli.json, exec_response(&command, stdout, stderr, exit_code))
             }
             Ok(resp) => emit_response(
                 cli.json,
@@ -742,14 +746,15 @@ fn shell_response() -> Response {
     }
 }
 
-fn exec_response(command: &str, output: &str, exit_code: i32) -> Response {
+fn exec_response(command: &str, stdout: &str, stderr: &str, exit_code: i32) -> Response {
     Response {
-        text: format!("exec exit_code={exit_code} output={output}"),
+        text: format!("exec exit_code={exit_code} stdout={stdout}"),
         json: json!({
             "ok": true,
             "command": "exec",
             "requested": command,
-            "output": output,
+            "stdout": stdout,
+            "stderr": stderr,
             "exit_code": exit_code
         }),
         exit_code: EXIT_SUCCESS,
@@ -991,7 +996,7 @@ fn step_to_response(step: &BatchStep) -> Response {
         "shell" => shell_response(),
         "exec" => {
             let command = flag_value(&step.args, "--command").unwrap_or("");
-            exec_response(command, "stub exec output", 0)
+            exec_response(command, "stub exec output", "", 0)
         }
         "clipboard" => {
             let action = first_non_flag_arg(&step.args).unwrap_or("get");

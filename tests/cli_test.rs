@@ -85,7 +85,8 @@ fn json_exec_contract() {
     assert_eq!(value["command"], "exec");
     if value["ok"] == true {
         assert_eq!(value["requested"], "whoami");
-        assert_eq!(value["output"], "stub exec output");
+        assert_eq!(value["stdout"], "stub exec output");
+        assert_eq!(value["stderr"], "");
         assert_eq!(value["exit_code"], 0);
     } else {
         assert!(value["error"]["code"].is_string());
@@ -324,7 +325,7 @@ fn do_verifies_output_format_for_text_mode_pivot_commands() {
 
     assert_eq!(steps[1]["command"], "exec");
     assert_eq!(steps[1]["requested"], "pwd");
-    assert_eq!(steps[1]["output"], "stub exec output");
+    assert_eq!(steps[1]["stdout"], "stub exec output");
     assert_eq!(steps[1]["exit_code"], 0);
 
     assert_eq!(steps[2]["command"], "clipboard");

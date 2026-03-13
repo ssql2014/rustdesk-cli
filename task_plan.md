@@ -164,3 +164,28 @@ Add a UDP rendezvous client built on the prost-generated RustDesk signaling type
 - [x] Run `cargo test`
 - [x] Confirm unit and integration suites pass
 - **Status:** complete
+
+## 2026-03-14 Live Rendezvous Server Test
+
+### Goal
+Add an ignored integration test that exercises the real RustDesk ID server over UDP using the rendezvous client and verify it with the exact ignored-test command.
+
+### Phases
+#### Phase 1: Discovery
+- [x] Read `TEST_CONFIG.md`
+- [x] Read `src/rendezvous.rs`
+- [x] Read `src/proto.rs`
+- [x] Confirm how to import binary-only modules from an integration test
+- **Status:** complete
+
+#### Phase 2: Implementation
+- [x] Create `tests/live_server_test.rs`
+- [x] Add ignored live UDP test for `RegisterPeer`
+- [x] Add ignored live UDP test coverage for `PunchHoleRequest`
+- **Status:** complete
+
+#### Phase 3: Verification
+- [x] Run `cargo test --test live_server_test -- --ignored`
+- [x] Fix live test assumptions based on actual server response
+- [x] Confirm ignored live test passes
+- **Status:** complete

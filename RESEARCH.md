@@ -322,3 +322,27 @@ A session falls back to the relay server (`hbbr`) in the following scenarios:
 *   **`connect_tcp_local`**: Used during TCP hole punching to attempt a connection from a specific local port.
 *   **`rebind_udp_for`**: Re-establishes a UDP socket if the network environment changes.
 
+---
+
+## 11. Video Decoding for Screenshots
+
+Capturing a screenshot from a RustDesk video stream requires decoding the incoming compressed frames and converting them into a standard image format like PNG.
+
+### VP9 Decoding (libvpx)
+RustDesk utilizes the **`libvpx`** library for decoding VP9 video streams.
+*   **Initialization**: The decoder is initialized using `vpx_codec_vp9_dx()`.
+*   **Decoding Process**: The `VpxDecoder::decode` method passes raw bytes from a `VideoFrame` Protobuf message into the `vpx_codec_decode` function.
+*   **Frame Extraction**: Decoding a single packet may yield multiple frames. RustDesk uses an iterator (`DecodeFrames`) that wraps `vpx_codec_get_frame` to retrieve `Image` objects. For a single screenshot, the client typically iterates through all frames in the current packet and retains only the **last frame** to ensure it has the most up-to-date visual state.
+
+### Pixel Format Conversion
+The raw output from the VP9 decoder is typically in a YUV format (e.g., **I420** or **I444**), which must be converted to **RGBA** for PNG generation.
+*   **Conversion Mechanism**: Conversion is handled by a `to` method on the `Image` object (e.g., `last_frame.to(rgb_buffer)`).
+*   **Libraries**: RustDesk leverages **`libyuv`** (via the `vpxcodec.rs` and `codec.rs` implementations) for high-performance YUV-to-RGB conversion. This handles the necessary color space transformations and chroma upsampling.
+
+### Generating a PNG Frame
+To save a decoded frame as a PNG in the CLI client:
+1.  **Buffer Allocation**: Allocate a buffer of size `width * height * 4` for the RGBA data.
+2.  **Conversion**: Call the decoder's conversion routine to fill this buffer from the `last_frame` decoded from the stream.
+3.  **Encoding**: Use a Rust crate like `png` or `image` to encode the raw RGBA buffer into a PNG file.
+    *   **Note**: Since RustDesk is "P2P-first," the client must wait for a **Keyframe** (I-frame) before it can successfully decode and display the first image. Subsequent delta frames require the previous state.
+

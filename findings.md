@@ -30,6 +30,8 @@
 | Keep the CLI surface stubbed for now even though daemon helpers exist | Existing integration tests lock down the current contract and should not depend on ambient daemon state |
 | Build the rendezvous client directly against the generated `crate::proto::hbb` prost types | This avoids drift between handwritten placeholder types and the real RustDesk signaling schema |
 | Use a connected `UdpSocket` plus typed `RendezvousMessage` helpers for hbbs requests | The rendezvous flow is request/response over UDP, so a connected socket keeps the client API small and the tests simple |
+| Reuse `src/proto.rs` and `src/rendezvous.rs` in the live integration test via `#[path = ...]` imports | The crate is still binary-only, so integration tests cannot import internal modules through a library target yet |
+| Keep the live-server assertion on `PunchHoleResponse` broad | Real hbbs responses vary with peer state, so the test should validate decoding and non-`IdNotExist` behavior rather than assume relay or PK fields are always present |
 
 ## Issues Encountered
 | Issue | Resolution |
@@ -40,6 +42,7 @@
 | `char::encode_utf8()` returns `&mut str`, which did not compare directly against `Option<&str>` in a test assertion | Switched the expectation to `ch.to_string()` and compared via `as_str()` |
 | The transport test initially used `?` in an async test returning `()` | Changed the test to return `Result<()>` so spawned task results could be propagated cleanly |
 | `RegisterPeer` in the generated schema does not carry the public key | Kept `register_peer(my_id, public_key)` aligned with the requested API and reserved the key for the later `RegisterPk` phase described in the research notes |
+| The first live `PunchHoleResponse` assertion was too strict for the real server behavior | Relaxed the check to require successful decoding and a target that is not reported as `ID_NOT_EXIST` |
 
 ## Resources
 - `/Users/qlss/Documents/Projects/rustdesk-cli`

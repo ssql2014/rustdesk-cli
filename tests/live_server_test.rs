@@ -38,7 +38,7 @@ async fn live_rendezvous_server_register_and_punch_hole() -> Result<()> {
 
     let _ = register_response;
 
-    let punch_hole_response = timeout(Duration::from_secs(5), client.punch_hole(TARGET_PEER_ID))
+    let punch_hole_response = timeout(Duration::from_secs(5), client.punch_hole(TARGET_PEER_ID, SERVER_KEY))
         .await??;
 
     let failure = Failure::try_from(punch_hole_response.failure).ok();
@@ -72,7 +72,7 @@ async fn live_rendezvous_server_requests_relay_and_connects_tcp() -> Result<()> 
 
     let _ = register_response;
 
-    let punch_hole_response = timeout(Duration::from_secs(5), client.punch_hole(TARGET_PEER_ID))
+    let punch_hole_response = timeout(Duration::from_secs(5), client.punch_hole(TARGET_PEER_ID, SERVER_KEY))
         .await??;
 
     let failure = Failure::try_from(punch_hole_response.failure).ok();

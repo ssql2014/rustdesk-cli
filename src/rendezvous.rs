@@ -44,13 +44,13 @@ impl RendezvousClient {
         }
     }
 
-    pub async fn punch_hole(&self, target_id: &str) -> Result<PunchHoleResponse> {
+    pub async fn punch_hole(&self, target_id: &str, licence_key: &str) -> Result<PunchHoleResponse> {
         let udp_port = self.socket.local_addr()?.port() as i32;
         let request = RendezvousMessage {
             union: Some(rendezvous_message::Union::PunchHoleRequest(PunchHoleRequest {
                 id: target_id.to_string(),
                 nat_type: NatType::UnknownNat as i32,
-                licence_key: String::new(),
+                licence_key: licence_key.to_string(),
                 conn_type: ConnType::DefaultConn as i32,
                 token: String::new(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -202,7 +202,7 @@ mod tests {
         });
 
         let client = RendezvousClient::connect(&server_addr.to_string()).await?;
-        let response = client.punch_hole("target-9").await?;
+        let response = client.punch_hole("target-9", "").await?;
 
         assert_eq!(response.pk, b"peer-public-key");
         assert_eq!(response.relay_server, "relay.example.com:21117");

@@ -64,7 +64,7 @@ pub async fn connect_to_peer(config: &ConnectionConfig) -> Result<ConnectionResu
         .relay_server
         .as_deref()
         .unwrap_or(&config.relay_server);
-    let transport = relay_connect(relay_addr, &relay_info.uuid, &config.peer_id).await?;
+    let transport = relay_connect(relay_addr, &relay_info.uuid, &config.peer_id, &config.server_key).await?;
 
     // Phase 3+4: NaCl handshake + authentication (takes ownership of transport).
     handshake_and_auth(transport, &server_pk, &config.password, &config.peer_id).await
@@ -93,7 +93,7 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
 
     // Try to punch hole to target.
     let ph_response = client
-        .punch_hole(&config.peer_id)
+        .punch_hole(&config.peer_id, &config.server_key)
         .await
         .context("PunchHoleRequest failed")?;
 
@@ -131,7 +131,7 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
 // Internal: Relay TCP connection + binding
 // ---------------------------------------------------------------------------
 
-async fn relay_connect(relay_addr: &str, uuid: &str, peer_id: &str) -> Result<TcpTransport> {
+async fn relay_connect(relay_addr: &str, uuid: &str, peer_id: &str, licence_key: &str) -> Result<TcpTransport> {
     let mut transport = TcpTransport::connect(relay_addr)
         .await
         .with_context(|| format!("failed to connect TCP to relay {relay_addr}"))?;
@@ -145,7 +145,7 @@ async fn relay_connect(relay_addr: &str, uuid: &str, peer_id: &str) -> Result<Tc
                 socket_addr: Vec::new(),
                 relay_server: String::new(),
                 secure: true,
-                licence_key: String::new(),
+                licence_key: licence_key.to_string(),
                 conn_type: crate::proto::hbb::ConnType::DefaultConn as i32,
                 token: String::new(),
                 control_permissions: None,

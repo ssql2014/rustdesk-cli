@@ -28,6 +28,7 @@ const TARGET_PEER_ID: &str = "308235080";
 const TARGET_PASSWORD: &str = "Evas@2026";
 const CLIENT_ID: &str = "rustdesk-cli-e2e-auth";
 const CLIENT_NAME: &str = "rustdesk-cli-e2e";
+const SERVER_KEY: &str = "SWc0NIWF0wR7kd8rHdGNaCHXtp7dirUImEtrVmRfQdc=";
 const SERVER_ED25519_PK: [u8; 32] = [
     73, 103, 52, 52, 133, 133, 211, 4, 123, 145, 223, 43, 29, 209, 141, 104, 33, 215, 182, 158,
     221, 138, 181, 8, 152, 75, 107, 86, 100, 95, 65, 215,
@@ -49,7 +50,7 @@ async fn live_e2e_connect_auth_probe() -> Result<()> {
     .await??;
 
     let punch_hole_response =
-        timeout(Duration::from_secs(5), rendezvous.punch_hole(TARGET_PEER_ID)).await??;
+        timeout(Duration::from_secs(5), rendezvous.punch_hole(TARGET_PEER_ID, SERVER_KEY)).await??;
 
     let relay_server_hint = if punch_hole_response.relay_server.is_empty() {
         RELAY_SERVER_ADDR

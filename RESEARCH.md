@@ -861,6 +861,41 @@ The `hbbr` server is passive upon TCP connection establishment.
 To ensure a successful relay bind in `src/connection.rs`:
 1.  Verify that the `uuid` from the `RelayResponse` is being correctly passed into the `RequestRelay` message.
 2.  Ensure the `licence_key` field contains the server's public key (the same one used for `PunchHoleRequest`).
-3.  Ensure the 4-byte LE framing is correctly applied to the `RequestRelay` message.
+---
+
+## 27. Shared UDP Socket Demultiplexing
+
+This section explores how the official RustDesk client handles multiple interleaved rendezvous responses (e.g., Heartbeats vs. PunchHole responses) on a single shared UDP socket.
+
+### 1. Unified Socket Architecture
+The official client (via `rendezvous_mediator.rs`) maintains **one UDP socket per rendezvous server**. This single socket is responsible for all signaling traffic, including:
+- Initial registration (`RegisterPk` / `RegisterPeer`).
+- Periodic heartbeats.
+- Requesting and receiving NAT traversal commands (`PunchHole`).
+- Relaying requests.
+
+### 2. The Receive-Dispatch Loop
+Instead of "connecting" the UDP socket to a specific request/response pair, the client uses a continuous event loop powered by `tokio::select!`.
+
+**Logic Flow:**
+1.  **Continuous Read**: The loop constantly polls the socket for the next `RendezvousMessage`.
+2.  **Central Dispatcher**: All received messages are passed to a `handle_resp` function.
+3.  **Pattern Matching**: `handle_resp` uses a large `match` statement on the message union variants.
+4.  **Async Handlers**: Crucially, for stateful or blocking operations (like `handle_punch_hole`), the dispatcher **spawns a new tokio task**. This ensures that the main loop remains free to process subsequent packets (like heartbeat responses) without delay.
+
+### 3. Handling Interleaved Responses
+Because the client is always "listening," it naturally handles interleaved responses:
+- If a `RegisterPeerResponse` arrives while the client is waiting for a `PunchHoleResponse`, the dispatcher simply updates the heartbeat timestamp and returns to the `select!` block.
+- By using task-specific state (or spawning handlers), the client avoids the "incorrect type" errors encountered by simpler sequential `recv` implementations.
+
+### 4. Message Filtering and Deduplication
+- **Duplicate Suppression**: The client tracks the IDs/timestamps of recent messages (using `LAST_MSG` mutexes) and silently discards identical requests received within a short window (e.g., 100ms).
+- **Unknown Messages**: Any message variant that doesn't match a known handler is logged and ignored, preventing the loop from crashing on protocol extensions.
+
+### 5. Implementation Strategy for `rustdesk-cli`
+To resolve response interleaving, the `RendezvousClient` should pivot from a sequential `send -> recv` model to an **Actor or Channel-based model**:
+1.  **Background Task**: Run a dedicated task that owns the `UdpSocket` and performs the `recv_from` loop.
+2.  **Subscription**: Use `mpsc` or `broadcast` channels to allow different parts of the code (e.g., the Heartbeat loop vs. the Connection Orchestrator) to "subscribe" to relevant message types.
+3.  **Routing**: The background task matches the message type and forwards it to the appropriate channel.
 
 

@@ -119,10 +119,23 @@ enum Commands {
         /// Mouse button (left, right, middle)
         #[arg(long, value_enum, default_value_t = MouseButton::Left)]
         button: MouseButton,
+        /// Double-click
+        #[arg(long, default_value_t = false)]
+        double: bool,
         /// X coordinate
         x: i32,
         /// Y coordinate
         y: i32,
+    },
+    /// Scroll the mouse wheel at coordinates
+    #[command(allow_hyphen_values = true)]
+    Scroll {
+        /// X coordinate
+        x: i32,
+        /// Y coordinate
+        y: i32,
+        /// Scroll delta (positive=up, negative=down)
+        delta: i32,
     },
     /// Move the mouse cursor on the remote display
     Move {
@@ -182,6 +195,7 @@ enum Modifier {
     Ctrl,
     Shift,
     Alt,
+    Meta,
 }
 
 impl Modifier {
@@ -190,6 +204,7 @@ impl Modifier {
             Self::Ctrl => "ctrl",
             Self::Shift => "shift",
             Self::Alt => "alt",
+            Self::Meta => "meta",
         }
     }
 }
@@ -587,14 +602,15 @@ fn run() -> i32 {
                 ),
             }
         }
-        Commands::Click { button, x, y } => {
+        Commands::Click { button, double, x, y } => {
             match send_to_daemon(&SessionCommand::Click {
                 x,
                 y,
                 button: button.as_str().to_string(),
+                double,
             }) {
                 Ok(resp) if resp.success => {
-                    emit_response(cli.json, click_response(button, x, y))
+                    emit_response(cli.json, click_response(button, x, y, double))
                 }
                 Ok(resp) => emit_response(
                     cli.json,
@@ -609,6 +625,31 @@ fn run() -> i32 {
                     cli.json,
                     error_response(
                         "click",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+            }
+        }
+        Commands::Scroll { x, y, delta } => {
+            match send_to_daemon(&SessionCommand::Scroll { x, y, delta }) {
+                Ok(resp) if resp.success => {
+                    emit_response(cli.json, scroll_response(x, y, delta))
+                }
+                Ok(resp) => emit_response(
+                    cli.json,
+                    error_response(
+                        "scroll",
+                        "connection_error",
+                        resp.message.as_deref().unwrap_or("scroll failed"),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "scroll",
                         "connection_error",
                         &e.to_string(),
                         EXIT_CONNECTION,
@@ -951,15 +992,33 @@ fn key_response(key: &str, modifiers: &[Modifier]) -> Response {
     }
 }
 
-fn click_response(button: MouseButton, x: i32, y: i32) -> Response {
+fn click_response(button: MouseButton, x: i32, y: i32, double: bool) -> Response {
     Response {
-        text: format!("clicked button={} x={x} y={y}", button.as_str()),
+        text: format!(
+            "clicked button={} x={x} y={y} double={double}",
+            button.as_str()
+        ),
         json: json!({
             "ok": true,
             "command": "click",
             "button": button.as_str(),
             "x": x,
-            "y": y
+            "y": y,
+            "double": double
+        }),
+        exit_code: EXIT_SUCCESS,
+    }
+}
+
+fn scroll_response(x: i32, y: i32, delta: i32) -> Response {
+    Response {
+        text: format!("scrolled x={x} y={y} delta={delta}"),
+        json: json!({
+            "ok": true,
+            "command": "scroll",
+            "x": x,
+            "y": y,
+            "delta": delta
         }),
         exit_code: EXIT_SUCCESS,
     }
@@ -1090,10 +1149,17 @@ fn step_to_response(step: &BatchStep) -> Response {
             let button = flag_value(&step.args, "--button")
                 .and_then(parse_mouse_button)
                 .unwrap_or(MouseButton::Left);
+            let double = flag_present(&step.args, "--double");
             let coords = positional_args(&step.args);
             let x = coords.first().and_then(|value| value.parse::<i32>().ok()).unwrap_or(0);
             let y = coords.get(1).and_then(|value| value.parse::<i32>().ok()).unwrap_or(0);
-            click_response(button, x, y)
+            click_response(button, x, y, double)
+        }
+        "scroll" => {
+            let x = step.args.first().and_then(|value| value.parse::<i32>().ok()).unwrap_or(0);
+            let y = step.args.get(1).and_then(|value| value.parse::<i32>().ok()).unwrap_or(0);
+            let delta = step.args.get(2).and_then(|value| value.parse::<i32>().ok()).unwrap_or(0);
+            scroll_response(x, y, delta)
         }
         "move" => {
             let x = step.args.first().and_then(|value| value.parse::<i32>().ok()).unwrap_or(0);
@@ -1165,6 +1231,20 @@ fn parse_batch_steps(tokens: &[String]) -> Result<Vec<BatchStep>, String> {
                     args: vec![tokens[index + 1].clone()],
                 });
                 index += 2;
+            }
+            "scroll" => {
+                if index + 3 >= tokens.len() {
+                    return Err("scroll requires x y delta".to_string());
+                }
+                steps.push(BatchStep {
+                    command,
+                    args: vec![
+                        tokens[index + 1].clone(),
+                        tokens[index + 2].clone(),
+                        tokens[index + 3].clone(),
+                    ],
+                });
+                index += 4;
             }
             "move" => {
                 if index + 2 >= tokens.len() {
@@ -1249,6 +1329,12 @@ fn parse_click_step(tokens: &[String], mut index: usize) -> Result<(Vec<String>,
             args.push(token.clone());
             args.push(tokens[index + 1].clone());
             index += 2;
+            continue;
+        }
+
+        if token == "--double" {
+            args.push(token.clone());
+            index += 1;
             continue;
         }
 
@@ -1350,6 +1436,7 @@ fn is_step_command(token: &str) -> bool {
             | "type"
             | "key"
             | "click"
+            | "scroll"
             | "move"
             | "drag"
     )
@@ -1359,6 +1446,10 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|window| window[0] == flag)
         .map(|window| window[1].as_str())
+}
+
+fn flag_present(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
 }
 
 fn first_non_flag_arg(args: &[String]) -> Option<&str> {

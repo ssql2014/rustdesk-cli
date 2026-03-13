@@ -34,6 +34,7 @@ fn help_lists_all_subcommands() {
                 .and(contains("type"))
                 .and(contains("key"))
                 .and(contains("click"))
+                .and(contains("scroll"))
                 .and(contains("move"))
                 .and(contains("drag"))
                 .and(contains("do")),
@@ -171,6 +172,7 @@ fn json_click_contract() {
         assert_eq!(value["button"], "left");
         assert_eq!(value["x"], 500);
         assert_eq!(value["y"], 300);
+        assert_eq!(value["double"], false);
     } else {
         assert!(value["error"]["code"].is_string());
     }
@@ -372,4 +374,54 @@ fn capture_region_invalid_dimensions_fail() {
         .assert()
         .failure()
         .stderr(contains("region width and height must be positive"));
+}
+
+#[test]
+fn json_scroll_contract() {
+    let value = run_json_any_exit(&["--json", "scroll", "100", "200", "3"]);
+    assert_eq!(value["command"], "scroll");
+    if value["ok"] == true {
+        assert_eq!(value["x"], 100);
+        assert_eq!(value["y"], 200);
+        assert_eq!(value["delta"], 3);
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
+}
+
+#[test]
+fn json_scroll_negative_delta() {
+    let value = run_json_any_exit(&["--json", "scroll", "50", "60", "-2"]);
+    assert_eq!(value["command"], "scroll");
+    if value["ok"] == true {
+        assert_eq!(value["delta"], -2);
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
+}
+
+#[test]
+fn json_click_double_contract() {
+    let value = run_json_any_exit(&["--json", "click", "--double", "500", "300"]);
+    assert_eq!(value["command"], "click");
+    if value["ok"] == true {
+        assert_eq!(value["button"], "left");
+        assert_eq!(value["x"], 500);
+        assert_eq!(value["y"], 300);
+        assert_eq!(value["double"], true);
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
+}
+
+#[test]
+fn json_key_meta_modifier() {
+    let value = run_json_any_exit(&["--json", "key", "a", "--modifiers", "meta"]);
+    assert_eq!(value["command"], "key");
+    if value["ok"] == true {
+        assert_eq!(value["key"], "a");
+        assert_eq!(value["modifiers"], serde_json::json!(["meta"]));
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
 }

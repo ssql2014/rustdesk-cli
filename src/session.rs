@@ -63,6 +63,7 @@ pub enum SessionCommand {
         x: i32,
         y: i32,
         button: String,
+        double: bool,
     },
     Drag {
         x: i32,
@@ -271,10 +272,10 @@ impl Session {
                 Ok((SessionResponse::ok("Key sent"), messages))
             }
 
-            SessionCommand::Click { x, y, button } => {
+            SessionCommand::Click { x, y, button, double } => {
                 self.require_connected()?;
                 let mask = MouseEvent::button_mask(&button);
-                let messages = vec![
+                let click_pair = vec![
                     ProtocolMessage::MouseEvent(MouseEvent {
                         x,
                         y,
@@ -288,6 +289,13 @@ impl Session {
                         is_move: false,
                     }),
                 ];
+                let messages = if double {
+                    let mut msgs = click_pair.clone();
+                    msgs.extend(click_pair);
+                    msgs
+                } else {
+                    click_pair
+                };
                 Ok((
                     SessionResponse::ok(format!("{button} click at ({x}, {y})")),
                     messages,
@@ -571,6 +579,7 @@ mod tests {
                 x: 100,
                 y: 200,
                 button: "left".to_string(),
+                double: false,
             })
             .expect("click should succeed");
 
@@ -726,6 +735,7 @@ mod tests {
                 x: 100,
                 y: 200,
                 button: "left".to_string(),
+                double: false,
             },
             SessionCommand::Drag {
                 x: 100,

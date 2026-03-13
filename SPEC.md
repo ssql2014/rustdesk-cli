@@ -176,6 +176,8 @@ All errors go to stderr. Exit codes:
 | **M2: Input** | `type`, `key`, `click`, `move` working | Can type text and click buttons remotely |
 | **M3: Polish** | Session daemon, error handling, JSON output, docs | Reliable enough for AI agent loops |
 | **M4: Release** | Published crate + binary | `cargo install rustdesk-cli` works |
+| **M5: Text-First** | `shell`, `exec`, `clipboard` working via TerminalAction channel | Can open remote PTY, run commands, read output — no video needed |
+| **M6: Dogfood** | Use rustdesk-cli to develop a 算子 on remote server 308235080 | Connect → shell → edit files → compile → run, all via CLI. Validates real development workflow. 算子 can be simple (matrix multiply, convolution in C/CUDA/Python) — the point is proving the tool works. |
 
 ## References
 

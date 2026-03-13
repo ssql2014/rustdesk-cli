@@ -924,6 +924,37 @@ To unblock the `connect` command:
 1.  **Peer Verification**: Verify the target peer `308235080` is actually running and connected to the same ID server.
 2.  **State Warm-up**: The client should maintain heartbeats for **at least 5-10 seconds** before attempting the first `PunchHoleRequest`.
 3.  **Hole Punching Resilience**: Implement the actor-based demuxing described in **Section 27** to ensure heartbeat responses never block the discovery of connection responses.
-4.  **Error Feedback**: The CLI should immediately report `LicenseMismatch` if received, rather than waiting for a timeout, to provide better UX during misconfiguration.
+---
+
+## 29. Full Session Lifecycle & Initialization
+
+This section details the message sequence and session management logic used by the official RustDesk client after successful authentication.
+
+### 1. Initialization Sequence
+The session initialization is a multi-step handshake that follows the NaCl phase:
+1.  **LoginRequest (Client → Host)**: Contains the authentication credentials and the initial **`OptionMessage`**.
+2.  **LoginResponse (Host → Client)**: Indicates success or failure.
+3.  **PeerInfo (Host → Client)**: Sent by the host immediately after a successful login. It contains remote display information, OS details, and supported features.
+4.  **Client Post-Login Actions**:
+    *   **`CaptureDisplays`**: The client tells the host which displays to start capturing (e.g., `add: [0]`).
+    *   **`Misc { refresh_video: true }`**: Often sent to force the host's encoder to produce an immediate Keyframe.
+    *   **Resolution Sync**: Client may send `change_display_resolution` to align the remote desktop with the client window.
+
+### 2. The `OptionMessage`
+The `OptionMessage` is the primary control structure for session behavior. It can be sent within the `LoginRequest` or later via `Misc { option: ... }`.
+- **Image Quality**: Controls `image_quality` (Low, Balanced, Best) and `custom_fps`.
+- **Input Constraints**: Flags like `disable_keyboard`, `disable_clipboard`, and `disable_audio`.
+- **Capabilities**: `supported_decoding` informs the host which codecs (VP9, AV1, H264) the client can handle.
+- **Persistence**: `terminal_persistent` (for terminal sessions) prevents the host from killing PTYs on disconnect.
+
+### 3. Session Maintenance & Heartbeats
+RustDesk uses two mechanisms to maintain the encrypted TCP session:
+- **`TestDelay`**: The server periodically sends a `TestDelay` message. The client must echo this message back. This measures RTT and allows the host to adjust bitrate/quality dynamically.
+- **Heartbeat Timeout**: The client tracks the time since the last message was received. If it exceeds $1.5 \times$ the `keep_alive` interval, the session is terminated with a timeout error.
+
+### 4. Termination and Failure Detection
+- **Clean Disconnect**: One side sends a `Misc { close_reason: ... }` message before closing the socket.
+- **Network Failure**: Caught via standard `std::io::Error` (e.g., `ECONNRESET`).
+- **State Cleanup**: On failure, the client must abort background tasks (heartbeats, decoders) and transition the session state to `Disconnected`.
 
 

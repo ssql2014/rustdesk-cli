@@ -982,6 +982,37 @@ The host requires an explicit command to start its capture pipeline before it wi
 For the best possible screenshot:
 - **ImageQuality**: Use `Best`.
 - **Custom Quality**: If the host supports it, populate `custom_image_quality` with a high value (e.g., 100) to minimize compression artifacts.
-- **Chroma**: Set `prefer_chroma` to `I444` if the client's decoder supports it, as this provides better color reproduction than the standard `I420`.
+---
+
+## 31. Multi-Display Protocol Handling
+
+This section details how the RustDesk protocol discovers, reports, and manages sessions with multiple monitors.
+
+### 1. Display Reporting via `PeerInfo`
+Available displays are announced by the host immediately after authentication.
+- **Message**: `PeerInfo { displays: [...], current_display: i32, ... }`
+- **Structure**: The `displays` field is a `repeated DisplayInfo` list. Each `DisplayInfo` contains:
+    - `x, y`: Global coordinate offsets relative to the primary monitor.
+    - `width, height`: The resolution of the specific monitor.
+    - `name`: OS-provided string (e.g., "\\\\.\\DISPLAY1").
+    - `online`: Boolean indicating if the monitor is currently active.
+- **Discovery**: The client can query all available monitors from this initial message without initiating a video stream or capture.
+
+### 2. Dynamic Capture Control (`CaptureDisplays`)
+The client controls which monitors are being actively scraped and streamed using the `CaptureDisplays` message.
+- **Fields**:
+    - **`add`**: A list of display indices to start capturing.
+    - **`sub`**: A list of display indices to stop capturing.
+    - **`set`**: A list of display indices to capture exclusively (stops all others).
+- **Dynamic Switching**: This allows the client to switch between monitors or view multiple monitors simultaneously by updating the capture set at runtime.
+
+### 3. Display Index Mapping
+RustDesk uses a 0-based integer index to identify monitors.
+- **Source**: The index corresponds to the order of monitors returned by the system-level capture library (**`scrap`**).
+- **Primary Monitor**: Index `0` is almost always the primary monitor as defined by the OS.
+- **Mapping Consistency**: The mapping is stable for the duration of a session but can change if monitors are physically reconnected, as the enumeration order in `scrap::Display::all()` depends on OS driver reporting.
+
+### 4. Headless & Virtual Displays
+If the host is headless or has virtual display drivers installed (e.g., RustDesk's virtual display driver on Windows), these are reported as standard `DisplayInfo` entries in the `PeerInfo` list. The CLI client can interact with them using the same index-based protocol.
 
 

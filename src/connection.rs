@@ -13,8 +13,8 @@ use rand_core::{OsRng, RngCore};
 
 use crate::crypto::{self, EncryptedStream, KeyExchangeResult};
 use crate::proto::hbb::{
-    LoginRequest, Message, PeerInfo, PublicKey,
-    login_response, message,
+    LoginRequest, Message, PeerInfo, PublicKey, PunchHoleResponse,
+    login_response, message, punch_hole_response,
 };
 use crate::rendezvous::RendezvousClient;
 use crate::transport::{TcpTransport, Transport};
@@ -110,6 +110,9 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
         .await
         .context("PunchHoleRequest failed")?;
 
+    // Check for immediate PunchHole failure before proceeding to relay.
+    check_punch_hole_failure(&ph_response)?;
+
     // Determine relay info from punch-hole response.
     let relay_server = if ph_response.relay_server.is_empty() {
         None
@@ -138,6 +141,44 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
         relay_server: relay_addr,
         uuid,
     })
+}
+
+/// Check for immediate PunchHole failure codes and bail with a descriptive error.
+///
+/// The rendezvous server signals errors via the `failure` enum field and the
+/// free-text `other_failure` string.  We detect these early so the CLI can
+/// report a clear message instead of silently falling through to a relay that
+/// will also fail.
+fn check_punch_hole_failure(resp: &PunchHoleResponse) -> Result<()> {
+    // Non-empty other_failure is always an error, regardless of the enum value.
+    if !resp.other_failure.is_empty() {
+        bail!("punch hole failed: {}", resp.other_failure);
+    }
+
+    match punch_hole_response::Failure::try_from(resp.failure) {
+        // 0 = IdNotExist is also the protobuf default.  Distinguish a real
+        // "ID not found" from "no error" by checking whether the server
+        // gave us any useful addressing data.
+        Ok(punch_hole_response::Failure::IdNotExist) => {
+            if resp.socket_addr.is_empty() && resp.relay_server.is_empty() {
+                bail!("punch hole failed: the target ID does not exist on the rendezvous server");
+            }
+            Ok(())
+        }
+        Ok(punch_hole_response::Failure::Offline) => {
+            bail!("punch hole failed: the target peer is offline");
+        }
+        Ok(punch_hole_response::Failure::LicenseMismatch) => {
+            bail!("punch hole failed: license mismatch between client and server");
+        }
+        Ok(punch_hole_response::Failure::LicenseOveruse) => {
+            bail!("punch hole failed: license connection limit exceeded (login overload)");
+        }
+        // Unknown failure code — report the raw value.
+        Err(_) => {
+            bail!("punch hole failed: unknown failure code {}", resp.failure);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +405,76 @@ mod tests {
         let id = rand_session_id();
         // Just ensure it doesn't panic; the value is random.
         let _ = id;
+    }
+
+    #[test]
+    fn punch_hole_success_passes_check() {
+        let resp = PunchHoleResponse {
+            socket_addr: vec![127, 0, 0, 1, 0x20, 0xfb],
+            relay_server: "relay.example.com:21117".to_string(),
+            failure: 0,
+            ..Default::default()
+        };
+        assert!(check_punch_hole_failure(&resp).is_ok());
+    }
+
+    #[test]
+    fn punch_hole_offline_fails() {
+        let resp = PunchHoleResponse {
+            failure: punch_hole_response::Failure::Offline as i32,
+            ..Default::default()
+        };
+        let err = check_punch_hole_failure(&resp).unwrap_err();
+        assert!(err.to_string().contains("offline"), "got: {err}");
+    }
+
+    #[test]
+    fn punch_hole_license_mismatch_fails() {
+        let resp = PunchHoleResponse {
+            failure: punch_hole_response::Failure::LicenseMismatch as i32,
+            ..Default::default()
+        };
+        let err = check_punch_hole_failure(&resp).unwrap_err();
+        assert!(err.to_string().contains("license mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn punch_hole_license_overuse_fails() {
+        let resp = PunchHoleResponse {
+            failure: punch_hole_response::Failure::LicenseOveruse as i32,
+            ..Default::default()
+        };
+        let err = check_punch_hole_failure(&resp).unwrap_err();
+        assert!(
+            err.to_string().contains("license connection limit"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn punch_hole_id_not_exist_with_empty_addrs_fails() {
+        // failure=0 (IdNotExist) + no socket_addr + no relay_server → real failure
+        let resp = PunchHoleResponse {
+            failure: 0,
+            socket_addr: vec![],
+            relay_server: String::new(),
+            ..Default::default()
+        };
+        let err = check_punch_hole_failure(&resp).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn punch_hole_other_failure_string() {
+        let resp = PunchHoleResponse {
+            other_failure: "custom server error".to_string(),
+            ..Default::default()
+        };
+        let err = check_punch_hole_failure(&resp).unwrap_err();
+        assert!(
+            err.to_string().contains("custom server error"),
+            "got: {err}"
+        );
     }
 
     /// Live server integration test — requires the self-hosted RustDesk server

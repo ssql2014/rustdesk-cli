@@ -136,3 +136,31 @@ Add a reusable transport abstraction with RustDesk-style length-prefixed framing
 - [x] Fix compile or test regressions
 - [x] Confirm full suite passes cleanly
 - **Status:** complete
+
+## 2026-03-14 Rendezvous Client
+
+### Goal
+Add a UDP rendezvous client built on the prost-generated RustDesk signaling types, cover registration/hole-punch/relay flows with unit tests, and keep the full crate test suite green.
+
+### Phases
+#### Phase 1: Discovery
+- [x] Read `RESEARCH.md` sections 8 and 10
+- [x] Inspect `src/proto.rs`
+- [x] Inspect the generated `hbb.rs` types
+- [x] Confirm current crate/module state before editing
+- **Status:** complete
+
+#### Phase 2: Implementation
+- [x] Create `src/rendezvous.rs`
+- [x] Implement `RendezvousClient::connect`
+- [x] Implement `register_peer`
+- [x] Implement `punch_hole`
+- [x] Implement `request_relay`
+- [x] Add UDP unit tests
+- [x] Add `mod rendezvous;` to `src/main.rs`
+- **Status:** complete
+
+#### Phase 3: Verification
+- [x] Run `cargo test`
+- [x] Confirm unit and integration suites pass
+- **Status:** complete

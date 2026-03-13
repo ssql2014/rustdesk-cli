@@ -28,6 +28,8 @@
 | Represent scroll as repeated mouse wheel press/release pairs based on `delta` sign and magnitude | The current protocol only has `mask` and `is_move`, so repeated wheel masks are the simplest compatible encoding |
 | Let `FramedTransport` own RustDesk-style message framing and have `TcpTransport` delegate to it | This keeps framing testable with `tokio::io::duplex` while still exposing a concrete TCP transport |
 | Keep the CLI surface stubbed for now even though daemon helpers exist | Existing integration tests lock down the current contract and should not depend on ambient daemon state |
+| Build the rendezvous client directly against the generated `crate::proto::hbb` prost types | This avoids drift between handwritten placeholder types and the real RustDesk signaling schema |
+| Use a connected `UdpSocket` plus typed `RendezvousMessage` helpers for hbbs requests | The rendezvous flow is request/response over UDP, so a connected socket keeps the client API small and the tests simple |
 
 ## Issues Encountered
 | Issue | Resolution |
@@ -37,6 +39,7 @@
 | No existing CLI tests | Add an integration suite against the built binary with `assert_cmd` |
 | `char::encode_utf8()` returns `&mut str`, which did not compare directly against `Option<&str>` in a test assertion | Switched the expectation to `ch.to_string()` and compared via `as_str()` |
 | The transport test initially used `?` in an async test returning `()` | Changed the test to return `Result<()>` so spawned task results could be propagated cleanly |
+| `RegisterPeer` in the generated schema does not carry the public key | Kept `register_peer(my_id, public_key)` aligned with the requested API and reserved the key for the later `RegisterPk` phase described in the research notes |
 
 ## Resources
 - `/Users/qlss/Documents/Projects/rustdesk-cli`

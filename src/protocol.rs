@@ -135,3 +135,70 @@ impl ProtocolMessage {
         Ok(serde_json::from_slice(data)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn button_mask_maps_known_buttons_and_defaults_to_left() {
+        assert_eq!(MouseEvent::button_mask("left"), MouseEvent::BUTTON_LEFT);
+        assert_eq!(MouseEvent::button_mask("right"), MouseEvent::BUTTON_RIGHT);
+        assert_eq!(MouseEvent::button_mask("middle"), MouseEvent::BUTTON_MIDDLE);
+        assert_eq!(MouseEvent::button_mask("unknown"), MouseEvent::BUTTON_LEFT);
+    }
+
+    #[test]
+    fn protocol_message_key_event_roundtrip() {
+        let message = ProtocolMessage::KeyEvent(KeyEvent {
+            key_code: Some(13),
+            characters: Some("enter".to_string()),
+            down: true,
+            modifiers: KeyModifiers {
+                shift: false,
+                ctrl: true,
+                alt: false,
+                meta: false,
+            },
+        });
+
+        let encoded = message.encode().expect("encode should succeed");
+        let decoded = ProtocolMessage::decode(&encoded).expect("decode should succeed");
+
+        match decoded {
+            ProtocolMessage::KeyEvent(event) => {
+                assert_eq!(event.key_code, Some(13));
+                assert_eq!(event.characters.as_deref(), Some("enter"));
+                assert!(event.down);
+                assert!(event.modifiers.ctrl);
+                assert!(!event.modifiers.shift);
+                assert!(!event.modifiers.alt);
+                assert!(!event.modifiers.meta);
+            }
+            other => panic!("expected key event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_message_mouse_event_roundtrip() {
+        let message = ProtocolMessage::MouseEvent(MouseEvent {
+            x: 100,
+            y: 200,
+            mask: MouseEvent::BUTTON_LEFT,
+            is_move: false,
+        });
+
+        let encoded = message.encode().expect("encode should succeed");
+        let decoded = ProtocolMessage::decode(&encoded).expect("decode should succeed");
+
+        match decoded {
+            ProtocolMessage::MouseEvent(event) => {
+                assert_eq!(event.x, 100);
+                assert_eq!(event.y, 200);
+                assert_eq!(event.mask, MouseEvent::BUTTON_LEFT);
+                assert!(!event.is_move);
+            }
+            other => panic!("expected mouse event, got {other:?}"),
+        }
+    }
+}

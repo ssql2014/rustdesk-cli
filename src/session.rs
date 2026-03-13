@@ -250,3 +250,193 @@ impl Session {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connected_session() -> Session {
+        let mut session = Session::new();
+        let _ = session.dispatch(SessionCommand::Connect {
+            peer_id: "test".to_string(),
+            password: None,
+            server: None,
+        }).expect("connect should succeed");
+        session
+    }
+
+    #[test]
+    fn new_session_starts_disconnected() {
+        let session = Session::new();
+
+        assert_eq!(session.state, ConnectionState::Disconnected);
+        assert!(session.config.is_none());
+        assert!(session.peer_info.is_none());
+    }
+
+    #[test]
+    fn connect_transitions_to_connected_and_returns_success() {
+        let mut session = Session::new();
+
+        let (response, messages) = session.dispatch(SessionCommand::Connect {
+            peer_id: "test".to_string(),
+            password: None,
+            server: None,
+        }).expect("connect should succeed");
+
+        assert!(response.success);
+        assert_eq!(response.message.as_deref(), Some("Connected to test"));
+        assert!(messages.is_empty());
+        assert_eq!(session.state, ConnectionState::Connected);
+        assert_eq!(
+            session.config.as_ref().map(|config| config.peer_id.as_str()),
+            Some("test")
+        );
+    }
+
+    #[test]
+    fn disconnect_from_connected_returns_disconnect_message() {
+        let mut session = connected_session();
+
+        let (response, messages) = session
+            .dispatch(SessionCommand::Disconnect)
+            .expect("disconnect should succeed");
+
+        assert!(response.success);
+        assert_eq!(response.message.as_deref(), Some("Disconnected from test"));
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], ProtocolMessage::Disconnect));
+        assert_eq!(session.state, ConnectionState::Disconnected);
+        assert!(session.config.is_none());
+        assert!(session.peer_info.is_none());
+    }
+
+    #[test]
+    fn type_generates_key_event_sequence_for_each_character() {
+        let mut session = connected_session();
+
+        let (response, messages) = session
+            .dispatch(SessionCommand::Type {
+                text: "hello".to_string(),
+            })
+            .expect("type should succeed");
+
+        assert!(response.success);
+        assert_eq!(response.message.as_deref(), Some("Typed 5 characters"));
+        assert_eq!(messages.len(), 10);
+
+        for (index, ch) in "hello".chars().enumerate() {
+            let expected = ch.to_string();
+            let down = &messages[index * 2];
+            let up = &messages[index * 2 + 1];
+
+            match down {
+                ProtocolMessage::KeyEvent(event) => {
+                    assert_eq!(event.characters.as_deref(), Some(expected.as_str()));
+                    assert!(event.down);
+                    assert!(event.key_code.is_none());
+                    assert!(!event.modifiers.shift);
+                    assert!(!event.modifiers.ctrl);
+                    assert!(!event.modifiers.alt);
+                    assert!(!event.modifiers.meta);
+                }
+                other => panic!("expected key down event, got {other:?}"),
+            }
+
+            match up {
+                ProtocolMessage::KeyEvent(event) => {
+                    assert_eq!(event.characters.as_deref(), Some(expected.as_str()));
+                    assert!(!event.down);
+                    assert!(event.key_code.is_none());
+                }
+                other => panic!("expected key up event, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn click_generates_left_button_press_and_release() {
+        let mut session = connected_session();
+
+        let (response, messages) = session
+            .dispatch(SessionCommand::Click {
+                x: 100,
+                y: 200,
+                button: "left".to_string(),
+            })
+            .expect("click should succeed");
+
+        assert!(response.success);
+        assert_eq!(response.message.as_deref(), Some("left click at (100, 200)"));
+        assert_eq!(messages.len(), 2);
+
+        match &messages[0] {
+            ProtocolMessage::MouseEvent(event) => {
+                assert_eq!(event.x, 100);
+                assert_eq!(event.y, 200);
+                assert_eq!(event.mask, MouseEvent::BUTTON_LEFT);
+                assert!(!event.is_move);
+            }
+            other => panic!("expected mouse down event, got {other:?}"),
+        }
+
+        match &messages[1] {
+            ProtocolMessage::MouseEvent(event) => {
+                assert_eq!(event.x, 100);
+                assert_eq!(event.y, 200);
+                assert_eq!(event.mask, 0);
+                assert!(!event.is_move);
+            }
+            other => panic!("expected mouse up event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_returns_data_with_state_and_peer_id() {
+        let mut session = connected_session();
+
+        let (response, messages) = session
+            .dispatch(SessionCommand::Status)
+            .expect("status should succeed");
+
+        assert!(response.success);
+        assert!(messages.is_empty());
+
+        let data = response.data.expect("status should include data");
+        assert_eq!(data["state"], serde_json::json!("Connected"));
+        assert_eq!(data["peer_id"], serde_json::json!("test"));
+        assert!(data.get("peer_info").is_some());
+    }
+
+    #[test]
+    fn disconnected_session_rejects_commands_that_require_connection() {
+        let commands = [
+            SessionCommand::Disconnect,
+            SessionCommand::Capture {
+                output: "shot.png".to_string(),
+            },
+            SessionCommand::Type {
+                text: "hello".to_string(),
+            },
+            SessionCommand::Key {
+                key: "enter".to_string(),
+            },
+            SessionCommand::Click {
+                x: 100,
+                y: 200,
+                button: "left".to_string(),
+            },
+            SessionCommand::Move { x: 100, y: 200 },
+        ];
+
+        for command in commands {
+            let mut session = Session::new();
+            let error = session.dispatch(command).expect_err("command should fail");
+            assert_eq!(
+                error.to_string(),
+                "No active session. Run `rustdesk-cli connect` first."
+            );
+            assert_eq!(session.state, ConnectionState::Disconnected);
+        }
+    }
+}

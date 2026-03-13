@@ -661,6 +661,24 @@ fn run() -> i32 {
             }
         }
         Commands::Do { steps } => {
+            if !daemon::is_daemon_running() {
+                return emit_batch_response(
+                    cli.json,
+                    BatchResponse {
+                        lines: vec!["session_error: No active session".to_string()],
+                        json: json!({
+                            "ok": false,
+                            "command": "do",
+                            "error": {
+                                "code": "session_error",
+                                "message": "No active session"
+                            }
+                        }),
+                        exit_code: 2,
+                    },
+                );
+            }
+
             let response = match parse_batch_steps(&steps) {
                 Ok(parsed_steps) => do_response(&parsed_steps),
                 Err(message) => batch_error_response(message),

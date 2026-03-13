@@ -719,9 +719,50 @@ The `RESEARCH.md` (Section 16) specifies that all TCP messages must be prefixed 
 - **PunchHoleResponse**: The code currently ignores the `failure` field in `PunchHoleResponse`. If the peer were offline, this field would contain `OFFLINE (2)`.
 - **UUID Generation**: Since Phase 1 returns a valid `uuid` from `hbbs`, the signaling server at least recognizes the session request, suggesting the target peer is registered.
 
-### 5. e2e_connect_test.rs Insights
-The test confirms the failure point: it sends the `RequestRelay` bind message and then encounters an `early eof` or timeout when calling `recv()`. This confirms that the relay server either dropped the connection due to the invalid length or the test timeout hit while the server was waiting for the "1.6 GB" payload.
+---
 
-### Summary for Implementation
-To unblock the connection, the `FramedTransport` in `src/transport.rs` must be updated to use `u32::to_le_bytes()` and `u32::from_le_bytes()`.
+## 23. Capture Pipeline Design
+
+To resolve **BUG-002** (stubbed capture command), the `rustdesk-cli` must implement a real screenshot pipeline. This section details the design for two primary capture paths: the **Video Stream Path** (standard) and the **Screenshot Protocol Path** (on-demand).
+
+### 1. Video Stream Path (Full Protocol)
+This path is the most robust as it mirrors the official RustDesk client behavior. It is required when using the `DEFAULT_CONN` connection type.
+
+**Workflow:**
+1.  **Handshake & Login**: Complete the NaCl handshake and `LoginRequest`.
+2.  **Request Keyframe**: To minimize wait time, send a `Misc` message with `refresh_video: true`. This forces the host's encoder to generate a new **Keyframe** (IDR/Intra frame).
+3.  **Frame Acquisition**: Listen for `VideoFrame` messages.
+4.  **Keyframe Filtering**: Inspect the `EncodedVideoFrame` messages. Only process frames where `key == true`. Delta frames (P-frames) cannot be decoded without previous state.
+5.  **Decoding**:
+    *   **VP9**: Use the **`vpx-rs`** crate (idiomatic wrapper for `libvpx`).
+    *   **AV1**: Use the **`dav1d`** crate.
+    *   **H264**: Use **`openh264`** if hardware acceleration is not available.
+6.  **Pixel Conversion**: Decoders typically output **YUV420P**. Use **`yuvutils-rs`** or **`fast_image_resize`** to convert the YUV planes to **RGBA** raw pixels.
+7.  **PNG Encoding**: Use the **`image`** crate to encode the RGBA buffer and save it to the user-specified file path.
+
+### 2. Screenshot Protocol Path (Minimal)
+This is a dedicated, simpler mechanism described in **Section 20**. It is functional even with the `TERMINAL` connection type.
+
+**Workflow:**
+1.  **Request**: Send a `ScreenshotRequest` containing the target `display` index.
+2.  **Response**: Wait for a `ScreenshotResponse`.
+3.  **Payload**: The `data` field in the response contains a complete, encoded image file (magic bytes will indicate PNG or JPEG).
+4.  **Save**: Write the `data` bytes directly to disk.
+
+### 3. Comparison and Selection
+| Feature | Video Stream Path | Screenshot Protocol Path |
+| :--- | :--- | :--- |
+| **Complexity** | High (Requires codecs + YUV conversion) | Low (Direct file writing) |
+| **Bandwidth** | High (Requires starting a stream) | Low (Single packet) |
+| **Speed** | Slow (Waiting for Keyframe) | Fast (On-demand capture) |
+| **Compatibility** | Universal (All RustDesk hosts) | Host-dependent (May not be in older versions) |
+
+### Implementation Recommendation
+For `rustdesk-cli`, the **Screenshot Protocol Path** should be the primary method for the `capture` command due to its simplicity and efficiency. However, the **Video Stream Path** should be implemented as a fallback to ensure 100% compatibility with all remote hosts.
+
+### Required Crates for Real Capture
+- `vpx-rs` or `vpx-sys` (VP9 decoding)
+- `dav1d` (AV1 decoding)
+- `image` (PNG/JPEG handling and YUV->RGB if needed)
+- `yuvutils-rs` (Fast YUV conversion)
 

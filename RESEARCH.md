@@ -86,3 +86,36 @@ RustDesk implements a "P2P-first" approach:
 3.  **Relay (hbbr):** Used as a last resort. The relay server cannot decrypt the data as it lacks the shared secret established during the handshake.
 
 For a minimal CLI, implementing the **Relay** path first might be easier for guaranteed connectivity, though **P2P** is necessary for performance.
+
+---
+
+## 7. Vendored Proto Analysis
+
+The Protobuf definitions have been vendored into the `proto/` directory from the `hbb_common` repository.
+
+### Source Information
+*   **Repository:** `https://github.com/rustdesk/hbb_common` (Submodule of `rustdesk/rustdesk`)
+*   **Commit Hash:** `980bc11` (February 14, 2026)
+*   **Files:** `rendezvous.proto`, `message.proto`
+*   **Imports:** None (Self-contained)
+
+### Minimal Message Set for MVP
+
+To achieve the goal of connecting, authenticating, capturing a screenshot, and sending input, the following messages are required:
+
+#### Connection & Discovery (`rendezvous.proto`)
+*   **`RendezvousMessage`**: The top-level wrapper for signaling.
+*   **`RegisterPeer` / `RegisterPeerResponse`**: Registering the client with the ID server.
+*   **`PunchHoleRequest` / `PunchHoleResponse`**: Attempting NAT traversal.
+*   **`RequestRelay` / `RelayResponse`**: Fallback to relay server.
+*   **`RegisterPk`**: Registering the public key for the session.
+
+#### Session & Data (`message.proto`)
+*   **`Message`**: The top-level wrapper for session data.
+*   **`LoginRequest` / `LoginResponse`**: Authenticating with the remote host.
+*   **`Hash`**: Handling challenge-response authentication.
+*   **`VideoFrame` / `EncodedVideoFrame`**: Receiving screen data (VP8/VP9/AV1/H264/H265).
+*   **`PeerInfo` / `DisplayInfo`**: Discovering remote screen resolutions and capabilities.
+*   **`KeyEvent` / `ControlKey`**: Injecting keyboard input.
+*   **`MouseEvent`**: Injecting mouse movement and clicks.
+*   **`ScreenshotRequest` / `ScreenshotResponse`**: Optional alternative for capturing single frames.

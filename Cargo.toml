@@ -18,6 +18,9 @@ libc = "0.2"
 # Ed25519 identity keys + X25519 key exchange + XSalsa20-Poly1305 encryption
 crypto_box = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+xsalsa20poly1305 = "0.9"
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # NOTE: hbb_common from rustdesk repo has heavy dependencies and build requirements.
 # We'll vendor the specific protobuf definitions we need instead.

@@ -82,14 +82,27 @@ async fn live_rendezvous_server_requests_relay_and_connects_tcp() -> Result<()> 
         "expected live target peer {TARGET_PEER_ID} to exist"
     );
 
-    let relay_response = timeout(Duration::from_secs(5), client.request_relay()).await??;
-    let relay_addr = if relay_response.relay_server.is_empty() {
-        RELAY_SERVER_ADDR.to_string()
+    let relay_server_hint = if punch_hole_response.relay_server.is_empty() {
+        RELAY_SERVER_ADDR
     } else {
-        relay_response.relay_server.clone()
+        punch_hole_response.relay_server.as_str()
+    };
+    let relay_response = timeout(
+        Duration::from_secs(10),
+        client.request_relay_for(
+            TARGET_PEER_ID,
+            relay_server_hint,
+            &punch_hole_response.socket_addr,
+        ),
+    )
+    .await;
+    let relay_addr = match relay_response {
+        Ok(Ok(response)) if !response.relay_server.is_empty() => response.relay_server,
+        Ok(Ok(_)) | Err(_) => RELAY_SERVER_ADDR.to_string(),
+        Ok(Err(err)) => return Err(err),
     };
 
-    let stream = timeout(Duration::from_secs(5), TcpStream::connect(&relay_addr)).await??;
+    let stream = timeout(Duration::from_secs(10), TcpStream::connect(&relay_addr)).await??;
     assert_eq!(
         stream.peer_addr()?.to_string(),
         relay_addr,

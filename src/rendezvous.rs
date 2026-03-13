@@ -68,12 +68,21 @@ impl RendezvousClient {
     }
 
     pub async fn request_relay(&self) -> Result<RelayResponse> {
+        self.request_relay_for("", "", &[]).await
+    }
+
+    pub async fn request_relay_for(
+        &self,
+        target_id: &str,
+        relay_server: &str,
+        socket_addr: &[u8],
+    ) -> Result<RelayResponse> {
         let request = RendezvousMessage {
             union: Some(rendezvous_message::Union::RequestRelay(RequestRelay {
-                id: String::new(),
+                id: target_id.to_string(),
                 uuid: String::new(),
-                socket_addr: Vec::new(),
-                relay_server: String::new(),
+                socket_addr: socket_addr.to_vec(),
+                relay_server: relay_server.to_string(),
                 secure: true,
                 licence_key: String::new(),
                 conn_type: ConnType::DefaultConn as i32,
@@ -248,6 +257,55 @@ mod tests {
 
         assert_eq!(response.uuid, "relay-uuid");
         assert_eq!(response.relay_server, "relay.example.com:21117");
+        server_task.await.expect("server task should join")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_relay_for_includes_target_and_routing_hints() -> Result<()> {
+        let server = bind_test_server().await;
+        let server_addr = server.local_addr()?;
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 4096];
+            let (size, peer) = server.recv_from(&mut buf).await?;
+            let message = RendezvousMessage::decode(&buf[..size])?;
+
+            match message.union {
+                Some(rendezvous_message::Union::RequestRelay(request)) => {
+                    assert_eq!(request.id, "target-9");
+                    assert_eq!(request.relay_server, "relay.example.com:21117");
+                    assert_eq!(request.socket_addr, vec![1, 2, 3, 4]);
+                    assert!(request.secure);
+                }
+                other => panic!("expected RequestRelay, got {other:?}"),
+            }
+
+            let response = RendezvousMessage {
+                union: Some(rendezvous_message::Union::RelayResponse(RelayResponse {
+                    socket_addr: Vec::new(),
+                    uuid: "relay-uuid".to_string(),
+                    relay_server: "relay.example.com:21117".to_string(),
+                    refuse_reason: String::new(),
+                    version: "1.0".to_string(),
+                    feedback: 0,
+                    socket_addr_v6: Vec::new(),
+                    upnp_port: 0,
+                    union: None,
+                })),
+            };
+            let mut encoded = Vec::new();
+            response.encode(&mut encoded)?;
+            server.send_to(&encoded, peer).await?;
+            Result::<()>::Ok(())
+        });
+
+        let client = RendezvousClient::connect(&server_addr.to_string()).await?;
+        let response = client
+            .request_relay_for("target-9", "relay.example.com:21117", &[1, 2, 3, 4])
+            .await?;
+
+        assert_eq!(response.uuid, "relay-uuid");
         server_task.await.expect("server task should join")?;
         Ok(())
     }

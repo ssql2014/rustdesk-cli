@@ -64,7 +64,14 @@ pub fn is_daemon_running() -> bool {
 
 /// Spawn the daemon as a background process by re-executing ourselves
 /// with a special `--daemon` flag.
-pub fn spawn_daemon(peer_id: &str, password: Option<&str>, server: Option<&str>) -> Result<()> {
+pub fn spawn_daemon(
+    peer_id: &str,
+    password: Option<&str>,
+    server: Option<&str>,
+    id_server: Option<&str>,
+    relay_server: Option<&str>,
+    key: Option<&str>,
+) -> Result<()> {
     if is_daemon_running() {
         anyhow::bail!("Daemon already running. Disconnect first, or use other commands.");
     }
@@ -83,6 +90,15 @@ pub fn spawn_daemon(peer_id: &str, password: Option<&str>, server: Option<&str>)
     }
     if let Some(srv) = server {
         cmd.arg("--server").arg(srv);
+    }
+    if let Some(id_srv) = id_server {
+        cmd.arg("--id-server").arg(id_srv);
+    }
+    if let Some(relay_srv) = relay_server {
+        cmd.arg("--relay-server").arg(relay_srv);
+    }
+    if let Some(key) = key {
+        cmd.arg("--key").arg(key);
     }
 
     // Detach: redirect stdio so parent can exit
@@ -128,7 +144,14 @@ pub async fn send_command(cmd: &SessionCommand) -> Result<SessionResponse> {
 }
 
 /// Run the daemon event loop. Called when the binary is invoked with `--daemon`.
-pub async fn run_daemon(peer_id: String, password: Option<String>, server: Option<String>) -> Result<()> {
+pub async fn run_daemon(
+    peer_id: String,
+    password: Option<String>,
+    server: Option<String>,
+    _id_server: Option<String>,
+    _relay_server: Option<String>,
+    _key: Option<String>,
+) -> Result<()> {
     // Clean up stale socket
     let _ = fs::remove_file(SOCKET_PATH);
 

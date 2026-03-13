@@ -613,3 +613,41 @@ Injecting keyboard and mouse input correctly requires understanding the coordina
 - **`key` command**: Use `control_key` for modifiers and special keys.
 - **`click` command**: Send a `down: true` event followed immediately by a `down: false` event at the same coordinates.
 
+---
+
+## 20. Screenshot Capture Protocol
+
+RustDesk provides a dedicated mechanism for on-demand screen captures via `ScreenshotRequest` and `ScreenshotResponse` messages. This is distinct from the continuous video stream.
+
+### Message Format
+- **`ScreenshotRequest`**:
+    - `display` (int32): The index of the display to capture (default is 0).
+    - `sid` (string): The session ID of the controlling side, used for routing the response.
+- **`ScreenshotResponse`**:
+    - `sid` (string): The session ID to match the request.
+    - `msg` (string): An error message; empty if the capture was successful.
+    - `data` (bytes): The encoded image data.
+
+### Data Encoding
+The `data` field in `ScreenshotResponse` contains a complete, self-describing image file.
+- **Format**: Usually **PNG** (lossless) or **JPEG** (lossy), depending on the server's internal configuration. Since the protocol lacks a explicit `format` field, the client should use an image library (like the Rust `image` crate) that can detect the format from magic bytes (headers).
+- **Capture Source**: The server uses the **`scrap`** library to capture the frame buffer directly from the OS (DXGI on Windows, X11/Wayland on Linux).
+
+### Stream Independence
+- **Stand-alone Operation**: `ScreenshotRequest` does **not** require an active video stream. It triggers a one-off capture and encoding process on the server.
+- **TERMINAL ConnType**: Even if the connection is established with `TERMINAL` connection type (which disables the continuous video scraper), the `ScreenshotRequest` handler remains functional as it explicitly invokes the capture logic.
+- **Efficiency**: This is the preferred method for CLI agents to "see" the remote screen without the bandwidth and CPU overhead of decoding a live VP9/H264 stream.
+
+### Latency and Performance
+- **Capture + Encode**: Server-side processing (capturing raw pixels and encoding to PNG/JPEG) typically takes **50ms–150ms**.
+- **Transmission**: The response size depends on screen resolution and complexity (e.g., a 1920x1080 PNG can be 200KB–2MB).
+- **Round-trip**: On a standard broadband connection, the total latency from request to receiving the full PNG is expected to be **200ms–600ms**.
+
+### Alternative: Video Stream Snapping
+If `ScreenshotRequest` is unsupported by a specific host version, the client can fall back to:
+1.  Enabling the video stream.
+2.  Waiting for the first **Keyframe** (I-frame).
+3.  Decoding that single frame using `libvpx` (VP9) or `openh264`.
+4.  Saving the resulting RGBA buffer as a PNG.
+*Note: This is significantly more complex to implement than the dedicated screenshot protocol.*
+

@@ -382,7 +382,46 @@ Terminal access requires the **`terminal`** permission flag. While not explicitl
 
 ---
 
-## 13. hbbr Relay Handshake Details
+## 13. Terminal Protocol Optimizations
+
+Efficient terminal communication is achieved through data compression, multi-session management, and flow control mechanisms.
+
+### Data Compression (zstd)
+RustDesk uses the **zstd** algorithm for real-time compression of text-heavy payloads.
+- **Threshold**: Payload compression is triggered when the data size exceeds **512–1024 bytes**. Small chunks are sent raw to avoid the CPU and header overhead of compression.
+- **Toggling**: The `compressed` boolean flag in `TerminalData` or `Clipboard` messages indicates whether the payload requires decompression at the destination.
+
+### Multiple Terminal Sessions
+The protocol supports multiple concurrent shells through the **`terminal_id`** field.
+- **Server-side Mapping**: The host maintains a `HashMap<i32, Session>` to route data to the correct PTY.
+- **ID Management**: The client assigns IDs (starting from 0). Upon reconnection, the client can request to remap existing persistent sessions to new IDs.
+
+### Session Persistence (`terminal_persistent`)
+The `OptionMessage` includes a `terminal_persistent` flag that controls the lifecycle of terminal sessions.
+- **Behavior**: If enabled, terminal processes (PTYs) are not killed when the network connection drops. They are stored in a global registry on the host.
+- **Reconnection**: A client can reconnect to these "orphaned" sessions by sending an `OpenTerminal` request with the same parameters, allowing for continuity in long-running tasks.
+
+### Clipboard Protocol Flow (`cliprdr`)
+RustDesk implements a variant of the RDP **`cliprdr`** virtual channel for clipboard synchronization.
+- **Advertisement**: When the local clipboard changes, the client sends a `Cliprdr::format_list` containing available formats (Text, HTML, Image, etc.).
+- **Synchronization**: Every message includes a **sequence number** to ensure the most recent "Copy" event takes precedence.
+- **Data Pull**: The actual content is typically pulled on-demand (when the peer attempts a "Paste") using `format_data_request`.
+
+### Keystroke Batching
+- **Default**: Most interactive keystrokes are sent as individual `KeyEvent` messages (down/up pairs) to minimize latency.
+- **Batching (`seq`)**: The `KeyEvent` message includes a **`seq`** string field. This allows the client to send entire strings (e.g., automated commands or passwords) in a single packet, which the server then injects into the PTY input buffer.
+
+### Flow Control and Backpressure
+- **Bounded Channels**: The server uses bounded synchronous channels (typically size 500) for terminal output.
+- **Data Dropping**: If the client is too slow to consume output (e.g., during a `cat /dev/urandom` spike), the server will **drop data chunks** rather than deadlocking or exhausting memory. This protects the host's stability.
+
+### Connection Type (`ConnType`) Implications
+- **`TERMINAL` type**: If the connection is established specifically for a terminal session, the host **disables the video scraper** and encoder, significantly reducing CPU and bandwidth usage.
+- **`DEFAULT_CONN` type**: If a terminal is opened within a desktop session, the video stream remains active. For the CLI client, it is highly recommended to use the terminal-specific connection type when desktop visuals are not required.
+
+---
+
+## 14. hbbr Relay Handshake Details
 
 The `hbbr` relay server acts as a matchmaker for peers that cannot establish a direct P2P connection. The initial TCP handshake and binding process are critical for session establishment and stability.
 
@@ -413,7 +452,7 @@ Immediately after establishing a TCP connection to `hbbr` (default port 21117), 
 
 ---
 
-## 14. Video Decoding for Screenshots
+## 15. Video Decoding for Screenshots
 
 Capturing a screenshot from a RustDesk video stream requires decoding the incoming compressed frames and converting them into a standard image format like PNG.
 
@@ -437,7 +476,7 @@ To save a decoded frame as a PNG in the CLI client:
 
 ---
 
-## 15. Relay Binding & Session Handshake
+## 16. Relay Binding & Session Handshake
 
 When a direct P2P connection fails, the client must use the relay server (`hbbr`) and perform a cryptographic handshake to establish an end-to-end encrypted (E2EE) session.
 
@@ -477,7 +516,7 @@ Once a transport (Direct or Relay) is established, the E2EE tunnel is initialize
 
 ---
 
-## 16. TCP Hole Punching Sequence
+## 17. TCP Hole Punching Sequence
 
 In environments where UDP is restricted, RustDesk attempts TCP hole punching to establish a direct P2P connection before falling back to a relay.
 
@@ -504,7 +543,7 @@ If both peers are on the same local network, `hbbs` will detect this and facilit
 
 ---
 
-## 17. Pure-Rust NaCl Key Conversion
+## 18. Pure-Rust NaCl Key Conversion
 
 To maintain compatibility with the official RustDesk client (which uses `sodiumoxide`) while keeping the `rustdesk-cli` build simple and pure-Rust, we must correctly convert Ed25519 identity keys to Curve25519 (X25519) encryption keys.
 
@@ -548,7 +587,7 @@ fn convert_sk(ed_sk: &SigningKey) -> StaticSecret {
 
 ---
 
-## 18. Input Event Details
+## 19. Input Event Details
 
 Injecting keyboard and mouse input correctly requires understanding the coordinate system and input modes.
 

@@ -243,7 +243,7 @@ Verify the ignored live rendezvous/relay tests still pass, then add an ignored e
 - [x] Confirm both ignored live rendezvous/relay tests pass
 - [x] Run `cargo test --test e2e_connect_test -- --ignored`
 - [x] Capture the current live failure point for the auth probe
-- [x] Run `cargo test` to confirm the normal suite stays green
+- [x] Run `cargo test` to confirm the regular suite stays green
 - **Status:** complete
 
 ## 2026-03-14 Text-Mode CLI Pivot Commands
@@ -272,4 +272,27 @@ Add `shell`, `exec`, and `clipboard get/set` to the CLI and session layers, keep
 - [x] Run targeted `cargo test` coverage
 - [x] Fix compile or test regressions
 - [x] Confirm the full requested command surface is covered
+- **Status:** complete
+
+## 2026-03-14 Terminal Protocol Optimizations (Research)
+
+### Goal
+Research and document RustDesk protocol optimizations for terminal and text-heavy channels, focusing on compression, session persistence, and flow control.
+
+### Phases
+#### Phase 1: Discovery
+- [x] Read `TASK_NOVA_TEXTOPT.md`
+- [x] Research `zstd` compression details and thresholds
+- [x] Investigate `terminal_id` and `terminal_persistent` logic
+- [x] Map the `cliprdr` clipboard protocol flow
+- [x] Check for keystroke batching and flow control behavior
+- **Status:** complete
+
+#### Phase 2: Implementation
+- [x] Document findings in `RESEARCH.md` Section 13
+- [x] Renumber subsequent sections for consistency
+- **Status:** complete
+
+#### Phase 3: Verification
+- [x] Verify section numbering in `RESEARCH.md`
 - **Status:** complete

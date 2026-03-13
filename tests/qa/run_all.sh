@@ -166,12 +166,12 @@ else
     fail "T3 status no-session" "expected exit 0 + disconnected, got exit=$code out=$out"
 fi
 
-# T3.special: disconnect with no session is idempotent (exit 0)
+# T3.special: disconnect with no session should exit 2 (per PM)
 code=$(run_exit "$BIN" disconnect)
-if [[ "$code" == "0" ]]; then
-    pass "T3 disconnect no-session: idempotent exit 0"
+if [[ "$code" == "2" ]]; then
+    pass "T3 disconnect no-session: exit 2 (connection error per PM)"
 else
-    fail "T3 disconnect no-session" "expected exit 0, got $code"
+    fail "T3 disconnect no-session" "PM says exit 2 for 'no session', got exit $code (BUG-014)"
 fi
 
 # =============================================================================

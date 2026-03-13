@@ -825,5 +825,42 @@ The heartbeat loop is critical for unblocking **Phase 1 (Rendezvous)**:
 ### 5. Other Keep-alive Related Messages
 - **`TestNatRequest`**: Occasionally sent to verify if the NAT type has changed.
 - **`OnlineRequest`**: Used by the client to check the status of peers in its address book; receiving an `OnlineResponse` also serves as proof of server reachability.
-- **`PunchHoleSent`**: Not a heartbeat; it is a signaling message sent by the *target* peer to notify `hbbs` that it has started its side of the hole-punching attempt.
+- **PunchHoleSent**: Not a heartbeat; it is a signaling message sent by the *target* peer to notify `hbbs` that it has started its side of the hole-punching attempt.
+
+---
+
+## 26. hbbr Relay Binding Protocol
+
+This section details the low-level handshake and pairing logic used by the RustDesk relay server (`hbbr`) to bridge two peers.
+
+### 1. Handshake Sequence
+The `hbbr` server is passive upon TCP connection establishment.
+- **Client-Initiated**: The client must send the first message. `hbbr` does not send a banner or greeting.
+- **First Message**: The client must send a `RendezvousMessage` containing the `RequestRelay` variant.
+- **Timing**: The server typically allows a **30-second window** for the client to send this initial message after the TCP connection is established.
+
+### 2. Message Framing
+- **Length Prefix**: Like other RustDesk TCP services, `hbbr` expects all messages to be prefixed with a **4-byte little-endian** length header.
+- **Raw Transition**: Crucially, once a pair is successfully matched, `hbbr` disables framing and transitions both sockets to "raw mode." From this point forward, it acts as a transparent byte-level pipe, facilitating the subsequent secure session handshake (NaCl) directly between peers.
+
+### 3. The `uuid` and `token` Fields
+- **`uuid`**: This is a unique session identifier brokered by the ID server (`hbbs`). It is **not** generated locally by the relay client; it is obtained from the `RelayResponse` during Phase 1 (Rendezvous).
+- **`token` (licence_key)**: The `licence_key` field in the `RequestRelay` message serves as the authentication token. It must match the server's configured key string. If the keys do not match, the relay server will drop the connection immediately.
+
+### 4. Peer Pairing Logic
+`hbbr` uses the `uuid` as the unique lookup key to "glue" the Controller and Controlled sides together.
+- **Matchmaking**: The server maintains an internal map of pending connections indexed by `uuid`.
+- **First Peer**: When the first peer connects and sends its `RequestRelay`, its socket is stored in the map.
+- **Second Peer**: When the second peer arrives with the same `uuid`, `hbbr` removes the first peer from the map and bridges the two streams.
+
+### 5. Timeouts
+- **Unmatched Session**: If a matching peer does not arrive within **30 seconds** of the first peer's registration, `hbbr` removes the entry from its map and closes the first peer's connection.
+- **Idle Timeout**: After pairing, the relay remains active as long as both TCP connections are open. However, if the underlying network drops a connection without a FIN/RST packet, the relay may hang until the OS-level TCP keep-alive or a protocol-level heartbeat (if implemented by the peers) fails.
+
+### 6. Validation for `rustdesk-cli`
+To ensure a successful relay bind in `src/connection.rs`:
+1.  Verify that the `uuid` from the `RelayResponse` is being correctly passed into the `RequestRelay` message.
+2.  Ensure the `licence_key` field contains the server's public key (the same one used for `PunchHoleRequest`).
+3.  Ensure the 4-byte LE framing is correctly applied to the `RequestRelay` message.
+
 

@@ -465,3 +465,44 @@
 | Ignored live rendezvous/relay tests | `cargo test --test live_server_test -- --ignored` | Both live UDP and relay reachability tests pass | 2 passed | ✓ |
 | Ignored live auth probe | `cargo test --test e2e_connect_test -- --ignored` | Reach as far into real auth flow as possible and capture exact failure | Failed with `relay server closed before forwarding the first session message` (`early eof`) | ✓ |
 | Full crate test suite | `cargo test` | Normal suite remains green with ignored live auth probe added | 49 passed, 4 ignored | ✓ |
+
+## Session: 2026-03-14 (Text-Mode CLI Pivot Commands)
+
+### Phase 1: Requirements & Discovery
+- **Status:** complete
+- **Started:** 2026-03-14 01:37
+- Actions taken:
+  - Read `TASK_LEO.md` and `ARCHITECTURE_PIVOT.md`.
+  - Inspected `src/session.rs`, `src/main.rs`, `src/daemon.rs`, `src/terminal.rs`, and `tests/cli_test.rs`.
+  - Confirmed the requested work is additive and should follow the existing daemon/session command flow.
+- Files created/modified:
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 2: Implementation
+- **Status:** complete
+- Actions taken:
+  - Added `Shell`, `Exec`, `ClipboardGet`, and `ClipboardSet` to `SessionCommand` with stub success payloads.
+  - Extended `src/main.rs` with `shell`, `exec --command`, and nested `clipboard get/set` subcommands.
+  - Updated batch parsing and response generation so `do` also supports the new text-mode commands.
+  - Added unit tests in `src/session.rs` and integration tests in `tests/cli_test.rs` for the new command surface.
+- Files created/modified:
+  - `src/session.rs` (updated)
+  - `src/main.rs` (updated)
+  - `tests/cli_test.rs` (updated)
+
+### Phase 3: Testing & Verification
+- **Status:** complete
+- Actions taken:
+  - Ran `cargo test`.
+  - Verified the new session and CLI coverage passed with the existing suite.
+  - Noted one pre-existing warning from `src/text_session.rs` about an unused `TerminalOpened` import.
+- Files created/modified:
+  - `task_plan.md` (updated)
+  - `progress.md` (updated)
+
+## Test Results (Text-Mode CLI Pivot Commands)
+| Test | Input | Expected | Actual | Status |
+|------|-------|----------|--------|--------|
+| Full crate test suite | `cargo test` | New shell/exec/clipboard coverage plus existing suites all pass | 46 unit tests passed, 22 CLI tests passed, ignored live tests unchanged | ✓ |

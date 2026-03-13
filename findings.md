@@ -37,6 +37,9 @@
 | Thread `--id-server`, `--relay-server`, and `--key` through CLI connect into daemon startup even if the daemon does not consume them yet | This preserves the requested command-line contract and avoids dropping user-provided connectivity settings |
 | The repo already contains a `src/connection.rs` implementation of the full relay + crypto + login flow | The new ignored e2e test should align with that sequencing instead of inventing a different handshake order |
 | The current live e2e auth probe reaches the relay bind step but the relay closes before forwarding the first session message | The first real failure point is before `SignedId`, so the next protocol debugging step should focus on relay binding (`RequestRelay.uuid` / token / socket hints) rather than password hashing |
+| The current CLI/daemon architecture already treats `SessionCommand` as the single contract between `main.rs` and the daemon | `shell`, `exec`, and clipboard commands should be added there and reused everywhere instead of special-casing them in the CLI |
+| `src/terminal.rs` already contains real RustDesk terminal helpers, but `TASK_LEO.md` only requires stub dispatch behavior matching existing commands | This task is a surface-area expansion plus tests, not a live PTY transport integration |
+| Batch mode is implemented by the custom `parse_batch_steps()` and `step_to_response()` helpers rather than by Clap | Every new top-level command that should work in `do` must be added in both places or the batch surface will drift from the normal CLI |
 
 ## Issues Encountered
 | Issue | Resolution |

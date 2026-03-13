@@ -245,3 +245,31 @@ Verify the ignored live rendezvous/relay tests still pass, then add an ignored e
 - [x] Capture the current live failure point for the auth probe
 - [x] Run `cargo test` to confirm the normal suite stays green
 - **Status:** complete
+
+## 2026-03-14 Text-Mode CLI Pivot Commands
+
+### Goal
+Add `shell`, `exec`, and `clipboard get/set` to the CLI and session layers, keeping the existing command set intact and covered by tests.
+
+### Phases
+#### Phase 1: Discovery
+- [x] Read `TASK_LEO.md`
+- [x] Read `ARCHITECTURE_PIVOT.md`
+- [x] Inspect `src/session.rs`
+- [x] Inspect `src/main.rs`
+- [x] Inspect `src/daemon.rs`
+- [x] Inspect `tests/cli_test.rs`
+- **Status:** complete
+
+#### Phase 2: Implementation
+- [x] Add new `SessionCommand` variants and stub dispatch behavior
+- [x] Add session unit tests for the new commands
+- [x] Add CLI subcommands and batch parsing/response support
+- [x] Add CLI integration tests for the new commands
+- **Status:** complete
+
+#### Phase 3: Verification
+- [x] Run targeted `cargo test` coverage
+- [x] Fix compile or test regressions
+- [x] Confirm the full requested command surface is covered
+- **Status:** complete

@@ -324,7 +324,35 @@ A session falls back to the relay server (`hbbr`) in the following scenarios:
 
 ---
 
-## 11. Video Decoding for Screenshots
+## 11. API Server Endpoints
+
+The RustDesk API server (typically part of the Pro version or custom sidecars like `rustdesk-api`) facilitates client authentication, configuration, and address book management. Based on probing the test server at `http://115.238.185.55:50074`, here are the findings:
+
+### Core Endpoints & Methods
+The API server primarily uses **POST** for state-changing or sensitive actions and **GET** for configuration retrieval.
+
+| Endpoint | Method | Observed Response | Description |
+| :--- | :--- | :--- | :--- |
+| `/api/login` | **POST** | `{"error": "请求方式错误！请使用POST方式。"}` | Authenticates user (ID/Password). Returns JWT token. |
+| `/api/server-config` | **GET** | `404 Not Found` | Retrieves `id_server`, `relay_server`, and `key`. |
+| `/api/peers` | **GET** | `{"code": 1, "data": "ok"}` | Address book management. |
+| `/api/heartbeat` | **POST** | `500 Server Error` | Reports online status. |
+| `/api/currentUser` | **GET** | `{"error": "错误的提交方式！"}` | Returns user profile. |
+| `/api/audit` | **POST** | `500 Server Error` | Logs connection events (Pro feature). |
+
+### Key Observations from Probes
+1.  **Strict HTTP Methods**: The server explicitly enforces `POST` for `/api/login` and `/api/currentUser`. Accessing them via `GET` returns a descriptive error message.
+2.  **hbbs Integration**: While `hbbs` handles the rendezvous (port 21116), the API server (port 50074 in this config) handles the business logic.
+3.  **Status 500/404**: The `500 Server Error` on `/api/heartbeat` and `/api/audit` suggests these may require specific headers (like `Authorization`) or are disabled in the current configuration.
+
+### Implementation for CLI
+To support "Zero Config" in the CLI:
+1.  **Login**: Use `POST /api/login` with JSON payload `{username, password, id, uuid, device_name}`.
+2.  **Config**: Attempt to fetch `server-config` to auto-populate the ID and Relay server addresses.
+
+---
+
+## 12. Video Decoding for Screenshots
 
 Capturing a screenshot from a RustDesk video stream requires decoding the incoming compressed frames and converting them into a standard image format like PNG.
 
@@ -348,7 +376,7 @@ To save a decoded frame as a PNG in the CLI client:
 
 ---
 
-## 12. Relay Binding & Session Handshake
+## 13. Relay Binding & Session Handshake
 
 When a direct P2P connection fails, the client must use the relay server (`hbbr`) and perform a cryptographic handshake to establish an end-to-end encrypted (E2EE) session.
 
@@ -388,7 +416,7 @@ Once a transport (Direct or Relay) is established, the E2EE tunnel is initialize
 
 ---
 
-## 13. TCP Hole Punching Sequence
+## 14. TCP Hole Punching Sequence
 
 In environments where UDP is restricted, RustDesk attempts TCP hole punching to establish a direct P2P connection before falling back to a relay.
 
@@ -415,7 +443,7 @@ If both peers are on the same local network, `hbbs` will detect this and facilit
 
 ---
 
-## 14. Pure-Rust NaCl Key Conversion
+## 15. Pure-Rust NaCl Key Conversion
 
 To maintain compatibility with the official RustDesk client (which uses `sodiumoxide`) while keeping the `rustdesk-cli` build simple and pure-Rust, we must correctly convert Ed25519 identity keys to Curve25519 (X25519) encryption keys.
 
@@ -459,7 +487,7 @@ fn convert_sk(ed_sk: &SigningKey) -> StaticSecret {
 
 ---
 
-## 15. Input Event Details
+## 16. Input Event Details
 
 Injecting keyboard and mouse input correctly requires understanding the coordinate system and input modes.
 

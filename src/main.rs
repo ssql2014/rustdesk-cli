@@ -5,6 +5,8 @@ mod proto;
 #[allow(dead_code)]
 mod protocol;
 #[allow(dead_code)]
+mod rendezvous;
+#[allow(dead_code)]
 mod transport;
 mod session;
 

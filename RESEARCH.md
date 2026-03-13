@@ -954,7 +954,34 @@ RustDesk uses two mechanisms to maintain the encrypted TCP session:
 
 ### 4. Termination and Failure Detection
 - **Clean Disconnect**: One side sends a `Misc { close_reason: ... }` message before closing the socket.
-- **Network Failure**: Caught via standard `std::io::Error` (e.g., `ECONNRESET`).
-- **State Cleanup**: On failure, the client must abort background tasks (heartbeats, decoders) and transition the session state to `Disconnected`.
+---
+
+## 30. OptionMessage for Headless/Screenshot Clients
+
+This section details the optimal configuration of the `OptionMessage` for CLI-based clients that prioritize single-frame captures over continuous video streaming.
+
+### 1. Minimum Required Fields
+To minimize overhead and ensure the host prepares a high-quality frame, the following fields should be explicitly set:
+- **`custom_fps`**: Set to **`0`**. This is the most important optimization; it prevents the host from wasting CPU/bandwidth on a continuous stream, instead only sending a frame when requested or upon state changes.
+- **`image_quality`**: Set to **`Best`** (Value: 4) to ensure maximum clarity for the screenshot.
+- **`disable_audio`**: Set to **`Yes`** (Value: 2) to prevent the host from initializing audio scrapers.
+- **`disable_clipboard`**: Set to **`Yes`** (Value: 2) to reduce session complexity.
+
+### 2. Supported Decoding Configuration
+The **`supported_decoding`** field must be populated. If omitted, the host may assume the client cannot process any modern codecs.
+- **Recommendation**: Set `ability_vp9: 1` and/or `ability_av1: 1`.
+- **Prefer Codec**: Set `prefer` to the desired codec (e.g., `VP9`). This ensures the host's encoder is aligned with the client's decoding library.
+
+### 3. Initialization & Capture Sequence
+The host requires an explicit command to start its capture pipeline before it will respond to screenshot-related requests.
+1.  **Authentication**: Complete the NaCl handshake and `LoginRequest`.
+2.  **Display Selection**: Send **`CaptureDisplays`** with the target display ID (e.g., `add: [0]`). This initializes the OS-level capture source (DXGI/X11).
+3.  **Screenshot Request**: Once the capture pipeline is active, the client can send **`ScreenshotRequest`** (Message variant 29) to retrieve a direct image file or wait for the first **`VideoFrame`** if using the stream-snapping path.
+
+### 4. Quality Settings
+For the best possible screenshot:
+- **ImageQuality**: Use `Best`.
+- **Custom Quality**: If the host supports it, populate `custom_image_quality` with a high value (e.g., 100) to minimize compression artifacts.
+- **Chroma**: Set `prefer_chroma` to `I444` if the client's decoder supports it, as this provides better color reproduction than the standard `I420`.
 
 

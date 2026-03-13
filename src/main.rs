@@ -5,12 +5,15 @@ mod proto;
 #[allow(dead_code)]
 mod protocol;
 #[allow(dead_code)]
+mod transport;
 mod session;
 
 use std::{process, str::FromStr};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
+
+use crate::session::{SessionCommand, SessionResponse};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_CONNECTION: i32 = 1;
@@ -238,7 +241,31 @@ struct BatchStep {
 }
 
 fn main() {
+    // Intercept --daemon mode before clap parsing
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--daemon") {
+        run_daemon_mode(&args);
+        return;
+    }
     process::exit(run());
+}
+
+fn run_daemon_mode(args: &[String]) {
+    let peer_id = daemon_arg_value(args, "--peer-id")
+        .expect("--daemon requires --peer-id");
+    let password = daemon_arg_value(args, "--password");
+    let server = daemon_arg_value(args, "--server");
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    if let Err(e) = rt.block_on(daemon::run_daemon(peer_id, password, server)) {
+        eprintln!("daemon error: {e}");
+        process::exit(1);
+    }
+}
+
+fn daemon_arg_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].clone())
 }
 
 fn run() -> i32 {
@@ -247,12 +274,40 @@ fn run() -> i32 {
     match cli.command {
         Commands::Connect {
             id,
-            password: _,
+            password,
             server,
             timeout: _,
-        } => emit_response(cli.json, connect_response(&id, server.as_deref())),
-        Commands::Disconnect => emit_response(cli.json, disconnect_response()),
-        Commands::Status => emit_response(cli.json, status_response()),
+        } => match daemon::spawn_daemon(&id, password.as_deref(), server.as_deref()) {
+            Ok(()) => emit_response(cli.json, connect_response(&id, server.as_deref())),
+            Err(e) => emit_response(
+                cli.json,
+                error_response("connect", "connection_error", &e.to_string(), EXIT_CONNECTION),
+            ),
+        },
+        Commands::Disconnect => {
+            let was_connected = daemon::is_daemon_running();
+            if was_connected {
+                let _ = send_to_daemon(&SessionCommand::Disconnect);
+            }
+            emit_response(cli.json, disconnect_response(was_connected))
+        }
+        Commands::Status => {
+            if daemon::is_daemon_running() {
+                match send_to_daemon(&SessionCommand::Status) {
+                    Ok(resp) if resp.success => {
+                        let data = resp.data.unwrap_or(json!({}));
+                        let peer_id = data
+                            .get("peer_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        emit_response(cli.json, status_connected_response(peer_id))
+                    }
+                    _ => emit_response(cli.json, status_response()),
+                }
+            } else {
+                emit_response(cli.json, status_response())
+            }
+        }
         Commands::Capture {
             file,
             format,
@@ -260,13 +315,161 @@ fn run() -> i32 {
             region,
         } => {
             let format = format.unwrap_or_else(|| infer_format(&file));
-            emit_response(cli.json, capture_response(&file, format, region))
+            match send_to_daemon(&SessionCommand::Capture {
+                output: file.clone(),
+            }) {
+                Ok(resp) if resp.success => {
+                    emit_response(cli.json, capture_response(&file, format, region))
+                }
+                Ok(resp) => emit_response(
+                    cli.json,
+                    error_response(
+                        "capture",
+                        "connection_error",
+                        resp.message.as_deref().unwrap_or("capture failed"),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "capture",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+            }
         }
-        Commands::Type { text } => emit_response(cli.json, type_response(&text)),
-        Commands::Key { key, modifiers } => emit_response(cli.json, key_response(&key, &modifiers)),
-        Commands::Click { button, x, y } => emit_response(cli.json, click_response(button, x, y)),
-        Commands::Move { x, y } => emit_response(cli.json, move_response(x, y)),
-        Commands::Drag { x1, y1, x2, y2 } => emit_response(cli.json, drag_response(x1, y1, x2, y2)),
+        Commands::Type { text } => {
+            match send_to_daemon(&SessionCommand::Type { text: text.clone() }) {
+                Ok(resp) if resp.success => emit_response(cli.json, type_response(&text)),
+                Ok(resp) => emit_response(
+                    cli.json,
+                    error_response(
+                        "type",
+                        "connection_error",
+                        resp.message.as_deref().unwrap_or("type failed"),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "type",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+            }
+        }
+        Commands::Key { key, modifiers } => {
+            match send_to_daemon(&SessionCommand::Key { key: key.clone() }) {
+                Ok(resp) if resp.success => {
+                    emit_response(cli.json, key_response(&key, &modifiers))
+                }
+                Ok(resp) => emit_response(
+                    cli.json,
+                    error_response(
+                        "key",
+                        "connection_error",
+                        resp.message.as_deref().unwrap_or("key failed"),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "key",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+            }
+        }
+        Commands::Click { button, x, y } => {
+            match send_to_daemon(&SessionCommand::Click {
+                x,
+                y,
+                button: button.as_str().to_string(),
+            }) {
+                Ok(resp) if resp.success => {
+                    emit_response(cli.json, click_response(button, x, y))
+                }
+                Ok(resp) => emit_response(
+                    cli.json,
+                    error_response(
+                        "click",
+                        "connection_error",
+                        resp.message.as_deref().unwrap_or("click failed"),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "click",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+            }
+        }
+        Commands::Move { x, y } => match send_to_daemon(&SessionCommand::Move { x, y }) {
+            Ok(resp) if resp.success => emit_response(cli.json, move_response(x, y)),
+            Ok(resp) => emit_response(
+                cli.json,
+                error_response(
+                    "move",
+                    "connection_error",
+                    resp.message.as_deref().unwrap_or("move failed"),
+                    EXIT_CONNECTION,
+                ),
+            ),
+            Err(e) => emit_response(
+                cli.json,
+                error_response(
+                    "move",
+                    "connection_error",
+                    &e.to_string(),
+                    EXIT_CONNECTION,
+                ),
+            ),
+        },
+        Commands::Drag { x1, y1, x2, y2 } => {
+            match send_to_daemon(&SessionCommand::Drag {
+                x: x1,
+                y: y1,
+                x2,
+                y2,
+                button: "left".to_string(),
+            }) {
+                Ok(resp) if resp.success => {
+                    emit_response(cli.json, drag_response(x1, y1, x2, y2))
+                }
+                Ok(resp) => emit_response(
+                    cli.json,
+                    error_response(
+                        "drag",
+                        "connection_error",
+                        resp.message.as_deref().unwrap_or("drag failed"),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "drag",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+            }
+        }
         Commands::Do { steps } => {
             let response = match parse_batch_steps(&steps) {
                 Ok(parsed_steps) => do_response(&parsed_steps),
@@ -274,6 +477,26 @@ fn run() -> i32 {
             };
             emit_batch_response(cli.json, response)
         }
+    }
+}
+
+fn send_to_daemon(cmd: &SessionCommand) -> Result<SessionResponse, anyhow::Error> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(daemon::send_command(cmd))
+}
+
+fn error_response(command: &str, code: &str, message: &str, exit_code: i32) -> Response {
+    Response {
+        text: format!("{code}: {message}"),
+        json: json!({
+            "ok": false,
+            "command": command,
+            "error": {
+                "code": code,
+                "message": message
+            }
+        }),
+        exit_code,
     }
 }
 
@@ -321,13 +544,13 @@ fn connect_response(id: &str, server: Option<&str>) -> Response {
     }
 }
 
-fn disconnect_response() -> Response {
+fn disconnect_response(was_connected: bool) -> Response {
     Response {
         text: "disconnected".to_string(),
         json: json!({
             "ok": true,
             "command": "disconnect",
-            "was_connected": false
+            "was_connected": was_connected
         }),
         exit_code: EXIT_SUCCESS,
     }
@@ -340,6 +563,23 @@ fn status_response() -> Response {
             "ok": true,
             "command": "status",
             "connected": false
+        }),
+        exit_code: EXIT_SUCCESS,
+    }
+}
+
+fn status_connected_response(peer_id: &str) -> Response {
+    Response {
+        text: format!(
+            "connected id={peer_id} width={DEFAULT_WIDTH} height={DEFAULT_HEIGHT}"
+        ),
+        json: json!({
+            "ok": true,
+            "command": "status",
+            "connected": true,
+            "id": peer_id,
+            "width": DEFAULT_WIDTH,
+            "height": DEFAULT_HEIGHT
         }),
         exit_code: EXIT_SUCCESS,
     }
@@ -518,7 +758,7 @@ fn step_to_response(step: &BatchStep) -> Response {
             let server = flag_value(&step.args, "--server");
             connect_response(id, server)
         }
-        "disconnect" => disconnect_response(),
+        "disconnect" => disconnect_response(false),
         "status" => status_response(),
         "capture" => {
             let file = first_non_flag_arg(&step.args).unwrap_or("screenshot.png");

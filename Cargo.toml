@@ -1,0 +1,18 @@
+[package]
+name = "rustdesk-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line RustDesk client for AI agents"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+image = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+prost = "0.13"
+
+# NOTE: hbb_common from rustdesk repo has heavy dependencies and build requirements.
+# We'll vendor the specific protobuf definitions we need instead.
+# hbb_common = { git = "https://github.com/rustdesk/rustdesk" }

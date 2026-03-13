@@ -141,6 +141,18 @@ fn json_capture_contract() {
 }
 
 #[test]
+fn capture_without_file_writes_png_to_stdout() {
+    let output = bin()
+        .args(["capture"])
+        .output()
+        .expect("binary should run");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(output.stdout.starts_with(b"\x89PNG\r\n\x1a\n"));
+}
+
+#[test]
 fn json_type_contract() {
     let value = run_json_any_exit(&["--json", "type", "hello"]);
     assert_eq!(value["command"], "type");
@@ -424,4 +436,38 @@ fn json_key_meta_modifier() {
     } else {
         assert!(value["error"]["code"].is_string());
     }
+}
+
+#[test]
+fn password_and_password_stdin_are_mutually_exclusive() {
+    bin()
+        .args(["connect", "123", "--password", "pw", "--password-stdin"])
+        .write_stdin("secret\n")
+        .assert()
+        .code(3)
+        .stderr(contains("mutually exclusive"));
+}
+
+#[test]
+fn password_stdin_reads_from_piped_input() {
+    // password-stdin should read from stdin; the connect will fail (no daemon)
+    // but it should NOT fail with an input error — it should attempt the connection.
+    let output = bin()
+        .args(["--json", "connect", "123", "--password-stdin"])
+        .write_stdin("secret_from_stdin\n")
+        .output()
+        .expect("binary should run");
+    let value: Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert_eq!(value["command"], "connect");
+}
+
+#[test]
+fn env_var_rustdesk_password_is_accepted() {
+    let output = bin()
+        .args(["--json", "connect", "123"])
+        .env("RUSTDESK_PASSWORD", "env_pw")
+        .output()
+        .expect("binary should run");
+    let value: Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert_eq!(value["command"], "connect");
 }

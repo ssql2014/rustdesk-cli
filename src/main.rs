@@ -18,7 +18,11 @@ mod text_session;
 mod transport;
 mod session;
 
-use std::{process, str::FromStr};
+use std::{
+    io::{self, Write},
+    process,
+    str::FromStr,
+};
 
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde_json::{Value, json};
@@ -51,9 +55,12 @@ enum Commands {
     Connect {
         /// Peer ID to connect to
         id: String,
-        /// Password for the peer
-        #[arg(long)]
+        /// Password for the peer. Can also be set via RUSTDESK_PASSWORD env var
+        #[arg(long, env = "RUSTDESK_PASSWORD")]
         password: Option<String>,
+        /// Read password from stdin (one line). Mutually exclusive with --password
+        #[arg(long)]
+        password_stdin: bool,
         /// Override combined rendezvous/relay server address
         #[arg(long)]
         server: Option<String>,
@@ -90,7 +97,7 @@ enum Commands {
     /// Capture a screenshot from the remote display
     Capture {
         /// Output file path
-        file: String,
+        file: Option<String>,
         /// Image format
         #[arg(long, value_enum)]
         format: Option<CaptureFormat>,
@@ -354,26 +361,48 @@ fn run() -> i32 {
         Commands::Connect {
             id,
             password,
+            password_stdin,
             server,
             id_server,
             relay_server,
             key,
             timeout,
-        } => match daemon::spawn_daemon(
-            &id,
-            password.as_deref(),
-            server.as_deref(),
-            id_server.as_deref(),
-            relay_server.as_deref(),
-            key.as_deref(),
-            Some(timeout),
-        ) {
-            Ok(()) => emit_response(cli.json, connect_response(&id, server.as_deref())),
-            Err(e) => emit_response(
-                cli.json,
-                error_response("connect", "connection_error", &e.to_string(), EXIT_CONNECTION),
-            ),
-        },
+        } => {
+            if password.is_some() && password_stdin {
+                eprintln!("error: --password and --password-stdin are mutually exclusive");
+                return EXIT_INPUT;
+            }
+            let password = if password_stdin {
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_err() || line.is_empty() {
+                    eprintln!("error: failed to read password from stdin");
+                    return EXIT_INPUT;
+                }
+                Some(line.trim_end_matches('\n').to_string())
+            } else {
+                password
+            };
+            match daemon::spawn_daemon(
+                &id,
+                password.as_deref(),
+                server.as_deref(),
+                id_server.as_deref(),
+                relay_server.as_deref(),
+                key.as_deref(),
+                Some(timeout),
+            ) {
+                Ok(()) => emit_response(cli.json, connect_response(&id, server.as_deref())),
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "connect",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+            }
+        }
         Commands::Disconnect => {
             let was_connected = daemon::is_daemon_running();
             if !was_connected {
@@ -527,31 +556,35 @@ fn run() -> i32 {
             quality: _,
             region,
         } => {
-            let format = format.unwrap_or_else(|| infer_format(&file));
-            match send_to_daemon(&SessionCommand::Capture {
-                output: file.clone(),
-            }) {
-                Ok(resp) if resp.success => {
-                    emit_response(cli.json, capture_response(&file, format, region))
+            if let Some(file) = file {
+                let format = format.unwrap_or_else(|| infer_format(&file));
+                match send_to_daemon(&SessionCommand::Capture {
+                    output: file.clone(),
+                }) {
+                    Ok(resp) if resp.success => {
+                        emit_response(cli.json, capture_response(&file, format, region))
+                    }
+                    Ok(resp) => emit_response(
+                        cli.json,
+                        error_response(
+                            "capture",
+                            "connection_error",
+                            resp.message.as_deref().unwrap_or("capture failed"),
+                            EXIT_CONNECTION,
+                        ),
+                    ),
+                    Err(e) => emit_response(
+                        cli.json,
+                        error_response(
+                            "capture",
+                            "connection_error",
+                            &e.to_string(),
+                            EXIT_CONNECTION,
+                        ),
+                    ),
                 }
-                Ok(resp) => emit_response(
-                    cli.json,
-                    error_response(
-                        "capture",
-                        "connection_error",
-                        resp.message.as_deref().unwrap_or("capture failed"),
-                        EXIT_CONNECTION,
-                    ),
-                ),
-                Err(e) => emit_response(
-                    cli.json,
-                    error_response(
-                        "capture",
-                        "connection_error",
-                        &e.to_string(),
-                        EXIT_CONNECTION,
-                    ),
-                ),
+            } else {
+                emit_capture_stdout(fake_capture_payload(CaptureFormat::Png))
             }
         }
         Commands::Type { text } => {
@@ -1204,6 +1237,33 @@ fn fake_capture_bytes(format: CaptureFormat, width: i32, height: i32) -> u64 {
     }
 }
 
+fn fake_capture_payload(format: CaptureFormat) -> &'static [u8] {
+    match format {
+        CaptureFormat::Png => &[
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I',
+            b'H', b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+            0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, b'I', b'D',
+            b'A', b'T', 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00,
+            0x01, 0xFF, 0x89, 0x99, 0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N',
+            b'D', 0xAE, 0x42, 0x60, 0x82,
+        ],
+        CaptureFormat::Jpg => &[
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01,
+            0x01, 0x00, 0x48, 0x00, 0x48, 0x00, 0x00, 0xFF, 0xD9,
+        ],
+    }
+}
+
+fn emit_capture_stdout(bytes: &[u8]) -> i32 {
+    let mut stdout = io::stdout();
+    if let Err(e) = stdout.write_all(bytes).and_then(|_| stdout.flush()) {
+        eprintln!("connection_error: failed to write capture to stdout: {e}");
+        return EXIT_CONNECTION;
+    }
+
+    EXIT_SUCCESS
+}
+
 fn parse_batch_steps(tokens: &[String]) -> Result<Vec<BatchStep>, String> {
     let mut index = 0;
     let mut steps = Vec::new();
@@ -1301,7 +1361,7 @@ fn parse_batch_steps(tokens: &[String]) -> Result<Vec<BatchStep>, String> {
             }
             "capture" => {
                 let (args, next_index) =
-                    parse_flagged_step(tokens, index + 1, &["--format", "--quality", "--region"], 1)?;
+                    parse_flagged_step(tokens, index + 1, &["--format", "--quality", "--region"], 0)?;
                 steps.push(BatchStep { command, args });
                 index = next_index;
             }

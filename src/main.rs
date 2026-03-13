@@ -11,6 +11,8 @@ mod protocol;
 #[allow(dead_code)]
 mod rendezvous;
 #[allow(dead_code)]
+mod terminal;
+#[allow(dead_code)]
 mod transport;
 mod session;
 

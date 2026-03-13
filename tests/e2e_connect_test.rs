@@ -103,7 +103,8 @@ async fn live_e2e_connect_auth_probe() -> Result<()> {
 
     let first_bytes = timeout(Duration::from_secs(10), transport.recv())
         .await
-        .context("timed out waiting for first session message after relay bind")??;
+        .context("timed out waiting for first session message after relay bind")?
+        .context("relay server closed before forwarding the first session message")?;
     let first_msg = Message::decode(first_bytes.as_slice())
         .context("failed to decode first post-bind Message")?;
 
@@ -126,7 +127,8 @@ async fn live_e2e_connect_auth_probe() -> Result<()> {
     let mut encrypted = EncryptedStream::new(transport, &kx.session_key);
     let hash_bytes = timeout(Duration::from_secs(10), encrypted.recv())
         .await
-        .context("timed out waiting for encrypted Hash challenge")??;
+        .context("timed out waiting for encrypted Hash challenge")?
+        .context("encrypted stream closed before Hash challenge")?;
     let hash_msg = Message::decode(hash_bytes.as_slice())
         .context("failed to decode encrypted challenge Message")?;
     let hash = match hash_msg.union {
@@ -144,7 +146,8 @@ async fn live_e2e_connect_auth_probe() -> Result<()> {
 
     let response_bytes = timeout(Duration::from_secs(10), encrypted.recv())
         .await
-        .context("timed out waiting for encrypted post-login response")??;
+        .context("timed out waiting for encrypted post-login response")?
+        .context("encrypted stream closed before post-login response")?;
     let response = Message::decode(response_bytes.as_slice())
         .context("failed to decode encrypted post-login response")?;
 

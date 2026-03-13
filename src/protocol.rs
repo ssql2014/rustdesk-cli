@@ -57,6 +57,8 @@ pub struct DisplayInfo {
     pub width: i32,
     pub height: i32,
     pub name: String,
+    pub online: bool,
+    pub cursor_embedded: bool,
 }
 
 /// Keyboard event sent to the remote peer.

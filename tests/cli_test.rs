@@ -141,6 +141,8 @@ fn json_displays_contract() {
             assert!(d["width"].is_number());
             assert!(d["height"].is_number());
             assert!(d["name"].is_string());
+            assert!(d["online"].is_boolean());
+            assert!(d["cursor_embedded"].is_boolean());
         }
     } else {
         assert!(value["error"]["code"].is_string());

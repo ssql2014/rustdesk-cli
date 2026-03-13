@@ -1120,9 +1120,11 @@ fn displays_response(displays: &[Value]) -> Response {
         .iter()
         .map(|d| {
             format!(
-                "display {} {}x{} at ({},{}) name={}",
+                "display {} {}x{} at ({},{}) name={} online={} cursor_embedded={}",
                 d["idx"], d["width"], d["height"], d["x"], d["y"],
-                d["name"].as_str().unwrap_or("")
+                d["name"].as_str().unwrap_or(""),
+                d["online"].as_bool().unwrap_or(false),
+                d["cursor_embedded"].as_bool().unwrap_or(false),
             )
         })
         .collect();

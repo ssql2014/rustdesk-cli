@@ -413,6 +413,8 @@ impl Session {
                             "width": d.width,
                             "height": d.height,
                             "name": d.name,
+                            "online": d.online,
+                            "cursor_embedded": d.cursor_embedded,
                         })
                     })
                     .collect();

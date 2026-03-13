@@ -289,6 +289,8 @@ pub async fn run_daemon(
                 width: d.width,
                 height: d.height,
                 name: d.name.clone(),
+                online: d.online,
+                cursor_embedded: d.cursor_embedded,
             })
             .collect(),
     });
@@ -637,6 +639,8 @@ where
                 width: d.width,
                 height: d.height,
                 name: d.name.clone(),
+                online: d.online,
+                cursor_embedded: d.cursor_embedded,
             })
             .collect(),
     });

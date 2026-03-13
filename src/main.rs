@@ -94,6 +94,8 @@ enum Commands {
     },
     /// Show connection status
     Status,
+    /// List available displays on the remote peer
+    Displays,
     /// Capture a screenshot from the remote display
     Capture {
         /// Output file path
@@ -107,6 +109,9 @@ enum Commands {
         /// JPEG quality (1-100)
         #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
         quality: u8,
+        /// Capture request timeout in seconds
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
         /// Capture region as x,y,w,h
         #[arg(long)]
         region: Option<Region>,
@@ -565,11 +570,70 @@ fn run() -> i32 {
                 emit_response(cli.json, status_response())
             }
         }
+        Commands::Displays => match send_to_daemon(&SessionCommand::Displays) {
+            Ok(resp) if resp.success => {
+                let data = resp.data.unwrap_or(json!({}));
+                let displays = data
+                    .get("displays")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let text_lines: Vec<String> = displays
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "display {} {}x{} at ({},{}) name={}",
+                            d["idx"],
+                            d["width"],
+                            d["height"],
+                            d["x"],
+                            d["y"],
+                            d["name"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect();
+                emit_response(
+                    cli.json,
+                    Response {
+                        text: if text_lines.is_empty() {
+                            "no displays".to_string()
+                        } else {
+                            text_lines.join("\n")
+                        },
+                        json: json!({
+                            "ok": true,
+                            "command": "displays",
+                            "displays": displays
+                        }),
+                        exit_code: EXIT_SUCCESS,
+                    },
+                )
+            }
+            Ok(resp) => emit_response(
+                cli.json,
+                error_response(
+                    "displays",
+                    "connection_error",
+                    resp.message.as_deref().unwrap_or("displays failed"),
+                    EXIT_CONNECTION,
+                ),
+            ),
+            Err(e) => emit_response(
+                cli.json,
+                error_response(
+                    "displays",
+                    "connection_error",
+                    &e.to_string(),
+                    EXIT_CONNECTION,
+                ),
+            ),
+        },
         Commands::Capture {
             file,
             display,
             format,
             quality,
+            timeout,
             region,
         } => {
             if !daemon::is_daemon_running() {
@@ -581,6 +645,7 @@ fn run() -> i32 {
                             format.unwrap_or_else(|| infer_format(file)),
                             region,
                             display,
+                            timeout,
                         ),
                     );
                 }
@@ -610,6 +675,7 @@ fn run() -> i32 {
                 quality: Some(quality),
                 region: region.map(Region::to_capture_region),
                 display,
+                timeout_secs: Some(timeout),
             }) {
                 Ok(resp) if resp.success => {
                     let Some(data) = resp.data else {
@@ -665,6 +731,7 @@ fn run() -> i32 {
                                 response_format,
                                 region,
                                 display,
+                                timeout,
                                 bytes.len(),
                             ),
                         )
@@ -1048,11 +1115,38 @@ fn status_connected_response(peer_id: &str) -> Response {
     }
 }
 
+fn displays_response(displays: &[Value]) -> Response {
+    let text_lines: Vec<String> = displays
+        .iter()
+        .map(|d| {
+            format!(
+                "display {} {}x{} at ({},{}) name={}",
+                d["idx"], d["width"], d["height"], d["x"], d["y"],
+                d["name"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    Response {
+        text: if text_lines.is_empty() {
+            "no displays".to_string()
+        } else {
+            text_lines.join("\n")
+        },
+        json: json!({
+            "ok": true,
+            "command": "displays",
+            "displays": displays
+        }),
+        exit_code: EXIT_SUCCESS,
+    }
+}
+
 fn capture_response(
     file: &str,
     format: CaptureFormat,
     region: Option<Region>,
     display: Option<i32>,
+    timeout: u64,
 ) -> Response {
     let (width, height) = match region {
         Some(region) => (region.w, region.h),
@@ -1070,6 +1164,7 @@ fn capture_response(
     if let Some(display) = display {
         text.push_str(&format!(" display={display}"));
     }
+    text.push_str(&format!(" timeout={timeout}"));
 
     let mut json = if let Some(region) = region {
         json!({
@@ -1099,6 +1194,9 @@ fn capture_response(
             object.insert("display".to_string(), json!(display));
         }
     }
+    if let Some(object) = json.as_object_mut() {
+        object.insert("timeout".to_string(), json!(timeout));
+    }
 
     Response {
         text,
@@ -1112,6 +1210,7 @@ fn capture_result_response(
     format: CaptureFormat,
     region: Option<Region>,
     display: Option<i32>,
+    timeout: u64,
     bytes: usize,
 ) -> Response {
     let mut json = json!({
@@ -1139,6 +1238,9 @@ fn capture_result_response(
         if let Some(object) = json.as_object_mut() {
             object.insert("display".to_string(), json!(display));
         }
+    }
+    if let Some(object) = json.as_object_mut() {
+        object.insert("timeout".to_string(), json!(timeout));
     }
 
     Response {
@@ -1320,6 +1422,7 @@ fn step_to_response(step: &BatchStep) -> Response {
             }
         }
         "status" => status_response(),
+        "displays" => displays_response(&[]),
         "capture" => {
             let file = first_non_flag_arg(&step.args).unwrap_or("screenshot.png");
             let format = flag_value(&step.args, "--format")
@@ -1327,7 +1430,10 @@ fn step_to_response(step: &BatchStep) -> Response {
                 .unwrap_or_else(|| infer_format(file));
             let region = flag_value(&step.args, "--region").and_then(|raw| raw.parse::<Region>().ok());
             let display = flag_value(&step.args, "--display").and_then(|raw| raw.parse::<i32>().ok());
-            capture_response(file, format, region, display)
+            let timeout = flag_value(&step.args, "--timeout")
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(10);
+            capture_response(file, format, region, display, timeout)
         }
         "type" => type_response(step.args.first().map(String::as_str).unwrap_or("")),
         "key" => {
@@ -1424,7 +1530,7 @@ fn parse_batch_steps(tokens: &[String]) -> Result<Vec<BatchStep>, String> {
         }
 
         match command.as_str() {
-            "disconnect" | "status" | "shell" => {
+            "disconnect" | "status" | "displays" | "shell" => {
                 steps.push(BatchStep {
                     command,
                     args: Vec::new(),
@@ -1510,7 +1616,7 @@ fn parse_batch_steps(tokens: &[String]) -> Result<Vec<BatchStep>, String> {
             }
             "capture" => {
                 let (args, next_index) =
-                    parse_flagged_step(tokens, index + 1, &["--display", "--format", "--quality", "--region"], 0)?;
+                    parse_flagged_step(tokens, index + 1, &["--display", "--format", "--quality", "--region", "--timeout"], 0)?;
                 steps.push(BatchStep { command, args });
                 index = next_index;
             }
@@ -1641,6 +1747,7 @@ fn is_step_command(token: &str) -> bool {
             | "exec"
             | "clipboard"
             | "status"
+            | "displays"
             | "capture"
             | "type"
             | "key"

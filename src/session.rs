@@ -64,6 +64,7 @@ pub enum SessionCommand {
         quality: Option<u8>,
         region: Option<CaptureRegion>,
         display: Option<i32>,
+        timeout_secs: Option<u64>,
     },
     Type {
         text: String,
@@ -94,6 +95,7 @@ pub enum SessionCommand {
         y: i32,
     },
     Status,
+    Displays,
 }
 
 /// Response from the daemon back to the CLI.
@@ -392,6 +394,35 @@ impl Session {
                     "peer_info": self.peer_info,
                 });
                 Ok((SessionResponse::ok_with_data("Status", data), vec![]))
+            }
+
+            SessionCommand::Displays => {
+                self.require_connected()?;
+                let displays: Vec<serde_json::Value> = self
+                    .peer_info
+                    .as_ref()
+                    .map(|pi| &pi.displays)
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, d)| {
+                        serde_json::json!({
+                            "idx": idx,
+                            "x": d.x,
+                            "y": d.y,
+                            "width": d.width,
+                            "height": d.height,
+                            "name": d.name,
+                        })
+                    })
+                    .collect();
+                Ok((
+                    SessionResponse::ok_with_data(
+                        format!("{} display(s)", displays.len()),
+                        serde_json::json!({ "displays": displays }),
+                    ),
+                    vec![],
+                ))
             }
         }
     }
@@ -740,6 +771,7 @@ mod tests {
                 quality: None,
                 region: None,
                 display: None,
+                timeout_secs: None,
             },
             SessionCommand::Type {
                 text: "hello".to_string(),
@@ -766,6 +798,7 @@ mod tests {
                 delta: -1,
             },
             SessionCommand::Move { x: 100, y: 200 },
+            SessionCommand::Displays,
         ];
 
         for command in commands {

@@ -288,6 +288,7 @@ pub async fn run_daemon(
                 y: d.y,
                 width: d.width,
                 height: d.height,
+                name: d.name.clone(),
             })
             .collect(),
     });
@@ -530,18 +531,23 @@ async fn execute_daemon_command(
             quality,
             region,
             display,
+            timeout_secs,
             ..
         } => {
-            let bytes = capture::request_screenshot(
-                encrypted,
-                &capture::CaptureOptions {
-                    format,
-                    quality,
-                    region,
-                    display,
-                },
+            let bytes = tokio::time::timeout(
+                Duration::from_secs(timeout_secs.unwrap_or(10)),
+                capture::request_screenshot(
+                    encrypted,
+                    &capture::CaptureOptions {
+                        format,
+                        quality,
+                        region,
+                        display,
+                    },
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!("screenshot request timed out"))??;
             Ok(SessionResponse::ok_with_data(
                 "Screenshot captured",
                 serde_json::json!({
@@ -630,6 +636,7 @@ where
                 y: d.y,
                 width: d.width,
                 height: d.height,
+                name: d.name.clone(),
             })
             .collect(),
     });

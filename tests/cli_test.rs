@@ -30,6 +30,7 @@ fn help_lists_all_subcommands() {
                 .and(contains("exec"))
                 .and(contains("clipboard"))
                 .and(contains("status"))
+                .and(contains("displays"))
                 .and(contains("capture"))
                 .and(contains("type"))
                 .and(contains("key"))
@@ -128,6 +129,25 @@ fn json_status_contract() {
 }
 
 #[test]
+fn json_displays_contract() {
+    let value = run_json_any_exit(&["--json", "displays"]);
+    assert_eq!(value["command"], "displays");
+    if value["ok"] == true {
+        let displays = value["displays"].as_array().expect("displays should be array");
+        for d in displays {
+            assert!(d["idx"].is_number());
+            assert!(d["x"].is_number());
+            assert!(d["y"].is_number());
+            assert!(d["width"].is_number());
+            assert!(d["height"].is_number());
+            assert!(d["name"].is_string());
+        }
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
+}
+
+#[test]
 fn json_capture_contract() {
     let value = run_json_any_exit(&["--json", "capture", "shot.png"]);
     assert_eq!(value["command"], "capture");
@@ -166,6 +186,23 @@ fn json_capture_format_contract() {
     if value["ok"] == true {
         assert_eq!(value["format"], "jpg");
         assert!(value["bytes"].as_u64().is_some());
+    } else {
+        assert!(value["error"]["code"].is_string());
+    }
+}
+
+#[test]
+fn json_capture_timeout_contract() {
+    let value = run_json_any_exit(&[
+        "--json",
+        "capture",
+        "shot.png",
+        "--timeout",
+        "7",
+    ]);
+    assert_eq!(value["command"], "capture");
+    if value["ok"] == true {
+        assert_eq!(value["timeout"], 7);
     } else {
         assert!(value["error"]["code"].is_string());
     }

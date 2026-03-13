@@ -898,4 +898,32 @@ To resolve response interleaving, the `RendezvousClient` should pivot from a seq
 2.  **Subscription**: Use `mpsc` or `broadcast` channels to allow different parts of the code (e.g., the Heartbeat loop vs. the Connection Orchestrator) to "subscribe" to relevant message types.
 3.  **Routing**: The background task matches the message type and forwards it to the appropriate channel.
 
+---
+
+## 28. Diagnostic Findings: PunchHole Timeout
+
+Investigation into why `PunchHoleRequest` times out despite successful heartbeat and registration.
+
+### 1. Selective Response (Silent Dropping)
+Probing the live ID server (`115.238.185.55:50076`) reveals a deliberate "Selective Silence" behavior:
+- **Empty Key**: Sending `PunchHoleRequest` with `licence_key: ""` immediately returns `PunchHoleResponse { failure: 3 }` (LicenseMismatch). This proves the server **is** receiving the UDP packets.
+- **Correct Key**: Sending the same request with the correct key from `TEST_CONFIG.md` results in **silence** (no response).
+
+**Conclusion**: The server silently drops authorized connection requests if it determines the target peer is offline or if the requesting client's session state is considered "incomplete" or "stale".
+
+### 2. Response Interleaving
+During the 15-second wait for a `PunchHoleResponse`, the client received multiple `RegisterPeerResponse` messages from the heartbeat loop.
+- **Impact**: In a sequential `recv` model, the client might pick up a heartbeat response and incorrectly interpret it as a failed or missing `PunchHole` response.
+- **Observation**: Even when manually filtering these interleaved messages, the `PunchHoleResponse` never arrived for the correct key.
+
+### 3. OnlineRequest Failure
+The server did not respond to `OnlineRequest`. This suggests that simple registration (`RegisterPeer` + `RegisterPk`) is insufficient to grant the client access to peer status information. The server likely requires a period of sustained heartbeats or a specific NAT test (`TestNatRequest`) before promoting the session to an "authorized" tier.
+
+### 4. Path to Resolution
+To unblock the `connect` command:
+1.  **Peer Verification**: Verify the target peer `308235080` is actually running and connected to the same ID server.
+2.  **State Warm-up**: The client should maintain heartbeats for **at least 5-10 seconds** before attempting the first `PunchHoleRequest`.
+3.  **Hole Punching Resilience**: Implement the actor-based demuxing described in **Section 27** to ensure heartbeat responses never block the discovery of connection responses.
+4.  **Error Feedback**: The CLI should immediately report `LicenseMismatch` if received, rather than waiting for a timeout, to provide better UX during misconfiguration.
+
 

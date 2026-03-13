@@ -35,6 +35,8 @@
 | Add a `request_relay_for` variant that carries target and routing hints from `PunchHoleResponse` | The live hbbs server did not answer an empty `RequestRelay`, but it accepts a more complete relay request shape |
 | In the live relay test, fall back to the configured relay endpoint if hbbs does not return relay routing in time | This still verifies the `RequestRelay` send path while keeping the TCP relay reachability check stable against live-server variance |
 | Thread `--id-server`, `--relay-server`, and `--key` through CLI connect into daemon startup even if the daemon does not consume them yet | This preserves the requested command-line contract and avoids dropping user-provided connectivity settings |
+| The repo already contains a `src/connection.rs` implementation of the full relay + crypto + login flow | The new ignored e2e test should align with that sequencing instead of inventing a different handshake order |
+| The current live e2e auth probe reaches the relay bind step but the relay closes before forwarding the first session message | The first real failure point is before `SignedId`, so the next protocol debugging step should focus on relay binding (`RequestRelay.uuid` / token / socket hints) rather than password hashing |
 
 ## Issues Encountered
 | Issue | Resolution |
@@ -47,6 +49,7 @@
 | `RegisterPeer` in the generated schema does not carry the public key | Kept `register_peer(my_id, public_key)` aligned with the requested API and reserved the key for the later `RegisterPk` phase described in the research notes |
 | The first live `PunchHoleResponse` assertion was too strict for the real server behavior | Relaxed the check to require successful decoding and a target that is not reported as `ID_NOT_EXIST` |
 | Direct TCP relay reachability checks can fail under the default sandbox policy | Used an unsandboxed test run for the ignored live relay test command |
+| The ignored e2e auth probe initially stalled waiting for `RelayResponse` | Added the same relay-endpoint fallback used by the live relay test so the probe could continue far enough to observe the relay-side EOF |
 
 ## Resources
 - `/Users/qlss/Documents/Projects/rustdesk-cli`

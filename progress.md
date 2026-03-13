@@ -420,3 +420,48 @@
 |------|-------|----------|--------|--------|
 | Full crate test suite | `cargo test` | All unit and non-ignored integration tests pass after connect flag threading | 47 tests passed, 2 ignored | ✓ |
 | Live rendezvous and relay tests | `cargo test --test live_server_test -- --ignored` | Live UDP registration/punch-hole and TCP relay reachability both pass | 2 passed | ✓ |
+
+## Session: 2026-03-14 (E2E Auth Probe)
+
+### Phase 1: Requirements & Discovery
+- **Status:** complete
+- **Started:** 2026-03-14 01:19
+- Actions taken:
+  - Read `src/crypto.rs` and `src/proto.rs` for `password_hash`, `key_exchange`, and the real `Message` / `LoginRequest` envelope shapes.
+  - Decoded the configured server key once to obtain the 32-byte Ed25519 key expected by `key_exchange`.
+  - Discovered the repo already has `src/connection.rs`, which confirmed the intended relay-bind → `SignedId` → `PublicKey` → encrypted `Hash` → encrypted `LoginRequest` sequence.
+- Files created/modified:
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 2: Implementation
+- **Status:** complete
+- Actions taken:
+  - Created `tests/e2e_connect_test.rs`.
+  - Added an ignored live auth probe that reuses `src/proto.rs`, `src/rendezvous.rs`, `src/transport.rs`, and `src/crypto.rs` via `#[path = ...]` imports.
+  - Implemented rendezvous registration, punch-hole, relay bind, `PublicKey` exchange, encrypted `Hash` handling, and encrypted `LoginRequest` emission.
+  - Added stage-specific error context so failures identify the exact point in the live protocol flow.
+- Files created/modified:
+  - `tests/e2e_connect_test.rs` (created)
+
+### Phase 3: Testing & Verification
+- **Status:** complete
+- Actions taken:
+  - Reran `cargo test --test live_server_test -- --ignored` with live network access and confirmed both live rendezvous/relay tests passed.
+  - Ran `cargo test --test e2e_connect_test -- --ignored` with live network access.
+  - Observed the current live failure point: the relay closes the TCP stream before forwarding the first post-bind session message (`early eof` before `SignedId`).
+  - Added a relay-endpoint fallback so the auth probe gets past missing `RelayResponse` replies and reaches the relay bind failure point.
+  - Ran `cargo test` to confirm the regular suite still passes with the ignored auth probe in place.
+- Files created/modified:
+  - `tests/e2e_connect_test.rs` (updated)
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+## Test Results (E2E Auth Probe)
+| Test | Input | Expected | Actual | Status |
+|------|-------|----------|--------|--------|
+| Ignored live rendezvous/relay tests | `cargo test --test live_server_test -- --ignored` | Both live UDP and relay reachability tests pass | 2 passed | ✓ |
+| Ignored live auth probe | `cargo test --test e2e_connect_test -- --ignored` | Reach as far into real auth flow as possible and capture exact failure | Failed with `relay server closed before forwarding the first session message` (`early eof`) | ✓ |
+| Full crate test suite | `cargo test` | Normal suite remains green with ignored live auth probe added | 49 passed, 4 ignored | ✓ |

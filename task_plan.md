@@ -217,3 +217,31 @@ Extend the ignored live-server coverage to include relay TCP reachability and ad
 - [x] Adjust the live relay test based on observed hbbs behavior
 - [x] Confirm both normal and ignored suites pass
 - **Status:** complete
+
+## 2026-03-14 E2E Auth Probe
+
+### Goal
+Verify the ignored live rendezvous/relay tests still pass, then add an ignored end-to-end auth probe that drives relay binding, crypto handshake, and login far enough to capture the first real server-side failure.
+
+### Phases
+#### Phase 1: Discovery
+- [x] Read `src/crypto.rs`
+- [x] Read `src/proto.rs`
+- [x] Read the generated `Message`, `Hash`, `PublicKey`, and `LoginRequest` shapes
+- [x] Check for existing full-connection code in the repo
+- **Status:** complete
+
+#### Phase 2: Implementation
+- [x] Create `tests/e2e_connect_test.rs`
+- [x] Reuse binary-only modules via `#[path = ...]` imports
+- [x] Implement the ignored relay/auth probe
+- [x] Add stage-specific failure context for live debugging
+- **Status:** complete
+
+#### Phase 3: Verification
+- [x] Run `cargo test --test live_server_test -- --ignored`
+- [x] Confirm both ignored live rendezvous/relay tests pass
+- [x] Run `cargo test --test e2e_connect_test -- --ignored`
+- [x] Capture the current live failure point for the auth probe
+- [x] Run `cargo test` to confirm the normal suite stays green
+- **Status:** complete

@@ -238,3 +238,87 @@ The following fields are typically populated in a `LoginRequest`:
 *   `os_login` (12): Optional `OSLogin` sub-message for system-level authentication.
 *   `hwid` (14): Hardware ID (bytes) for "trusted device" features.
 
+---
+
+## 10. Rendezvous Implementation Details
+
+The rendezvous protocol facilitates peer discovery and connectivity through the `hbbs` (ID/Rendezvous) server.
+
+### UDP Message Sequence
+
+#### 1. Registration (`RegisterPeer`)
+To stay online and discoverable, the host periodically sends a `RegisterPeer` message to `hbbs`.
+*   **Sequence**:
+    1.  **Host → `hbbs` (`RegisterPk`)**: (Initial) Registers the public key and UUID.
+    2.  **`hbbs` → Host (`RegisterPkResponse`)**: Confirms registration and provides `keep_alive` interval.
+    3.  **Host → `hbbs` (`RegisterPeer`)**: (Periodic) Updates online status.
+    4.  **`hbbs` → Host (`RegisterPeerResponse`)**: Acknowledges status.
+
+#### 2. Connection Request (`PunchHoleRequest`)
+The client initiates a connection by asking `hbbs` to help "punch a hole" to the target host.
+*   **Sequence**:
+    1.  **Client → `hbbs` (`PunchHoleRequest`)**: Contains `id` (target), `nat_type`, and `udp_port`.
+    2.  **`hbbs` → Target (`PunchHole`)**: Forwards the request to the host.
+    3.  **Target → `hbbs` (`PunchHoleSent`)**: Host acknowledges and starts punching.
+    4.  **`hbbs` → Client (`PunchHoleResponse`)**: Provides target's IP, PK, and relay info.
+
+### Building `RendezvousMessage` Protobuf
+
+The client uses the `prost` generated `RendezvousMessage` struct. Messages are typically wrapped in a `oneof` union.
+
+```rust
+// Example: Building a RegisterPeer message
+let mut msg_out = RendezvousMessage::new();
+msg_out.set_register_peer(RegisterPeer {
+    id: Config::get_id(),
+    serial: Config::get_serial(),
+    ..Default::default()
+});
+
+// Example: Building a PunchHoleRequest
+let mut msg_out = RendezvousMessage::new();
+msg_out.set_punch_hole_request(PunchHoleRequest {
+    id: target_id.to_owned(),
+    nat_type: my_nat_type.into(),
+    licence_key: key.to_owned(),
+    conn_type: conn_type.into(),
+    udp_port: my_udp_port as _,
+    ..Default::default()
+});
+```
+
+### NAT Type Detection Logic
+RustDesk determines NAT type by comparing the public ports returned by two different rendezvous servers (or different ports on the same server).
+
+1.  **Request**: Client sends `TestNatRequest` to `Server1:Port1` and `Server2:Port2`.
+2.  **Response**: Each server returns the client's public port in a `TestNatResponse`.
+3.  **Logic**:
+    *   If `Port1 == Port2`, the NAT is **ASYMMETRIC** (usually "Full Cone" or "Address Restricted").
+    *   If `Port1 != Port2`, the NAT is **SYMMETRIC**.
+
+```rust
+// Simplified Logic from test_nat_type_()
+let ok = port1 > 0 && port2 > 0;
+if ok {
+    let t = if port1 == port2 {
+        NatType::ASYMMETRIC
+    } else {
+        NatType::SYMMETRIC
+    };
+    Config::set_nat_type(t as _);
+}
+```
+
+### Relay Fallback Trigger Conditions
+A session falls back to the relay server (`hbbr`) in the following scenarios:
+1.  **Symmetric NAT on both sides**: Hole punching is mathematically unlikely to succeed.
+2.  **Force Relay**: The `force_relay` flag is set in the `PunchHoleRequest`.
+3.  **Direct P2P Timeout**: The client fails to establish a direct connection within the `CONNECT_TIMEOUT` after hole punching.
+4.  **WebSocket/Proxy**: If the client is using a WebSocket or a SOCKS5 proxy, direct UDP P2P is often bypassed in favor of relay.
+
+### Socket_client Functions Used
+*   **`connect_tcp`**: Establishes a signaling connection to `hbbs`.
+*   **`new_direct_udp_for`**: Creates a UDP socket for registration and hole punching.
+*   **`connect_tcp_local`**: Used during TCP hole punching to attempt a connection from a specific local port.
+*   **`rebind_udp_for`**: Re-establishes a UDP socket if the network environment changes.
+

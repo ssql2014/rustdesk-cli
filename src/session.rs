@@ -56,6 +56,18 @@ pub enum SessionCommand {
         y: i32,
         button: String,
     },
+    Drag {
+        x: i32,
+        y: i32,
+        x2: i32,
+        y2: i32,
+        button: String,
+    },
+    Scroll {
+        x: i32,
+        y: i32,
+        delta: i32,
+    },
     Move {
         x: i32,
         y: i32,
@@ -214,6 +226,63 @@ impl Session {
                 ];
                 Ok((
                     SessionResponse::ok(format!("{button} click at ({x}, {y})")),
+                    messages,
+                ))
+            }
+
+            SessionCommand::Drag { x, y, x2, y2, button } => {
+                self.require_connected()?;
+                let mask = MouseEvent::button_mask(&button);
+                let messages = vec![
+                    ProtocolMessage::MouseEvent(MouseEvent {
+                        x,
+                        y,
+                        mask,
+                        is_move: false,
+                    }),
+                    ProtocolMessage::MouseEvent(MouseEvent {
+                        x: x2,
+                        y: y2,
+                        mask,
+                        is_move: true,
+                    }),
+                    ProtocolMessage::MouseEvent(MouseEvent {
+                        x: x2,
+                        y: y2,
+                        mask: 0,
+                        is_move: false,
+                    }),
+                ];
+                Ok((
+                    SessionResponse::ok(format!("{button} drag from ({x}, {y}) to ({x2}, {y2})")),
+                    messages,
+                ))
+            }
+
+            SessionCommand::Scroll { x, y, delta } => {
+                self.require_connected()?;
+                let mask = if delta >= 0 {
+                    MouseEvent::SCROLL_UP
+                } else {
+                    MouseEvent::SCROLL_DOWN
+                };
+                let mut messages = Vec::new();
+                for _ in 0..delta.abs() {
+                    messages.push(ProtocolMessage::MouseEvent(MouseEvent {
+                        x,
+                        y,
+                        mask,
+                        is_move: false,
+                    }));
+                    messages.push(ProtocolMessage::MouseEvent(MouseEvent {
+                        x,
+                        y,
+                        mask: 0,
+                        is_move: false,
+                    }));
+                }
+                Ok((
+                    SessionResponse::ok(format!("Scrolled {delta} at ({x}, {y})")),
                     messages,
                 ))
             }
@@ -392,6 +461,91 @@ mod tests {
     }
 
     #[test]
+    fn drag_generates_press_move_release_sequence() {
+        let mut session = connected_session();
+
+        let (response, messages) = session
+            .dispatch(SessionCommand::Drag {
+                x: 100,
+                y: 200,
+                x2: 300,
+                y2: 400,
+                button: "left".to_string(),
+            })
+            .expect("drag should succeed");
+
+        assert!(response.success);
+        assert_eq!(
+            response.message.as_deref(),
+            Some("left drag from (100, 200) to (300, 400)")
+        );
+        assert_eq!(messages.len(), 3);
+
+        match &messages[0] {
+            ProtocolMessage::MouseEvent(event) => {
+                assert_eq!(event.x, 100);
+                assert_eq!(event.y, 200);
+                assert_eq!(event.mask, MouseEvent::BUTTON_LEFT);
+                assert!(!event.is_move);
+            }
+            other => panic!("expected drag press event, got {other:?}"),
+        }
+
+        match &messages[1] {
+            ProtocolMessage::MouseEvent(event) => {
+                assert_eq!(event.x, 300);
+                assert_eq!(event.y, 400);
+                assert_eq!(event.mask, MouseEvent::BUTTON_LEFT);
+                assert!(event.is_move);
+            }
+            other => panic!("expected drag move event, got {other:?}"),
+        }
+
+        match &messages[2] {
+            ProtocolMessage::MouseEvent(event) => {
+                assert_eq!(event.x, 300);
+                assert_eq!(event.y, 400);
+                assert_eq!(event.mask, 0);
+                assert!(!event.is_move);
+            }
+            other => panic!("expected drag release event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scroll_generates_scroll_up_events_for_positive_delta() {
+        let mut session = connected_session();
+
+        let (response, messages) = session
+            .dispatch(SessionCommand::Scroll {
+                x: 50,
+                y: 75,
+                delta: 2,
+            })
+            .expect("scroll should succeed");
+
+        assert!(response.success);
+        assert_eq!(response.message.as_deref(), Some("Scrolled 2 at (50, 75)"));
+        assert_eq!(messages.len(), 4);
+
+        for (index, message) in messages.iter().enumerate() {
+            match message {
+                ProtocolMessage::MouseEvent(event) => {
+                    assert_eq!(event.x, 50);
+                    assert_eq!(event.y, 75);
+                    assert!(!event.is_move);
+                    if index % 2 == 0 {
+                        assert_eq!(event.mask, MouseEvent::SCROLL_UP);
+                    } else {
+                        assert_eq!(event.mask, 0);
+                    }
+                }
+                other => panic!("expected scroll mouse event, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn status_returns_data_with_state_and_peer_id() {
         let mut session = connected_session();
 
@@ -425,6 +579,18 @@ mod tests {
                 x: 100,
                 y: 200,
                 button: "left".to_string(),
+            },
+            SessionCommand::Drag {
+                x: 100,
+                y: 200,
+                x2: 300,
+                y2: 400,
+                button: "left".to_string(),
+            },
+            SessionCommand::Scroll {
+                x: 100,
+                y: 200,
+                delta: -1,
             },
             SessionCommand::Move { x: 100, y: 200 },
         ];

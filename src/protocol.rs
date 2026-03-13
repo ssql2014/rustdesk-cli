@@ -88,6 +88,8 @@ impl MouseEvent {
     pub const BUTTON_LEFT: u32 = 1;
     pub const BUTTON_RIGHT: u32 = 2;
     pub const BUTTON_MIDDLE: u32 = 4;
+    pub const SCROLL_UP: u32 = 8;
+    pub const SCROLL_DOWN: u32 = 16;
 
     pub fn button_mask(button: &str) -> u32 {
         match button {

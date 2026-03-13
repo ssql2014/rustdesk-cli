@@ -34,6 +34,7 @@ use crate::transport::{TcpTransport, Transport};
 
 pub const SOCKET_PATH: &str = "/tmp/rustdesk-cli.sock";
 pub const LOCK_PATH: &str = "/tmp/rustdesk-cli.lock";
+const ERROR_PATH: &str = "/tmp/rustdesk-cli.error";
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const EXEC_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const EXEC_PROMPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -98,6 +99,7 @@ pub fn spawn_daemon(
     // Clean up stale socket/lock
     let _ = fs::remove_file(SOCKET_PATH);
     let _ = fs::remove_file(LOCK_PATH);
+    let _ = fs::remove_file(ERROR_PATH);
 
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
@@ -142,6 +144,13 @@ pub fn spawn_daemon(
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    if Path::new(ERROR_PATH).exists() {
+        let error = fs::read_to_string(ERROR_PATH)
+            .unwrap_or_else(|_| "daemon startup failed".to_string());
+        let _ = fs::remove_file(ERROR_PATH);
+        anyhow::bail!("Daemon failed to start: {}", error.trim());
+    }
+
     anyhow::bail!("Daemon started but lock file not created within {wait_secs} seconds")
 }
 
@@ -181,6 +190,7 @@ pub async fn run_daemon(
 ) -> Result<()> {
     // Clean up stale socket
     let _ = fs::remove_file(SOCKET_PATH);
+    let _ = fs::remove_file(ERROR_PATH);
 
     let listener = UnixListener::bind(SOCKET_PATH)
         .context("Failed to bind Unix socket")?;
@@ -209,13 +219,19 @@ pub async fn run_daemon(
     {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            eprintln!("daemon: connect failed: {e:#}");
+            let message = format!("{e:#}");
+            let _ = write_startup_error(&message);
+            eprintln!("daemon: connect failed: {message}");
             cleanup();
+            let _ = write_startup_error(&message);
             return Ok(());
         }
         Err(_) => {
-            eprintln!("daemon: connect timed out after {timeout_secs}s");
+            let message = format!("connect timed out after {timeout_secs}s");
+            let _ = write_startup_error(&message);
+            eprintln!("daemon: {message}");
             cleanup();
+            let _ = write_startup_error(&message);
             return Ok(());
         }
     };
@@ -840,7 +856,14 @@ async fn send_response(
 
 fn cleanup() {
     let _ = fs::remove_file(SOCKET_PATH);
+    let _ = fs::remove_file(ERROR_PATH);
     LockFile::remove();
+}
+
+fn write_startup_error(message: &str) -> Result<()> {
+    fs::write(ERROR_PATH, message)?;
+    fs::set_permissions(ERROR_PATH, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -40,6 +40,9 @@
 | The current CLI/daemon architecture already treats `SessionCommand` as the single contract between `main.rs` and the daemon | `shell`, `exec`, and clipboard commands should be added there and reused everywhere instead of special-casing them in the CLI |
 | `src/terminal.rs` already contains real RustDesk terminal helpers, but `TASK_LEO.md` only requires stub dispatch behavior matching existing commands | This task is a surface-area expansion plus tests, not a live PTY transport integration |
 | Batch mode is implemented by the custom `parse_batch_steps()` and `step_to_response()` helpers rather than by Clap | Every new top-level command that should work in `do` must be added in both places or the batch surface will drift from the normal CLI |
+| The real text-mode design cannot rely on `terminal.rs` reading the encrypted stream directly | Clipboard and terminal traffic share the same RustDesk `Message` stream, so the daemon needs a single inbound demultiplexer that routes terminal responses and caches clipboard events |
+| Plain text clipboard sync is push-based in the protobuf surface | `clipboard set` should send `Message::Clipboard`, while `clipboard get` should read from daemon-side cache updated by inbound `Clipboard` or `MultiClipboards` because there is no dedicated request message for plain text fetch |
+| Deterministic `exec` completion should not depend on parsing the remote prompt | The robust design is an ephemeral terminal per exec plus a daemon-generated sentinel marker that carries exit status and defines the command boundary |
 
 ## Issues Encountered
 | Issue | Resolution |

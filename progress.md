@@ -506,3 +506,24 @@
 | Test | Input | Expected | Actual | Status |
 |------|-------|----------|--------|--------|
 | Full crate test suite | `cargo test` | New shell/exec/clipboard coverage plus existing suites all pass | 46 unit tests passed, 22 CLI tests passed, ignored live tests unchanged | ✓ |
+
+## Session: 2026-03-14 (Text Session Design)
+
+### Phase 1: Requirements & Discovery
+- **Status:** complete
+- **Started:** 2026-03-14 02:0x
+- Actions taken:
+  - Read `src/text_session.rs`, `src/terminal.rs`, `src/session.rs`, and `src/daemon.rs`.
+  - Read `src/connection.rs` and the clipboard portions of `proto/message.proto` to verify the real connect path and exact protobuf message names.
+  - Identified the main architectural gap: the daemon lacks ownership of the live encrypted stream and there is no shared inbound router for terminal and clipboard traffic.
+- Files created/modified:
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 2: Design
+- **Status:** complete
+- Actions taken:
+  - Wrote `DESIGN_TEXT_SESSION.md`.
+  - Specified daemon runtime ownership, real connect wiring, interactive shell attach lifecycle, sentinel-based exec completion, clipboard cache semantics, timeout/reconnect policy, and module dependency graph.
+- Files created/modified:
+  - `DESIGN_TEXT_SESSION.md` (created)

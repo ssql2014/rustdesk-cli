@@ -53,12 +53,12 @@ pub struct ConnectionResult {
 
 /// Connect to a remote RustDesk peer through the full protocol flow.
 ///
-/// 1. Rendezvous discovery via hbbs
+/// 1. Rendezvous discovery via hbbs (PunchHole + relay fallback)
 /// 2. Relay TCP connection via hbbr
-/// 3. NaCl key exchange
-/// 4. Password authentication
+/// 3. NaCl key exchange (Ed25519→Curve25519, crypto_box)
+/// 4. Password authentication (two-stage SHA256)
 /// 5. Returns PeerInfo + encrypted stream
-pub async fn connect_to_peer(config: &ConnectionConfig) -> Result<ConnectionResult> {
+pub async fn connect(config: &ConnectionConfig) -> Result<ConnectionResult> {
     let server_pk = decode_server_key(&config.server_key)?;
 
     // Phase 1: Rendezvous discovery.
@@ -177,24 +177,36 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
 /// free-text `other_failure` string.  We detect these early so the CLI can
 /// report a clear message instead of silently falling through to a relay that
 /// will also fail.
+///
+/// Relay fallback: when the server returns `Offline` but also provides a
+/// `relay_server`, direct UDP punch failed but relay may still work.  In that
+/// case we return `Ok(())` so the caller proceeds to RequestRelay.
 fn check_punch_hole_failure(resp: &PunchHoleResponse) -> Result<()> {
     // Non-empty other_failure is always an error, regardless of the enum value.
     if !resp.other_failure.is_empty() {
         bail!("punch hole failed: {}", resp.other_failure);
     }
 
+    let has_relay = !resp.relay_server.is_empty();
+
     match punch_hole_response::Failure::try_from(resp.failure) {
         // 0 = IdNotExist is also the protobuf default.  Distinguish a real
         // "ID not found" from "no error" by checking whether the server
         // gave us any useful addressing data.
         Ok(punch_hole_response::Failure::IdNotExist) => {
-            if resp.socket_addr.is_empty() && resp.relay_server.is_empty() {
+            if resp.socket_addr.is_empty() && !has_relay {
                 bail!("punch hole failed: the target ID does not exist on the rendezvous server");
             }
             Ok(())
         }
         Ok(punch_hole_response::Failure::Offline) => {
-            bail!("punch hole failed: the target peer is offline");
+            if has_relay {
+                // Direct punch failed but server provided relay — proceed
+                // with relay fallback (Nova §26).
+                Ok(())
+            } else {
+                bail!("punch hole failed: the target peer is offline");
+            }
         }
         Ok(punch_hole_response::Failure::LicenseMismatch) => {
             bail!("punch hole failed: license mismatch between client and server");
@@ -457,6 +469,17 @@ mod tests {
     }
 
     #[test]
+    fn punch_hole_offline_with_relay_allows_fallback() {
+        // Offline + relay_server populated → proceed with relay (not a hard error).
+        let resp = PunchHoleResponse {
+            failure: punch_hole_response::Failure::Offline as i32,
+            relay_server: "relay.example.com:21117".to_string(),
+            ..Default::default()
+        };
+        assert!(check_punch_hole_failure(&resp).is_ok());
+    }
+
+    #[test]
     fn punch_hole_license_mismatch_fails() {
         let resp = PunchHoleResponse {
             failure: punch_hole_response::Failure::LicenseMismatch as i32,
@@ -519,7 +542,7 @@ mod tests {
             warmup_secs: 5,
         };
 
-        match connect_to_peer(&config).await {
+        match connect(&config).await {
             Ok(result) => {
                 println!("Connected successfully!");
                 println!("  hostname: {}", result.peer_info.hostname);

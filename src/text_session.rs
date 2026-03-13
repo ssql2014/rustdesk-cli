@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use prost::Message as ProstMessage;
 
-use crate::connection::{ConnectionConfig, ConnectionResult, connect_to_peer};
+use crate::connection::{ConnectionConfig, ConnectionResult, connect};
 use crate::crypto::EncryptedStream;
 use crate::proto::hbb::{
     ImageQuality, Message, Misc, OptionMessage, PeerInfo,
@@ -60,7 +60,7 @@ pub async fn text_connect(config: &ConnectionConfig) -> Result<TextSession> {
     let ConnectionResult {
         peer_info,
         mut encrypted,
-    } = connect_to_peer(config)
+    } = connect(config)
         .await
         .context("connection failed")?;
 

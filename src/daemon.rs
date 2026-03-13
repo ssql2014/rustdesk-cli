@@ -142,7 +142,7 @@ pub fn spawn_daemon(
     cmd.spawn().context("Failed to spawn daemon process")?;
 
     // Wait for the daemon to create its lock file.
-    // Lock file is written AFTER connect_to_peer succeeds, so we need
+    // Lock file is written AFTER connection::connect succeeds, so we need
     // to wait at least as long as the connection timeout plus margin.
     let wait_secs = timeout.unwrap_or(30) + 5;
     let wait_iters = (wait_secs * 10) as usize; // 100ms per iteration
@@ -417,7 +417,7 @@ async fn connect_with_timeout(
 ) -> std::result::Result<connection::ConnectionResult, ConnectWithTimeoutError> {
     tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        connection::connect_to_peer(config),
+        connection::connect(config),
     )
     .await
     .map_err(|_| ConnectWithTimeoutError::TimedOut(timeout_secs))?
@@ -525,7 +525,7 @@ async fn reconnect_encrypted_stream<N>(
 where
     N: FnMut(&SessionResponse),
 {
-    let conn = reconnect_with_retry(|| connection::connect_to_peer(config), notify).await?;
+    let conn = reconnect_with_retry(|| connection::connect(config), notify).await?;
     let mut encrypted = conn.encrypted;
     send_option_message(&mut encrypted).await?;
 

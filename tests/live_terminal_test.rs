@@ -2,7 +2,7 @@
 
 //! Live integration test: connect to the real RustDesk server and open a terminal.
 //!
-//! Uses `connection::connect_to_peer` then `terminal::open_terminal` against the
+//! Uses `connection::connect` then `terminal::open_terminal` against the
 //! self-hosted server. Marked `#[ignore]` so it only runs when explicitly requested.
 
 #[path = "../src/proto.rs"]
@@ -21,7 +21,7 @@ mod terminal;
 use anyhow::Result;
 use tokio::time::{Duration, timeout};
 
-use connection::{ConnectionConfig, connect_to_peer};
+use connection::{ConnectionConfig, connect};
 use terminal::{open_terminal, close_terminal, send_terminal_data, recv_terminal_data, TerminalEvent};
 
 const ID_SERVER_ADDR: &str = "115.238.185.55:50076";
@@ -48,9 +48,9 @@ async fn live_open_terminal() -> Result<()> {
     let config = test_config();
 
     // Phase 1: Full connection (rendezvous → relay → crypto → auth).
-    let result = timeout(Duration::from_secs(30), connect_to_peer(&config))
+    let result = timeout(Duration::from_secs(30), connect(&config))
         .await
-        .map_err(|_| anyhow::anyhow!("connect_to_peer timed out after 30s"))??;
+        .map_err(|_| anyhow::anyhow!("connect timed out after 30s"))??;
 
     println!("Connected to peer:");
     println!("  hostname: {}", result.peer_info.hostname);
@@ -90,9 +90,9 @@ async fn live_open_terminal() -> Result<()> {
 async fn live_terminal_exec_echo() -> Result<()> {
     let config = test_config();
 
-    let result = timeout(Duration::from_secs(30), connect_to_peer(&config))
+    let result = timeout(Duration::from_secs(30), connect(&config))
         .await
-        .map_err(|_| anyhow::anyhow!("connect_to_peer timed out after 30s"))??;
+        .map_err(|_| anyhow::anyhow!("connect timed out after 30s"))??;
 
     let mut encrypted = result.encrypted;
 

@@ -141,6 +141,7 @@ fn json_capture_contract() {
 }
 
 #[test]
+#[ignore = "requires a live daemon connection to capture real screenshots"]
 fn capture_without_file_writes_png_to_stdout() {
     let output = bin()
         .args(["capture"])

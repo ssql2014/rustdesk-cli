@@ -43,6 +43,8 @@
 | The real text-mode design cannot rely on `terminal.rs` reading the encrypted stream directly | Clipboard and terminal traffic share the same RustDesk `Message` stream, so the daemon needs a single inbound demultiplexer that routes terminal responses and caches clipboard events |
 | Plain text clipboard sync is push-based in the protobuf surface | `clipboard set` should send `Message::Clipboard`, while `clipboard get` should read from daemon-side cache updated by inbound `Clipboard` or `MultiClipboards` because there is no dedicated request message for plain text fetch |
 | Deterministic `exec` completion should not depend on parsing the remote prompt | The robust design is an ephemeral terminal per exec plus a daemon-generated sentinel marker that carries exit status and defines the command boundary |
+| Screenshot capture is exposed as top-level `Message::ScreenshotRequest` / `Message::ScreenshotResponse`, not a `Misc` variant | The real capture path should send a screenshot request on the encrypted stream and wait for the matching `sid` in the response loop |
+| The current daemon UDS protocol is JSON-line only, so screenshot bytes cannot cross it as raw binary | The smallest compatible end-to-end capture path is to base64-encode screenshot bytes in daemon `SessionResponse.data` and let the CLI decode them before writing to file/stdout |
 
 ## Issues Encountered
 | Issue | Resolution |

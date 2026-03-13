@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 mod connection;
 #[allow(dead_code)]
+mod capture;
+#[allow(dead_code)]
 mod crypto;
 #[allow(dead_code)]
 mod daemon;
@@ -18,11 +20,7 @@ mod text_session;
 mod transport;
 mod session;
 
-use std::{
-    io::{self, Write},
-    process,
-    str::FromStr,
-};
+use std::{process, str::FromStr};
 
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde_json::{Value, json};
@@ -556,35 +554,85 @@ fn run() -> i32 {
             quality: _,
             region,
         } => {
-            if let Some(file) = file {
-                let format = format.unwrap_or_else(|| infer_format(&file));
-                match send_to_daemon(&SessionCommand::Capture {
-                    output: file.clone(),
-                }) {
-                    Ok(resp) if resp.success => {
-                        emit_response(cli.json, capture_response(&file, format, region))
+            let output = file.clone().unwrap_or_default();
+            let response_format = file
+                .as_deref()
+                .map(infer_format)
+                .or(format)
+                .unwrap_or(CaptureFormat::Png);
+
+            match send_to_daemon(&SessionCommand::Capture { output }) {
+                Ok(resp) if resp.success => {
+                    let Some(data) = resp.data else {
+                        return emit_response(
+                            cli.json,
+                            error_response(
+                                "capture",
+                                "connection_error",
+                                "capture response missing image bytes",
+                                EXIT_CONNECTION,
+                            ),
+                        );
+                    };
+
+                    let encoded = data
+                        .get("bytes_b64")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let bytes = match capture::base64_decode(encoded) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            return emit_response(
+                                cli.json,
+                                error_response(
+                                    "capture",
+                                    "connection_error",
+                                    &format!("invalid capture payload: {e}"),
+                                    EXIT_CONNECTION,
+                                ),
+                            )
+                        }
+                    };
+
+                    if let Err(e) = capture::write_capture_output(&bytes, file.as_deref()) {
+                        return emit_response(
+                            cli.json,
+                            error_response(
+                                "capture",
+                                "connection_error",
+                                &e.to_string(),
+                                EXIT_CONNECTION,
+                            ),
+                        );
                     }
-                    Ok(resp) => emit_response(
-                        cli.json,
-                        error_response(
-                            "capture",
-                            "connection_error",
-                            resp.message.as_deref().unwrap_or("capture failed"),
-                            EXIT_CONNECTION,
-                        ),
-                    ),
-                    Err(e) => emit_response(
-                        cli.json,
-                        error_response(
-                            "capture",
-                            "connection_error",
-                            &e.to_string(),
-                            EXIT_CONNECTION,
-                        ),
-                    ),
+
+                    if file.is_none() && !cli.json {
+                        EXIT_SUCCESS
+                    } else {
+                        emit_response(
+                            cli.json,
+                            capture_result_response(file.as_deref(), response_format, region, bytes.len()),
+                        )
+                    }
                 }
-            } else {
-                emit_capture_stdout(fake_capture_payload(CaptureFormat::Png))
+                Ok(resp) => emit_response(
+                    cli.json,
+                    error_response(
+                        "capture",
+                        "connection_error",
+                        resp.message.as_deref().unwrap_or("capture failed"),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "capture",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
+                ),
             }
         }
         Commands::Type { text } => {
@@ -990,6 +1038,41 @@ fn capture_response(file: &str, format: CaptureFormat, region: Option<Region>) -
     }
 }
 
+fn capture_result_response(
+    file: Option<&str>,
+    format: CaptureFormat,
+    region: Option<Region>,
+    bytes: usize,
+) -> Response {
+    let mut json = json!({
+        "ok": true,
+        "command": "capture",
+        "format": format.as_str(),
+        "bytes": bytes,
+    });
+
+    let text = if let Some(file) = file {
+        if let Some(object) = json.as_object_mut() {
+            object.insert("file".to_string(), json!(file));
+        }
+        format!("captured file={file} format={} bytes={bytes}", format.as_str())
+    } else {
+        format!("captured stdout format={} bytes={bytes}", format.as_str())
+    };
+
+    if let Some(region) = region {
+        if let Some(object) = json.as_object_mut() {
+            object.insert("region".to_string(), region.to_json());
+        }
+    }
+
+    Response {
+        text,
+        json,
+        exit_code: EXIT_SUCCESS,
+    }
+}
+
 fn type_response(text: &str) -> Response {
     let chars = text.chars().count();
 
@@ -1235,33 +1318,6 @@ fn fake_capture_bytes(format: CaptureFormat, width: i32, height: i32) -> u64 {
         CaptureFormat::Png => pixels / 8 + 8_193,
         CaptureFormat::Jpg => pixels / 12 + 4_821,
     }
-}
-
-fn fake_capture_payload(format: CaptureFormat) -> &'static [u8] {
-    match format {
-        CaptureFormat::Png => &[
-            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I',
-            b'H', b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
-            0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, b'I', b'D',
-            b'A', b'T', 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00,
-            0x01, 0xFF, 0x89, 0x99, 0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N',
-            b'D', 0xAE, 0x42, 0x60, 0x82,
-        ],
-        CaptureFormat::Jpg => &[
-            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01,
-            0x01, 0x00, 0x48, 0x00, 0x48, 0x00, 0x00, 0xFF, 0xD9,
-        ],
-    }
-}
-
-fn emit_capture_stdout(bytes: &[u8]) -> i32 {
-    let mut stdout = io::stdout();
-    if let Err(e) = stdout.write_all(bytes).and_then(|_| stdout.flush()) {
-        eprintln!("connection_error: failed to write capture to stdout: {e}");
-        return EXIT_CONNECTION;
-    }
-
-    EXIT_SUCCESS
 }
 
 fn parse_batch_steps(tokens: &[String]) -> Result<Vec<BatchStep>, String> {

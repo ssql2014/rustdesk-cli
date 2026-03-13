@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
+use crate::capture;
 use crate::connection::{self, ConnectionConfig};
 use crate::crypto::EncryptedStream;
 use crate::proto::hbb::{
@@ -335,6 +336,19 @@ pub async fn run_daemon(
                         match clipboard_set(&mut encrypted, &text).await {
                             Ok(resp) => resp,
                             Err(e) => SessionResponse::error(format!("clipboard set failed: {e:#}")),
+                        }
+                    }
+                    SessionCommand::Capture { .. } => {
+                        match capture::request_screenshot(&mut encrypted).await {
+                            Ok(bytes) => SessionResponse::ok_with_data(
+                                "Screenshot captured",
+                                serde_json::json!({
+                                    "bytes_b64": capture::base64_encode(&bytes),
+                                    "bytes": bytes.len(),
+                                    "format": "png",
+                                }),
+                            ),
+                            Err(e) => SessionResponse::error(format!("capture failed: {e:#}")),
                         }
                     }
                     other => match session.dispatch(other) {

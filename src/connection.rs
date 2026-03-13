@@ -170,6 +170,13 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
         ))?
         .context("RequestRelay failed")?;
 
+        if !relay_response.refuse_reason.is_empty() {
+            bail!("relay refused: {}", relay_response.refuse_reason);
+        }
+        if relay_response.uuid.is_empty() {
+            bail!("relay server returned empty session uuid");
+        }
+
         let uuid = relay_response.uuid;
         let relay_addr = if relay_response.relay_server.is_empty() {
             relay_hint
@@ -195,9 +202,11 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
 /// report a clear message instead of silently falling through to a relay that
 /// will also fail.
 ///
-/// Relay fallback: when the server returns `Offline` but also provides a
-/// `relay_server`, direct UDP punch failed but relay may still work.  In that
-/// case we return `Ok(())` so the caller proceeds to RequestRelay.
+/// Relay fallback: `Offline` always returns `Ok(())` so the caller falls
+/// through to RequestRelay using `config.relay_server`.  The relay path has
+/// its own timeout, so truly-offline peers will be caught there.  Only
+/// `LicenseMismatch`, `LicenseOveruse`, and `IdNotExist` (with no addressing
+/// data) are hard failures.
 fn check_punch_hole_failure(resp: &PunchHoleResponse) -> Result<()> {
     // Non-empty other_failure is always an error, regardless of the enum value.
     if !resp.other_failure.is_empty() {
@@ -217,13 +226,11 @@ fn check_punch_hole_failure(resp: &PunchHoleResponse) -> Result<()> {
             Ok(())
         }
         Ok(punch_hole_response::Failure::Offline) => {
-            if has_relay {
-                // Direct punch failed but server provided relay — proceed
-                // with relay fallback (Nova §26).
-                Ok(())
-            } else {
-                bail!("punch hole failed: the target peer is offline");
-            }
+            // Always fall through to relay — the client knows
+            // config.relay_server even when the PunchHoleResponse doesn't
+            // include one.  If the peer is truly unreachable the relay
+            // request will time out with a clear error.
+            Ok(())
         }
         Ok(punch_hole_response::Failure::LicenseMismatch) => {
             bail!("punch hole failed: license mismatch between client and server");
@@ -482,18 +489,19 @@ mod tests {
     }
 
     #[test]
-    fn punch_hole_offline_fails() {
+    fn punch_hole_offline_without_relay_falls_through() {
+        // Offline without relay_server in the response is NOT a hard error —
+        // the caller has config.relay_server and should try relay anyway.
         let resp = PunchHoleResponse {
             failure: punch_hole_response::Failure::Offline as i32,
             ..Default::default()
         };
-        let err = check_punch_hole_failure(&resp).unwrap_err();
-        assert!(err.to_string().contains("offline"), "got: {err}");
+        assert!(check_punch_hole_failure(&resp).is_ok());
     }
 
     #[test]
     fn punch_hole_offline_with_relay_allows_fallback() {
-        // Offline + relay_server populated → proceed with relay (not a hard error).
+        // Offline + relay_server populated → also OK (relay hint is a bonus).
         let resp = PunchHoleResponse {
             failure: punch_hole_response::Failure::Offline as i32,
             relay_server: "relay.example.com:21117".to_string(),

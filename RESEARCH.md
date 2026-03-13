@@ -119,3 +119,61 @@ To achieve the goal of connecting, authenticating, capturing a screenshot, and s
 *   **`KeyEvent` / `ControlKey`**: Injecting keyboard input.
 *   **`MouseEvent`**: Injecting mouse movement and clicks.
 *   **`ScreenshotRequest` / `ScreenshotResponse`**: Optional alternative for capturing single frames.
+
+---
+
+## 8. Connection Sequence (Detailed)
+
+This section traces the exact sequence of messages and cryptographic handshakes required to establish a session between a client and a remote host.
+
+### Phase 1: Rendezvous & Discovery (via `hbbs`)
+**Ports:** 21116 (UDP/TCP), 21115 (TCP)
+1.  **Client → `hbbs` (`RegisterPk`)**: Client sends its ID, UUID, and Public Key (Ed25519) to the rendezvous server.
+2.  **Client → `hbbs` (`RegisterPeer`)**: Client announces it is online and available.
+3.  **Client → `hbbs` (`PunchHoleRequest`)**: Client requests a connection to a specific Target ID.
+4.  **`hbbs` → Target (`PunchHole`)**: Server forwards the request to the target host.
+5.  **Target → `hbbs` (`PunchHoleSent`)**: Target host attempts to "punch" a UDP hole and notifies the server.
+6.  **`hbbs` → Client (`PunchHoleResponse`)**: Server provides the target's public/local IP and its public key.
+
+### Phase 2: Secure Channel Handshake (NaCl Crypto)
+Once IP addresses are exchanged, the client and host establish an encrypted tunnel before any sensitive data (like passwords) is sent.
+1.  **Ephemeral Key Generation**: Both client and host generate ephemeral **Curve25519** key pairs for the session.
+2.  **Key Exchange (`PublicKey`)**:
+    *   Client sends its ephemeral Public Key.
+    *   Host sends its ephemeral Public Key.
+3.  **Shared Secret Derivation**:
+    *   Both sides use their own private key and the other's public key to derive a 32-byte shared secret via **Diffie-Hellman (X25519)**.
+    *   Using `libsodium`'s `crypto_box::precompute`, a `PrecomputedKey` is generated.
+4.  **Symmetric Encryption**: All subsequent packets are encrypted using **XSalsa20-Poly1305** (NaCl `secretbox`) with a unique nonce for every message.
+
+### Phase 3: Authentication & Session Initialization
+**Protocol:** Protobuf over Encrypted TCP/UDP
+1.  **Host → Client (`Hash`)**: Host sends a `salt` and a `challenge` string.
+2.  **Client → Host (`LoginRequest`)**:
+    *   `username`: Remote machine username.
+    *   `password`: Hashed password using the provided `salt` and `challenge`.
+    *   `my_id`: Client's unique ID.
+    *   `version`: Client version string.
+3.  **Host → Client (`PeerInfo`)**: If login is successful, the host sends its capabilities.
+    *   `displays`: List of available screens and their resolutions.
+    *   `features`: Supported features (terminal, privacy mode, etc.).
+    *   `encoding`: Supported video codecs (VP8, VP9, AV1, H264).
+
+### Phase 4: Steady State (Media & Input)
+1.  **Host → Client (`VideoFrame`)**: The host continuously streams encoded video. The client MUST decode at least one keyframe to get a valid screenshot.
+2.  **Client → Host (`KeyEvent`)**:
+    *   `down`: Boolean (True for press, False for release).
+    *   `control_key`: Enum (e.g., `Return`, `Escape`, `Shift`).
+    *   `chr`: Scancode or Unicode.
+3.  **Client → Host (`MouseEvent`)**:
+    *   `x`, `y`: Absolute coordinates on the remote screen.
+    *   `mask`: Bitmask for buttons (1=Left, 2=Right, 4=Middle).
+
+### Phase 5: Relay Fallback (via `hbbr`)
+**Ports:** 21117 (TCP), 21118 (TCP)
+If Phase 1 (`PunchHole`) fails (e.g., due to symmetric NAT):
+1.  **Client → `hbbs` (`RequestRelay`)**: Client asks for a relay server.
+2.  **`hbbs` → Client (`RelayResponse`)**: Server provides the `hbbr` address and a unique `uuid` token.
+3.  **Client/Host → `hbbr` (Connection)**: Both parties connect to the relay server using the same `uuid`.
+4.  **`hbbr` (Binding)**: The relay server bridges the two TCP streams.
+5.  **E2EE Tunnel**: The parties perform the same **Phase 2 (NaCl Handshake)** over the relay. `hbbr` only sees encrypted traffic and cannot decrypt it.

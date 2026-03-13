@@ -108,3 +108,31 @@ Add session-layer drag and scroll commands that emit the expected mouse protocol
 - [x] Run `cargo test`
 - [x] Confirm unit and integration suites still pass
 - **Status:** complete
+
+## 2026-03-14 Transport Layer
+
+### Goal
+Add a reusable transport abstraction with RustDesk-style length-prefixed framing, wire it into the crate, and verify it with unit and integration tests.
+
+### Phases
+#### Phase 1: Discovery
+- [x] Read `TASK_LEO.md`
+- [x] Read `src/protocol.rs`
+- [x] Read `src/daemon.rs`
+- [x] Check current crate/module state before editing
+- **Status:** complete
+
+#### Phase 2: Implementation
+- [x] Create `src/transport.rs`
+- [x] Add the `Transport` trait
+- [x] Implement `TcpTransport`
+- [x] Implement `FramedTransport`
+- [x] Add duplex-based framing tests
+- [x] Add `mod transport;` to `src/main.rs`
+- **Status:** complete
+
+#### Phase 3: Verification
+- [x] Run `cargo test`
+- [x] Fix compile or test regressions
+- [x] Confirm full suite passes cleanly
+- **Status:** complete

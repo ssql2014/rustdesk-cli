@@ -26,6 +26,8 @@
 | Put the new session/protocol unit tests inside `src/session.rs` and `src/protocol.rs` | This crate has no `lib.rs`, so inline unit tests keep private APIs directly testable |
 | Represent drag as press, move-with-button-held, then release | This matches the `drag` contract in `DESIGN.md` while staying within the existing `MouseEvent` shape |
 | Represent scroll as repeated mouse wheel press/release pairs based on `delta` sign and magnitude | The current protocol only has `mask` and `is_move`, so repeated wheel masks are the simplest compatible encoding |
+| Let `FramedTransport` own RustDesk-style message framing and have `TcpTransport` delegate to it | This keeps framing testable with `tokio::io::duplex` while still exposing a concrete TCP transport |
+| Keep the CLI surface stubbed for now even though daemon helpers exist | Existing integration tests lock down the current contract and should not depend on ambient daemon state |
 
 ## Issues Encountered
 | Issue | Resolution |
@@ -34,6 +36,7 @@
 | The scaffold has no shared output model | Add structured payload builders and final render helpers in `main.rs` |
 | No existing CLI tests | Add an integration suite against the built binary with `assert_cmd` |
 | `char::encode_utf8()` returns `&mut str`, which did not compare directly against `Option<&str>` in a test assertion | Switched the expectation to `ch.to_string()` and compared via `as_str()` |
+| The transport test initially used `?` in an async test returning `()` | Changed the test to return `Result<()>` so spawned task results could be propagated cleanly |
 
 ## Resources
 - `/Users/qlss/Documents/Projects/rustdesk-cli`

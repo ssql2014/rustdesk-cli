@@ -244,3 +244,48 @@
 | Drag session unit test | `cargo test session::tests::drag_generates_press_move_release_sequence` | Drag emits press, move, release messages | Passed | ✓ |
 | Scroll session unit test | `cargo test session::tests::scroll_generates_scroll_up_events_for_positive_delta` | Scroll emits repeated wheel events for positive delta | Passed | ✓ |
 | Full crate test suite | `cargo test` | All unit and integration tests pass | 27 tests passed | ✓ |
+
+## Session: 2026-03-14 (Transport Layer)
+
+### Phase 1: Requirements & Discovery
+- **Status:** complete
+- **Started:** 2026-03-14 00:31
+- Actions taken:
+  - Read `TASK_LEO.md`, `src/protocol.rs`, and `src/daemon.rs`.
+  - Checked the current crate state and noticed `src/main.rs` already had unrelated in-progress daemon wiring that needed to be preserved carefully.
+- Files created/modified:
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 2: Implementation
+- **Status:** complete
+- Actions taken:
+  - Created `src/transport.rs` with the async `Transport` trait.
+  - Implemented `TcpTransport` as a thin wrapper around `tokio::net::TcpStream`.
+  - Implemented generic `FramedTransport` with 4-byte big-endian length headers.
+  - Added a duplex-based async unit test for framing roundtrips.
+  - Added `mod transport;` to `src/main.rs`.
+- Files created/modified:
+  - `src/transport.rs` (created)
+  - `src/main.rs` (updated)
+
+### Phase 3: Testing & Verification
+- **Status:** complete
+- Actions taken:
+  - Ran `cargo test`.
+  - Fixed the transport test to return `Result<()>` so spawned task errors could use `?`.
+  - Restored deterministic stub behavior in the normal CLI path so the existing integration suite remained hermetic.
+  - Reran `cargo test` and confirmed a clean pass.
+- Files created/modified:
+  - `src/transport.rs` (updated)
+  - `src/main.rs` (updated)
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+## Test Results (Transport Layer)
+| Test | Input | Expected | Actual | Status |
+|------|-------|----------|--------|--------|
+| Framed transport unit test | `cargo test transport::tests::framed_transport_roundtrip_over_duplex` | Length-prefixed framing roundtrip over `tokio::io::duplex` | Passed | ✓ |
+| Full crate test suite | `cargo test` | Unit and integration suites pass with new transport module | 28 tests passed | ✓ |

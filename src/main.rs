@@ -20,17 +20,15 @@ mod session;
 
 use std::{process, str::FromStr};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde_json::{Value, json};
 
 use crate::session::{SessionCommand, SessionResponse};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_CONNECTION: i32 = 1;
-#[allow(dead_code)]
-const EXIT_AUTH: i32 = 2;
-#[allow(dead_code)]
-const EXIT_TIMEOUT: i32 = 3;
+const EXIT_SESSION: i32 = 2;
+const EXIT_INPUT: i32 = 3;
 
 const DEFAULT_WIDTH: i32 = 1920;
 const DEFAULT_HEIGHT: i32 = 1080;
@@ -325,7 +323,17 @@ fn daemon_arg_value(args: &[String], flag: &str) -> Option<String> {
 }
 
 fn run() -> i32 {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let exit_code = match err.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => EXIT_SUCCESS,
+                _ => EXIT_INPUT,
+            };
+            let _ = err.print();
+            return exit_code;
+        }
+    };
 
     match cli.command {
         Commands::Connect {
@@ -360,7 +368,7 @@ fn run() -> i32 {
                         "disconnect",
                         "session_error",
                         "No active session",
-                        2,
+                        EXIT_SESSION,
                     ),
                 );
             }
@@ -674,7 +682,7 @@ fn run() -> i32 {
                                 "message": "No active session"
                             }
                         }),
-                        exit_code: 2,
+                        exit_code: EXIT_SESSION,
                     },
                 );
             }

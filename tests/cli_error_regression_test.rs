@@ -33,3 +33,17 @@ fn disconnect_without_session_exits_two_and_uses_stderr() {
         "stderr should contain the disconnect error"
     );
 }
+
+#[test]
+fn clap_argument_errors_exit_three() {
+    let output = bin()
+        .args(["capture", "shot.png", "--region", "100,200,300"])
+        .output()
+        .expect("binary should run");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("region must be in x,y,w,h format"),
+        "stderr should contain the input validation error"
+    );
+}

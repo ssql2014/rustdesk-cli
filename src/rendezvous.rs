@@ -1,8 +1,12 @@
 //! Rendezvous client for RustDesk's hbbs server.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use prost::Message;
 use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
 
 use crate::proto::hbb::{
     ConnType, NatType, PunchHoleRequest, PunchHoleResponse, RegisterPeer, RegisterPeerResponse,
@@ -11,7 +15,7 @@ use crate::proto::hbb::{
 };
 
 pub struct RendezvousClient {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
 }
 
 impl RendezvousClient {
@@ -24,7 +28,14 @@ impl RendezvousClient {
             .connect(server_addr)
             .await
             .with_context(|| format!("failed to connect UDP socket to rendezvous server {server_addr}"))?;
-        Ok(Self { socket })
+        Ok(Self { socket: Arc::new(socket) })
+    }
+
+    /// Spawn a background task that sends RegisterPeer every 10 seconds to
+    /// maintain presence on the rendezvous server.  Returns a JoinHandle that
+    /// should be aborted once discovery completes.
+    pub fn start_heartbeat(&self, my_id: &str) -> JoinHandle<()> {
+        spawn_heartbeat(Arc::clone(&self.socket), my_id.to_string(), Duration::from_secs(10))
     }
 
     pub async fn register_peer(
@@ -129,6 +140,27 @@ impl RendezvousClient {
         let size = self.socket.recv(&mut recv_buf).await?;
         Ok(RendezvousMessage::decode(&recv_buf[..size])?)
     }
+}
+
+/// Spawn a heartbeat task that sends RegisterPeer at the given interval.
+fn spawn_heartbeat(socket: Arc<UdpSocket>, id: String, period: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.tick().await; // consume the immediate first tick
+        loop {
+            interval.tick().await;
+            let msg = RendezvousMessage {
+                union: Some(rendezvous_message::Union::RegisterPeer(RegisterPeer {
+                    id: id.clone(),
+                    serial: 0,
+                })),
+            };
+            let mut buf = Vec::new();
+            if msg.encode(&mut buf).is_ok() {
+                let _ = socket.send(&buf).await;
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -377,6 +409,48 @@ mod tests {
 
         assert_eq!(response.uuid, "relay-uuid");
         server_task.await.expect("server task should join")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_sends_periodic_register_peer() -> Result<()> {
+        let server = bind_test_server().await;
+        let server_addr = server.local_addr()?;
+
+        let client = RendezvousClient::connect(&server_addr.to_string()).await?;
+        // Use a short interval (50ms) so the test completes quickly.
+        let handle = spawn_heartbeat(
+            Arc::clone(&client.socket),
+            "cli-heartbeat".to_string(),
+            Duration::from_millis(50),
+        );
+
+        let mut count = 0u32;
+        let mut buf = [0u8; 4096];
+        // Collect heartbeat messages for up to 300ms — expect at least 2.
+        while count < 3 {
+            match tokio::time::timeout(Duration::from_millis(300), server.recv_from(&mut buf)).await
+            {
+                Ok(Ok((size, _))) => {
+                    let msg = RendezvousMessage::decode(&buf[..size])?;
+                    match msg.union {
+                        Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                            assert_eq!(rp.id, "cli-heartbeat");
+                            count += 1;
+                        }
+                        other => panic!("expected RegisterPeer heartbeat, got {other:?}"),
+                    }
+                }
+                Ok(Err(e)) => panic!("recv error: {e}"),
+                Err(_) => break, // timeout — stop collecting
+            }
+        }
+
+        handle.abort();
+        assert!(
+            count >= 2,
+            "expected at least 2 heartbeat messages, got {count}"
+        );
         Ok(())
     }
 }

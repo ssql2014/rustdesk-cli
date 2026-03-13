@@ -104,43 +104,54 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
             .context("RegisterPk failed")?;
     }
 
-    // Try to punch hole to target.
-    let ph_response = client
-        .punch_hole(&config.peer_id, &config.server_key)
-        .await
-        .context("PunchHoleRequest failed")?;
+    // Start heartbeat to maintain presence on the rendezvous server.
+    let heartbeat = client.start_heartbeat(&my_id);
 
-    // Check for immediate PunchHole failure before proceeding to relay.
-    check_punch_hole_failure(&ph_response)?;
+    // Wrap remaining discovery in an async block so we always abort the
+    // heartbeat, even on error paths.
+    let result = async {
+        // Try to punch hole to target.
+        let ph_response = client
+            .punch_hole(&config.peer_id, &config.server_key)
+            .await
+            .context("PunchHoleRequest failed")?;
 
-    // Determine relay info from punch-hole response.
-    let relay_server = if ph_response.relay_server.is_empty() {
-        None
-    } else {
-        Some(ph_response.relay_server.clone())
-    };
+        // Check for immediate PunchHole failure before proceeding to relay.
+        check_punch_hole_failure(&ph_response)?;
 
-    // Request relay — we always go through relay for now.
-    let relay_response = client
-        .request_relay_for(
-            &config.peer_id,
-            relay_server.as_deref().unwrap_or(&config.relay_server),
-            &ph_response.socket_addr,
-        )
-        .await
-        .context("RequestRelay failed")?;
+        // Determine relay info from punch-hole response.
+        let relay_server = if ph_response.relay_server.is_empty() {
+            None
+        } else {
+            Some(ph_response.relay_server.clone())
+        };
 
-    let uuid = relay_response.uuid;
-    let relay_addr = if relay_response.relay_server.is_empty() {
-        relay_server
-    } else {
-        Some(relay_response.relay_server)
-    };
+        // Request relay — we always go through relay for now.
+        let relay_response = client
+            .request_relay_for(
+                &config.peer_id,
+                relay_server.as_deref().unwrap_or(&config.relay_server),
+                &ph_response.socket_addr,
+            )
+            .await
+            .context("RequestRelay failed")?;
 
-    Ok(RelayInfo {
-        relay_server: relay_addr,
-        uuid,
-    })
+        let uuid = relay_response.uuid;
+        let relay_addr = if relay_response.relay_server.is_empty() {
+            relay_server
+        } else {
+            Some(relay_response.relay_server)
+        };
+
+        Ok(RelayInfo {
+            relay_server: relay_addr,
+            uuid,
+        })
+    }
+    .await;
+
+    heartbeat.abort();
+    result
 }
 
 /// Check for immediate PunchHole failure codes and bail with a descriptive error.

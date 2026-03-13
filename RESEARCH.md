@@ -352,7 +352,37 @@ To support "Zero Config" in the CLI:
 
 ---
 
-## 12. hbbr Relay Handshake Details
+## 12. Terminal Channel Protocol
+
+RustDesk features a native terminal channel that provides a remote shell (PTY) without the overhead of video encoding. This is the preferred channel for text-based CLI interactions.
+
+### PTY Spawning and Management
+The server-side logic is implemented in `src/server/terminal_service.rs` and utilizes the **`portable-pty`** crate for cross-platform support.
+- **Unix (Linux/macOS)**: Uses standard `/dev/ptmx` via `openpty`. On macOS, it defaults to a login shell (`-l`).
+- **Windows**: Uses **ConPTY** (Windows 10+). Due to permission constraints, it often employs a "helper process" pattern where a separate process is launched as the logged-in user to manage the PTY, communicating with the main service via named pipes.
+- **Shell Selection**: The server typically defaults to `/bin/bash` or `/bin/sh` on Unix and `powershell.exe` or `cmd.exe` on Windows.
+
+### TerminalData Encoding and Compression
+- **Bidirectional Stream**: `TerminalData` messages carry stdin (client → server) and stdout/stderr (server → client) bytes.
+- **Compression**: Data is compressed using **zstd** if the payload exceeds **512 bytes**.
+- **Optimization**: The server checks if the compressed data is actually smaller than the raw bytes; if not, it sends the raw data. The `compressed` boolean flag in the `TerminalData` message indicates the state.
+
+### Sequencing and Handshake
+1.  **Authentication**: The client must complete the NaCl handshake and `LoginRequest` first.
+2.  **Open Request**: After receiving `LoginResponse`, the client sends `TerminalAction::OpenTerminal`.
+3.  **Persistence**: If the client sends `OptionMessage` with `terminal_persistent: Yes` before opening, the server will attempt to reconnect to an existing PTY session if available.
+4.  **Redraw Trigger**: Upon reconnection, the server performs a "two-phase SIGWINCH" (resizing the terminal by ±1 row and then back) to force TUI applications (like `htop` or `vim`) to redraw the screen.
+
+### Rows, Cols, and Resizing
+- **Initialization**: `OpenTerminal` includes the initial `rows` and `cols`.
+- **Dynamic Resize**: `TerminalAction::ResizeTerminal` updates the PTY size at runtime. The server handles this by calling the underlying PTY's `resize` method or sending a resize control message to the Windows helper process.
+
+### Permissions
+Terminal access requires the **`terminal`** permission flag. While not explicitly checked in `terminal_service.rs`, the main message dispatcher verifies that the session has the `ControlPermissions::Permission::terminal` bit set before forwarding terminal actions.
+
+---
+
+## 13. hbbr Relay Handshake Details
 
 The `hbbr` relay server acts as a matchmaker for peers that cannot establish a direct P2P connection. The initial TCP handshake and binding process are critical for session establishment and stability.
 
@@ -383,7 +413,7 @@ Immediately after establishing a TCP connection to `hbbr` (default port 21117), 
 
 ---
 
-## 13. Video Decoding for Screenshots
+## 14. Video Decoding for Screenshots
 
 Capturing a screenshot from a RustDesk video stream requires decoding the incoming compressed frames and converting them into a standard image format like PNG.
 
@@ -407,7 +437,7 @@ To save a decoded frame as a PNG in the CLI client:
 
 ---
 
-## 14. Relay Binding & Session Handshake
+## 15. Relay Binding & Session Handshake
 
 When a direct P2P connection fails, the client must use the relay server (`hbbr`) and perform a cryptographic handshake to establish an end-to-end encrypted (E2EE) session.
 
@@ -447,7 +477,7 @@ Once a transport (Direct or Relay) is established, the E2EE tunnel is initialize
 
 ---
 
-## 15. TCP Hole Punching Sequence
+## 16. TCP Hole Punching Sequence
 
 In environments where UDP is restricted, RustDesk attempts TCP hole punching to establish a direct P2P connection before falling back to a relay.
 
@@ -474,7 +504,7 @@ If both peers are on the same local network, `hbbs` will detect this and facilit
 
 ---
 
-## 16. Pure-Rust NaCl Key Conversion
+## 17. Pure-Rust NaCl Key Conversion
 
 To maintain compatibility with the official RustDesk client (which uses `sodiumoxide`) while keeping the `rustdesk-cli` build simple and pure-Rust, we must correctly convert Ed25519 identity keys to Curve25519 (X25519) encryption keys.
 
@@ -518,7 +548,7 @@ fn convert_sk(ed_sk: &SigningKey) -> StaticSecret {
 
 ---
 
-## 17. Input Event Details
+## 18. Input Event Details
 
 Injecting keyboard and mouse input correctly requires understanding the coordinate system and input modes.
 

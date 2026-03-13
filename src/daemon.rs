@@ -2,6 +2,8 @@
 //!
 //! Lifecycle:
 //! - Spawned by `rustdesk-cli connect` as a background process
+//! - Establishes a real RustDesk connection (rendezvous → relay → crypto → auth)
+//! - Sends OptionMessage to configure text-mode preferences
 //! - Writes PID + socket path to /tmp/rustdesk-cli.lock
 //! - Accepts commands over UDS, dispatches to Session
 //! - Exits on `disconnect` command or idle timeout
@@ -12,11 +14,22 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use crate::session::{Session, SessionCommand, SessionResponse};
+use crate::connection::{self, ConnectionConfig};
+use crate::crypto::EncryptedStream;
+use crate::proto::hbb::{
+    ImageQuality, Message, Misc, OptionMessage,
+    message, misc, option_message,
+};
+use crate::protocol::DisplayInfo;
+use crate::session::{
+    ConnectionState, PeerInfoState, Session, SessionCommand, SessionResponse,
+};
+use crate::transport::TcpTransport;
 
 pub const SOCKET_PATH: &str = "/tmp/rustdesk-cli.sock";
 pub const LOCK_PATH: &str = "/tmp/rustdesk-cli.lock";
@@ -148,9 +161,9 @@ pub async fn run_daemon(
     peer_id: String,
     password: Option<String>,
     server: Option<String>,
-    _id_server: Option<String>,
-    _relay_server: Option<String>,
-    _key: Option<String>,
+    id_server: Option<String>,
+    relay_server: Option<String>,
+    key: Option<String>,
 ) -> Result<()> {
     // Clean up stale socket
     let _ = fs::remove_file(SOCKET_PATH);
@@ -164,29 +177,61 @@ pub async fn run_daemon(
     // Write lock file
     LockFile::write(SOCKET_PATH)?;
 
-    // Initialize session
-    let mut session = Session::new();
+    // Build connection config from daemon arguments.
+    let config = build_connection_config(
+        &peer_id,
+        password.as_deref(),
+        server.as_deref(),
+        id_server.as_deref(),
+        relay_server.as_deref(),
+        key.as_deref(),
+    );
 
-    // Auto-connect on startup
-    let connect_cmd = SessionCommand::Connect {
-        peer_id,
-        password,
-        server,
-    };
-    match session.dispatch(connect_cmd) {
-        Ok((resp, _msgs)) => {
-            if !resp.success {
-                eprintln!("daemon: connect failed: {:?}", resp.message);
-                cleanup();
-                return Ok(());
-            }
-        }
+    // Real connection: rendezvous → relay → crypto → auth.
+    let conn_result = match connection::connect_to_peer(&config).await {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("daemon: connect error: {e}");
+            eprintln!("daemon: connect failed: {e:#}");
             cleanup();
             return Ok(());
         }
+    };
+
+    let mut encrypted = conn_result.encrypted;
+    let peer_info = conn_result.peer_info;
+
+    // Send OptionMessage: disable audio/camera, enable terminal persistence,
+    // keep clipboard enabled, low image quality for text-mode.
+    if let Err(e) = send_option_message(&mut encrypted).await {
+        eprintln!("daemon: failed to send OptionMessage: {e:#}");
+        let _ = encrypted.close().await;
+        cleanup();
+        return Ok(());
     }
+
+    // Initialize session control-plane state with real peer info.
+    let mut session = Session::new();
+    session.state = ConnectionState::Connected;
+    session.config = Some(crate::protocol::ConnectionConfig {
+        peer_id: peer_id.clone(),
+        password: password.clone(),
+        server: server.clone(),
+    });
+    session.peer_info = Some(PeerInfoState {
+        peer_id: peer_info.username.clone(),
+        username: peer_info.username.clone(),
+        hostname: peer_info.hostname.clone(),
+        displays: peer_info
+            .displays
+            .iter()
+            .map(|d| DisplayInfo {
+                x: d.x,
+                y: d.y,
+                width: d.width,
+                height: d.height,
+            })
+            .collect(),
+    });
 
     let mut last_activity = Instant::now();
 
@@ -221,16 +266,14 @@ pub async fn run_daemon(
                 let is_disconnect = matches!(cmd, SessionCommand::Disconnect);
 
                 let response = match session.dispatch(cmd) {
-                    Ok((resp, _msgs)) => {
-                        // TODO: Send protocol messages over the RustDesk connection
-                        resp
-                    }
+                    Ok((resp, _msgs)) => resp,
                     Err(e) => SessionResponse::error(e.to_string()),
                 };
 
                 let _ = send_response(&mut writer, &response).await;
 
                 if is_disconnect {
+                    let _ = encrypted.close().await;
                     cleanup();
                     return Ok(());
                 }
@@ -241,12 +284,95 @@ pub async fn run_daemon(
             Err(_) => {
                 // Idle timeout
                 eprintln!("daemon: idle timeout, shutting down");
+                let _ = encrypted.close().await;
                 cleanup();
                 return Ok(());
             }
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Internal: connection config builder
+// ---------------------------------------------------------------------------
+
+/// Build a [`ConnectionConfig`] from the daemon's CLI arguments.
+///
+/// Priority: explicit `--id-server`/`--relay-server` > derived from `--server` > defaults.
+fn build_connection_config(
+    peer_id: &str,
+    password: Option<&str>,
+    server: Option<&str>,
+    id_server: Option<&str>,
+    relay_server: Option<&str>,
+    key: Option<&str>,
+) -> ConnectionConfig {
+    let id_srv = match id_server {
+        Some(s) => s.to_string(),
+        None => match server {
+            Some(s) => {
+                let host = s.split(':').next().unwrap_or(s);
+                format!("{host}:21116")
+            }
+            None => "localhost:21116".to_string(),
+        },
+    };
+
+    let relay_srv = match relay_server {
+        Some(s) => s.to_string(),
+        None => match server {
+            Some(s) => {
+                let host = s.split(':').next().unwrap_or(s);
+                format!("{host}:21117")
+            }
+            None => "localhost:21117".to_string(),
+        },
+    };
+
+    ConnectionConfig {
+        id_server: id_srv,
+        relay_server: relay_srv,
+        server_key: key.unwrap_or("").to_string(),
+        peer_id: peer_id.to_string(),
+        password: password.unwrap_or("").to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal: OptionMessage for text-mode
+// ---------------------------------------------------------------------------
+
+/// Send `OptionMessage` to configure the remote peer for text-mode:
+/// - `disable_audio = Yes`
+/// - `disable_camera = Yes`
+/// - `terminal_persistent = Yes`
+/// - `disable_clipboard = No` (explicitly opt-in to clipboard sync)
+/// - `image_quality = Low`
+async fn send_option_message(
+    stream: &mut EncryptedStream<TcpTransport>,
+) -> Result<()> {
+    let opt = OptionMessage {
+        image_quality: ImageQuality::Low as i32,
+        disable_audio: option_message::BoolOption::Yes as i32,
+        disable_clipboard: option_message::BoolOption::No as i32,
+        disable_camera: option_message::BoolOption::Yes as i32,
+        terminal_persistent: option_message::BoolOption::Yes as i32,
+        ..Default::default()
+    };
+
+    let msg = Message {
+        union: Some(message::Union::Misc(Misc {
+            union: Some(misc::Union::Option(opt)),
+        })),
+    };
+    let mut buf = Vec::new();
+    msg.encode(&mut buf)?;
+    stream.send(&buf).await.context("sending OptionMessage")
+}
+
+// ---------------------------------------------------------------------------
+// Internal: helpers
+// ---------------------------------------------------------------------------
 
 async fn send_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,

@@ -112,6 +112,24 @@ enum Commands {
         /// Maximum time to wait for command completion in seconds
         #[arg(long, default_value_t = 30)]
         timeout: u64,
+        /// Peer ID for a direct one-shot exec without the daemon
+        #[arg(long)]
+        peer: Option<String>,
+        /// Password for a direct one-shot exec
+        #[arg(long, env = "RUSTDESK_PASSWORD")]
+        password: Option<String>,
+        /// Override combined rendezvous/relay server address
+        #[arg(long)]
+        server: Option<String>,
+        /// Override RustDesk ID/rendezvous server address
+        #[arg(long = "id-server", alias = "hbbs")]
+        id_server: Option<String>,
+        /// Override RustDesk relay server address
+        #[arg(long = "relay-server", alias = "hbbr", alias = "relay")]
+        relay_server: Option<String>,
+        /// Override RustDesk server public key
+        #[arg(long)]
+        key: Option<String>,
     },
     /// Push a local file to the remote machine
     Push {
@@ -132,7 +150,7 @@ enum Commands {
         #[arg(long = "id-server", alias = "hbbs")]
         id_server: Option<String>,
         /// Override RustDesk relay server address
-        #[arg(long = "relay-server", alias = "hbbr")]
+        #[arg(long = "relay-server", alias = "hbbr", alias = "relay")]
         relay_server: Option<String>,
         /// Override RustDesk server public key
         #[arg(long)]
@@ -433,7 +451,10 @@ fn build_direct_connection_config(
                 let host = s.split(':').next().unwrap_or(s);
                 format!("{host}:21116")
             }
-            None => "localhost:21116".to_string(),
+            None => match relay_server {
+                Some(s) => infer_id_server_from_relay(s),
+                None => "localhost:21116".to_string(),
+            },
         },
     };
 
@@ -456,6 +477,17 @@ fn build_direct_connection_config(
         password: password.unwrap_or("").to_string(),
         warmup_secs: 2,
     }
+}
+
+fn infer_id_server_from_relay(relay_server: &str) -> String {
+    let host = relay_server.split(':').next().unwrap_or(relay_server);
+    let port = relay_server
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .map(|port| port.saturating_sub(1))
+        .filter(|port| *port > 0)
+        .unwrap_or(21116);
+    format!("{host}:{port}")
 }
 
 fn run() -> i32 {
@@ -636,7 +668,16 @@ fn run() -> i32 {
                 ),
             }
         }
-        Commands::Exec { command, timeout } => {
+        Commands::Exec {
+            command,
+            timeout,
+            peer,
+            password,
+            server,
+            id_server,
+            relay_server,
+            key,
+        } => {
             if let Err(e) = permissions.ensure_exec_allowed(&command) {
                 return emit_response(
                     cli.json,
@@ -647,6 +688,60 @@ fn run() -> i32 {
                         EXIT_PERMISSION,
                     ),
                 );
+            }
+
+            if let Some(peer_id) = peer {
+                if let Err(e) = permissions.ensure_connect_allowed(&peer_id) {
+                    return emit_response(
+                        cli.json,
+                        error_response(
+                            "exec",
+                            "permission_error",
+                            &e.to_string(),
+                            EXIT_PERMISSION,
+                        ),
+                    );
+                }
+
+                return match direct_exec(
+                    &peer_id,
+                    password.as_deref(),
+                    server.as_deref(),
+                    id_server.as_deref(),
+                    relay_server.as_deref(),
+                    key.as_deref(),
+                    timeout,
+                    &command,
+                    cli.json,
+                ) {
+                    Ok((stdout, exit_code, timed_out)) => emit_response(
+                        cli.json,
+                        Response {
+                            text: format!("exec exit_code={exit_code} stdout={stdout}"),
+                            json: json!({
+                                "ok": true,
+                                "command": "exec",
+                                "data": {
+                                    "command": command,
+                                    "stdout": stdout,
+                                    "stderr": "",
+                                    "exit_code": exit_code,
+                                    "timed_out": timed_out,
+                                }
+                            }),
+                            exit_code: EXIT_SUCCESS,
+                        },
+                    ),
+                    Err(e) => emit_response(
+                        cli.json,
+                        error_response(
+                            "exec",
+                            "connection_error",
+                            &e.to_string(),
+                            EXIT_CONNECTION,
+                        ),
+                    ),
+                };
             }
 
             match send_to_daemon(&SessionCommand::Exec {
@@ -1386,6 +1481,164 @@ fn direct_push(
         }
         Ok((result.sent_bytes, result.total_bytes, result.resumed_bytes))
     })
+}
+
+fn direct_exec(
+    peer_id: &str,
+    password: Option<&str>,
+    server: Option<&str>,
+    id_server: Option<&str>,
+    relay_server: Option<&str>,
+    key: Option<&str>,
+    timeout_secs: u64,
+    command: &str,
+    _json_mode: bool,
+) -> Result<(String, i32, bool), anyhow::Error> {
+    let config = build_direct_connection_config(
+        peer_id,
+        password,
+        server,
+        id_server,
+        relay_server,
+        key,
+    );
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let connection = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            connection::connect_with_mode(
+                &config,
+                crate::proto::hbb::ConnType::Terminal,
+                Some(crate::proto::hbb::login_request::Union::Terminal(
+                    crate::proto::hbb::Terminal {
+                        service_id: String::new(),
+                    },
+                )),
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("direct exec timed out after {timeout_secs}s"))??;
+
+        let mut encrypted = connection.encrypted;
+        let terminal_info = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            crate::terminal::open_terminal(&mut encrypted, 24, 80),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("terminal open timed out"))??;
+        let tid = terminal_info.terminal_id;
+
+        loop {
+            match crate::terminal::recv_terminal_data_with_timeout(
+                &mut encrypted,
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            {
+                Ok(crate::terminal::TerminalEvent::Data(_)) => {}
+                Ok(crate::terminal::TerminalEvent::Closed { exit_code }) => {
+                    return Ok((String::new(), exit_code, false));
+                }
+                Ok(crate::terminal::TerminalEvent::Error(msg)) => {
+                    let _ = crate::terminal::close_terminal(&mut encrypted, tid).await;
+                    anyhow::bail!("terminal error during prompt drain: {msg}");
+                }
+                Err(e) if crate::terminal::is_terminal_response_timeout(&e) => break,
+                Err(e) => {
+                    let _ = crate::terminal::close_terminal(&mut encrypted, tid).await;
+                    anyhow::bail!("recv error during prompt drain: {e:#}");
+                }
+            }
+        }
+
+        let sentinel_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sentinel = format!("__RDCLI_{sentinel_id:032x}__");
+        let wrapped = format!("{command}\necho '{sentinel}'$?\n");
+        crate::terminal::send_terminal_data(&mut encrypted, tid, wrapped.as_bytes()).await?;
+
+        let completion_timeout = std::time::Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + completion_timeout;
+        let mut collected = Vec::new();
+        let mut timed_out = false;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                timed_out = true;
+                break;
+            }
+
+            match crate::terminal::recv_terminal_data_with_timeout(&mut encrypted, remaining).await
+            {
+                Ok(crate::terminal::TerminalEvent::Data(data)) => {
+                    collected.extend_from_slice(&data);
+                    if find_sentinel_output(&String::from_utf8_lossy(&collected), &sentinel)
+                        .is_some()
+                    {
+                        break;
+                    }
+                }
+                Ok(crate::terminal::TerminalEvent::Closed { exit_code }) => {
+                    let stdout = String::from_utf8_lossy(&collected).trim().to_string();
+                    let _ = crate::terminal::close_terminal(&mut encrypted, tid).await;
+                    return Ok((stdout, exit_code, false));
+                }
+                Ok(crate::terminal::TerminalEvent::Error(msg)) => {
+                    let _ = crate::terminal::close_terminal(&mut encrypted, tid).await;
+                    anyhow::bail!("terminal error during exec: {msg}");
+                }
+                Err(e) if crate::terminal::is_terminal_response_timeout(&e) => {
+                    timed_out = true;
+                    break;
+                }
+                Err(e) => {
+                    let _ = crate::terminal::close_terminal(&mut encrypted, tid).await;
+                    anyhow::bail!("recv error during exec: {e:#}");
+                }
+            }
+        }
+
+        let _ = crate::terminal::close_terminal(&mut encrypted, tid).await;
+        let _ = encrypted.close().await;
+        let raw = String::from_utf8_lossy(&collected);
+        let (stdout, exit_code) = parse_direct_exec_output(&raw, &sentinel);
+        Ok((stdout, exit_code, timed_out))
+    })
+}
+
+fn find_sentinel_output(raw: &str, sentinel: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(pos) = raw[search_from..].find(sentinel) {
+        let abs_pos = search_from + pos;
+        let after = &raw[abs_pos + sentinel.len()..];
+        if after.starts_with(|c: char| c.is_ascii_digit()) {
+            return Some(abs_pos);
+        }
+        search_from = abs_pos + sentinel.len();
+    }
+    None
+}
+
+fn parse_direct_exec_output(raw: &str, sentinel: &str) -> (String, i32) {
+    if let Some(pos) = find_sentinel_output(raw, sentinel) {
+        let before = &raw[..pos];
+        let after = &raw[pos + sentinel.len()..];
+        let exit_digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let exit_code = exit_digits.parse::<i32>().unwrap_or(0);
+        let stdout = before
+            .lines()
+            .filter(|line| !line.contains(&format!("echo '{sentinel}'$?")))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string();
+        return (stdout, exit_code);
+    }
+
+    (raw.trim().to_string(), -1)
 }
 
 fn render_push_progress(progress: crate::file_transfer::PushProgress) {

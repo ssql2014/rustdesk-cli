@@ -8,12 +8,16 @@ This directory contains technical research and protocol analysis for the `rustde
 | :--- | :--- | :--- | :--- |
 | [attention_op.py](attention_op.py) | AI Operator | NumPy GQA implementation; handles Query/KV head grouping (4:1). | Complete |
 | [clipboard_protocol.md](clipboard_protocol.md) | Protocol | Lightweight data pipe (4KB - 64MB); Push-based; Zstd compression. | Complete |
+| [connection_pooling.md](connection_pooling.md) | Architecture | Session reuse strategy; reducing 1s+ handshake latency to <100ms. | Complete |
 | [daemon_binary_replacement.md](daemon_binary_replacement.md) | Dev Workflow | macOS SIGBUS/SIGKILL on recompilation; "Move Aside" pattern recommended. | Complete |
+| [daemon_lifecycle.md](daemon_lifecycle.md) | Architecture | Dual-process model; PID files; graceful shutdown and session draining. | Complete |
 | [daemon_socket_lifecycle.md](daemon_socket_lifecycle.md) | OS / UDS | Connect-then-Unlink pattern for stale sockets; $TMPDIR usage on macOS. | Complete |
 | [embedding_operator.md](embedding_operator.md) | AI Operator | Llama 3 uses 128k vocab; lookup is memory-bound; 1.05GB RAM for 8B model. | Complete |
+| [error_handling_exit_codes.md](error_handling_exit_codes.md) | Protocol | Standardized exit codes (0-6); remote exit code ($?) propagation. | Complete |
 | [exec_command_limits.md](exec_command_limits.md) | OS / PTY | 4KB PTY `MAX_INPUT` limit found; causing daemon hangs on large execs. | Complete |
 | [exec_timeout_streaming.md](exec_timeout_streaming.md) | Protocol / UDS | Real-time output delivery via TerminalData; custom --timeout design. | Complete |
 | [file_transfer_protocol.md](file_transfer_protocol.md) | Protocol | 128KB chunks; Zstd compression; Resume supported via Digest. | Complete |
+| [file_transfer_pull.md](file_transfer_pull.md) | Protocol | Pull flow (Download): FileAction::Send -> Digest -> Confirm -> Blocks. | Complete |
 | [file_transfer_session_init.md](file_transfer_session_init.md) | Protocol | ConnType::FILE_TRANSFER (1); dedicated TCP connection required. | Complete |
 | [fork_vs_build_recommendation.md](fork_vs_build_recommendation.md) | Strategy | Build from scratch is superior to forking official repo (GUI bloat). | Complete |
 | [hbbr_relay_matching.md](hbbr_relay_matching.md) | Protocol | hbbr matches by UUID only; peer always uses DefaultConn for handshake. | Complete |
@@ -25,6 +29,8 @@ This directory contains technical research and protocol analysis for the `rustde
 | [kv_cache_implementation.md](kv_cache_implementation.md) | AI Architecture | Contiguous pre-allocation vs PagedAttention; 128KB per token per layer. | Complete |
 | [login_offline_error.md](login_offline_error.md) | Bug Analysis | "Offline" usually means malformed `LoginRequest` (empty username). | Complete |
 | [multi_head_attention.md](multi_head_attention.md) | AI Operator | Llama 3 uses GQA (4:1 or 8:1 ratio); KV Cache is critical for decoding. | Complete |
+| [multi_peer_connections.md](multi_peer_connections.md) | Architecture | HashMap-based multi-session manager for distributed inference. | Complete |
+| [nat_traversal_relay.md](nat_traversal_relay.md) | Protocol | UDP hole-punching vs Relay (hbbr); --prefer-direct design. | Complete |
 | [next_phase_priorities.md](next_phase_priorities.md) | Roadmap | MatMul/SiLU are next; Daemon stability and File Transfer are high priority. | Complete |
 | [official_cli_mode_verification.md](official_cli_mode_verification.md) | Strategy | Verification that official `--features cli` still has heavy GUI deps. | Complete |
 | [option_message_protocol.md](option_message_protocol.md) | Protocol | Terminal sessions use minimal Options (persistent flag only). | Complete |
@@ -36,6 +42,7 @@ This directory contains technical research and protocol analysis for the `rustde
 | [rope_positional_encoding.md](rope_positional_encoding.md) | AI Operator | Complex space rotations; Theta base 500k for Llama 3; Distance preservation. | Complete |
 | [rustdesk_client_relay_flow.md](rustdesk_client_relay_flow.md) | Protocol | Official client uses TCP for RequestRelay; 3-attempt retry loop. | Complete |
 | [secure_tcp_stream_details.md](secure_tcp_stream_details.md) | Crypto | XSalsa20-Poly1305; Counter-based nonce; Payload encryption only. | Complete |
+| [security_hardening.md](security_hardening.md) | Security | Credential protection; PFS; injection mitigations; production checklist. | Complete |
 | [softmax_op.py](softmax_op.py) | AI Operator | NumPy stable implementation; handles temperature and causal masks. | Complete |
 | [softmax_operator.md](softmax_operator.md) | AI Operator | Max subtraction trick for stability; Causal mask sets future to -inf. | Complete |
 | [swiglu_mlp_operator.md](swiglu_mlp_operator.md) | AI Operator | SwiGLU gated activation; Llama 3 intermediate dim (14336) mapping. | Complete |
@@ -86,4 +93,4 @@ graph TD
 1.  **Production Hardening:** Transition from prototype Python operators to a compiled Rust inference engine (via `burn` or `candle`) for 10x performance.
 2.  **Streaming IPC:** Finalize the UDS streaming implementation to allow real-time token observability.
 3.  **Daemon Watchdog:** Implement the auto-reconnect logic with `service_id` persistence to handle long-running generation tasks over flaky networks.
-4.  **Weight Sharding:** Implement the multi-shard `push` command to automate deployment of 5GB+ GGUF files.
+4.  **Multi-Peer Orchestration:** Update the daemon to support concurrent sessions for distributed inference (tensor parallelism).

@@ -196,6 +196,7 @@ pub(crate) async fn connect_with_mode(
         &config.password,
         &config.peer_id,
         &my_id,
+        conn_type,
         login_union,
     )
     .await;
@@ -316,6 +317,7 @@ async fn handshake_and_auth(
     password: &str,
     peer_id: &str,
     client_id: &str,
+    conn_type: ConnType,
     login_union: Option<login_request::Union>,
 ) -> Result<ConnectionResult> {
     // --- NaCl key exchange ---
@@ -400,7 +402,7 @@ async fn handshake_and_auth(
             password: pw_hash.to_vec(),
             my_id: client_id.to_string(),
             my_name: "rustdesk-cli".to_string(),
-            option: Some(build_login_option_message()),
+            option: Some(build_login_option_message(conn_type)),
             video_ack_required: false,
             session_id: rand_session_id(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -459,7 +461,14 @@ fn rand_session_id() -> u64 {
     u64::from_le_bytes(buf)
 }
 
-fn build_login_option_message() -> OptionMessage {
+fn build_login_option_message(conn_type: ConnType) -> OptionMessage {
+    if conn_type == ConnType::Terminal {
+        return OptionMessage {
+            terminal_persistent: option_message::BoolOption::Yes as i32,
+            ..Default::default()
+        };
+    }
+
     OptionMessage {
         image_quality: ImageQuality::Best as i32,
         custom_fps: 0,

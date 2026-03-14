@@ -16,8 +16,9 @@ use tokio::time::timeout;
 
 use crate::crypto::{self, EncryptedStream, KeyExchangeResult};
 use crate::proto::hbb::{
-    ConnType, IdPk, LoginRequest, Message, PeerInfo, PublicKey, PunchHoleResponse,
-    login_request, login_response, message, punch_hole_response,
+    ConnType, IdPk, ImageQuality, LoginRequest, Message, OptionMessage, PeerInfo,
+    PublicKey, PunchHoleResponse, SupportedDecoding, login_request, login_response,
+    message, option_message, punch_hole_response,
 };
 use crate::rendezvous::RendezvousClient;
 use crate::transport::{TcpTransport, Transport};
@@ -49,6 +50,8 @@ pub struct ConnectionResult {
     pub peer_info: PeerInfo,
     pub encrypted: EncryptedStream<TcpTransport>,
 }
+
+const PUNCH_HOLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -101,27 +104,51 @@ pub(crate) async fn connect_with_mode(
         tokio::time::sleep(tokio::time::Duration::from_secs(config.warmup_secs)).await;
     }
 
-    // Phase 2: Generate UUID and send RequestRelay to hbbs via TCP.
+    // Phase 2: Generate UUID and coordinate PunchHole / RequestRelay.
     // The official client generates its own UUID and sends it to both
     // hbbs (so hbbs can forward to the peer) and hbbr (to bind the relay).
     let mut uuid_bytes = [0_u8; 16];
     OsRng.fill_bytes(&mut uuid_bytes);
     let session_uuid: String = uuid_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    eprintln!("[debug] Phase 2: sending PunchHole + RequestRelay (uuid={})...", &session_uuid[..8]);
+    eprintln!("[debug] Phase 2: sending PunchHole (uuid={})...", &session_uuid[..8]);
 
-    // Fire PunchHole first (UDP, fire-and-forget).
-    client
-        .send_punch_hole_with_conn_type(&config.peer_id, &config.server_key, conn_type)
-        .await
-        .context("failed to send PunchHole")?;
+    let punch_hole_relay_hint = match timeout(
+        PUNCH_HOLE_RESPONSE_TIMEOUT,
+        client.punch_hole_with_conn_type(&config.peer_id, &config.server_key, conn_type),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            check_punch_hole_failure(&resp)?;
+            if !resp.relay_server.is_empty() {
+                Some(resp.relay_server)
+            } else {
+                None
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("[debug] Phase 2: PunchHole request failed: {e:#}, continuing to relay");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "[debug] Phase 2: PunchHoleResponse timed out after {}s, continuing to relay",
+                PUNCH_HOLE_RESPONSE_TIMEOUT.as_secs()
+            );
+            None
+        }
+    };
 
     // Send RequestRelay to hbbs via TCP (with correct BytesCodec framing).
     // hbbs forwards this to the peer, who then connects to hbbr with our UUID.
+    let requested_relay_server = punch_hole_relay_hint
+        .as_deref()
+        .unwrap_or(&config.relay_server);
     let relay_addr = match tokio::time::timeout(
         tokio::time::Duration::from_secs(15),
         client.request_relay_via_tcp_with_conn_type(
             &config.peer_id,
-            &config.relay_server,
+            requested_relay_server,
             &[],
             &config.server_key,
             &session_uuid,
@@ -373,7 +400,7 @@ async fn handshake_and_auth(
             password: pw_hash.to_vec(),
             my_id: client_id.to_string(),
             my_name: "rustdesk-cli".to_string(),
-            option: None,
+            option: Some(build_login_option_message()),
             video_ack_required: false,
             session_id: rand_session_id(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -430,6 +457,22 @@ fn rand_session_id() -> u64 {
     let mut buf = [0u8; 8];
     rand_core::OsRng.fill_bytes(&mut buf);
     u64::from_le_bytes(buf)
+}
+
+fn build_login_option_message() -> OptionMessage {
+    OptionMessage {
+        image_quality: ImageQuality::Best as i32,
+        custom_fps: 0,
+        disable_audio: option_message::BoolOption::Yes as i32,
+        disable_clipboard: option_message::BoolOption::Yes as i32,
+        disable_camera: option_message::BoolOption::Yes as i32,
+        terminal_persistent: option_message::BoolOption::Yes as i32,
+        supported_decoding: Some(SupportedDecoding {
+            ability_vp9: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------

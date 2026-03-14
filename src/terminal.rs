@@ -64,6 +64,19 @@ fn default_terminal_size() -> (u32, u32) {
 
 const TERMINAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const OPEN_TERMINAL_TIMEOUT: Duration = Duration::from_secs(15);
+const INITIAL_TERMINAL_OPENED_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn terminal_info_from_opened(opened: crate::proto::hbb::TerminalOpened) -> Result<TerminalInfo> {
+    if !opened.success {
+        bail!("remote refused to open terminal: {}", opened.message);
+    }
+
+    Ok(TerminalInfo {
+        terminal_id: opened.terminal_id,
+        pid: opened.pid,
+        service_id: opened.service_id,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Send helpers
@@ -135,10 +148,30 @@ pub async fn connect_terminal(config: &ConnectionConfig) -> Result<TerminalConne
     )
     .await?;
 
-    let (rows, cols) = default_terminal_size();
-    let terminal_info = open_terminal(&mut encrypted, rows, cols)
-        .await
-        .context("opening remote terminal")?;
+    let terminal_info = match timeout(
+        INITIAL_TERMINAL_OPENED_PROBE_TIMEOUT,
+        recv_terminal_response(&mut encrypted),
+    )
+    .await
+    {
+        Ok(Ok(terminal_response::Union::Opened(opened))) => {
+            terminal_info_from_opened(opened)
+                .context("processing initial TerminalOpened after login")?
+        }
+        Ok(Ok(terminal_response::Union::Error(e))) => {
+            bail!("terminal error after login: {}", e.message);
+        }
+        Ok(Ok(other)) => {
+            bail!("expected TerminalOpened after terminal login, got {other:?}");
+        }
+        Ok(Err(e)) => return Err(e).context("waiting for initial TerminalOpened"),
+        Err(_) => {
+            let (rows, cols) = default_terminal_size();
+            open_terminal(&mut encrypted, rows, cols)
+                .await
+                .context("opening remote terminal")?
+        }
+    };
 
     Ok(TerminalConnection {
         peer_info,
@@ -243,19 +276,7 @@ pub async fn open_terminal<T: Transport>(
         .context("waiting for TerminalOpened")?;
 
     match resp {
-        terminal_response::Union::Opened(opened) => {
-            if !opened.success {
-                bail!(
-                    "remote refused to open terminal: {}",
-                    opened.message
-                );
-            }
-            Ok(TerminalInfo {
-                terminal_id: opened.terminal_id,
-                pid: opened.pid,
-                service_id: opened.service_id,
-            })
-        }
+        terminal_response::Union::Opened(opened) => terminal_info_from_opened(opened),
         terminal_response::Union::Error(e) => {
             bail!("terminal error on open: {}", e.message)
         }

@@ -45,8 +45,8 @@ const EXEC_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const EXEC_PROMPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_EXEC_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 const SHELL_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45); // 1.5× 30s keep_alive (§29)
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(90); // 1.5× 60s keep_alive
 const RECONNECT_MAX_ATTEMPTS: usize = 3;
 const RECONNECT_BACKOFFS: [Duration; RECONNECT_MAX_ATTEMPTS] = [
     Duration::from_secs(1),
@@ -317,9 +317,21 @@ pub async fn run_daemon(
     });
 
     let mut last_activity = Instant::now();
-    let mut last_peer_msg = Instant::now();
-    let mut keepalive_tick = tokio::time::interval(KEEPALIVE_INTERVAL);
-    keepalive_tick.tick().await; // consume the immediate first tick
+    let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let heartbeat_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        interval.tick().await; // consume the immediate first tick
+        loop {
+            interval.tick().await;
+            match heartbeat_tx.try_send(()) {
+                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+            }
+            if heartbeat_tx.is_closed() {
+                break;
+            }
+        }
+    });
     let mut sigterm = signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("failed to register SIGINT handler")?;
 
@@ -332,25 +344,31 @@ pub async fn run_daemon(
         enum DaemonEvent {
             Accept(std::result::Result<std::result::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr), std::io::Error>, tokio::time::error::Elapsed>),
             PeerMessage(Result<Vec<u8>>),
-            KeepaliveTick,
+            HeartbeatTick,
             Signal(&'static str),
         }
 
         let event = tokio::select! {
             accept = accept => DaemonEvent::Accept(accept),
             peer_data = encrypted.recv() => DaemonEvent::PeerMessage(peer_data),
-            _ = keepalive_tick.tick() => DaemonEvent::KeepaliveTick,
+            tick = heartbeat_rx.recv() => match tick {
+                Some(()) => DaemonEvent::HeartbeatTick,
+                None => DaemonEvent::Signal("heartbeat task ended"),
+            },
             _ = sigterm.recv() => DaemonEvent::Signal("SIGTERM"),
             _ = sigint.recv() => DaemonEvent::Signal("SIGINT"),
         };
 
         match event {
             DaemonEvent::PeerMessage(Ok(data)) => {
-                last_peer_msg = Instant::now();
+                if data.is_empty() {
+                    continue;
+                }
                 match handle_peer_message(&mut encrypted, &data).await {
                     Ok(true) => {} // continue
                     Ok(false) => {
                         // Peer requested disconnect (close_reason).
+                        heartbeat_task.abort();
                         graceful_shutdown(&mut encrypted).await?;
                         return Ok(());
                     }
@@ -373,20 +391,42 @@ pub async fn run_daemon(
                 {
                     Ok(new_conn) => {
                         encrypted = new_conn.encrypted;
-                        last_peer_msg = Instant::now();
                     }
                     Err(reconnect_err) => {
+                        heartbeat_task.abort();
                         graceful_shutdown(&mut encrypted).await?;
                         return Err(reconnect_err);
                     }
                 }
                 continue;
             }
-            DaemonEvent::KeepaliveTick => {
-                if is_keepalive_expired(last_peer_msg, KEEPALIVE_TIMEOUT) {
+            DaemonEvent::HeartbeatTick => {
+                if let Err(e) = encrypted.send_heartbeat().await {
+                    eprintln!("daemon: heartbeat send error: {e:#}");
+                    match reconnect_encrypted_stream(&config, &mut session, active_conn_type, |resp| {
+                        eprintln!(
+                            "daemon: {}",
+                            resp.message.as_deref().unwrap_or("reconnecting...")
+                        );
+                    })
+                    .await
+                    {
+                        Ok(new_conn) => {
+                            encrypted = new_conn.encrypted;
+                            continue;
+                        }
+                        Err(reconnect_err) => {
+                            heartbeat_task.abort();
+                            graceful_shutdown(&mut encrypted).await?;
+                            return Err(reconnect_err);
+                        }
+                    }
+                }
+
+                if is_keepalive_expired(encrypted.recv_idle_for(), KEEPALIVE_TIMEOUT) {
                     eprintln!(
                         "daemon: keepalive timeout — no message from peer in {:.0}s, reconnecting",
-                        last_peer_msg.elapsed().as_secs_f64()
+                        encrypted.recv_idle_for().as_secs_f64()
                     );
                     match reconnect_encrypted_stream(&config, &mut session, active_conn_type, |resp| {
                         eprintln!(
@@ -398,9 +438,9 @@ pub async fn run_daemon(
                     {
                         Ok(new_conn) => {
                             encrypted = new_conn.encrypted;
-                            last_peer_msg = Instant::now();
                         }
                         Err(reconnect_err) => {
+                            heartbeat_task.abort();
                             graceful_shutdown(&mut encrypted).await?;
                             return Err(reconnect_err);
                         }
@@ -443,7 +483,6 @@ pub async fn run_daemon(
                         Ok(new_conn) => {
                             encrypted = new_conn.encrypted;
                             active_conn_type = desired_conn_type;
-                            last_peer_msg = Instant::now();
                         }
                         Err(reconnect_err) => {
                             let resp = SessionResponse::error(format!("{reconnect_err:#}"));
@@ -470,9 +509,9 @@ pub async fn run_daemon(
                             {
                                 Ok(new_conn) => {
                                     encrypted = new_conn.encrypted;
-                                    last_peer_msg = Instant::now();
                                 }
                                 Err(reconnect_err) => {
+                                    heartbeat_task.abort();
                                     graceful_shutdown(&mut encrypted).await?;
                                     return Err(reconnect_err);
                                 }
@@ -499,7 +538,6 @@ pub async fn run_daemon(
                         match reconnect_result {
                             Ok(new_conn) => {
                                 encrypted = new_conn.encrypted;
-                                last_peer_msg = Instant::now();
                                 match execute_daemon_command(&mut encrypted, &mut session, cmd).await {
                                     Ok(resp) => resp,
                                     Err(retry_err) => SessionResponse::error(format!(
@@ -512,6 +550,7 @@ pub async fn run_daemon(
                                     "connection lost: {command_err:#}; reconnect failed: {reconnect_err:#}"
                                 ));
                                 let _ = send_response(&mut writer, &resp).await;
+                                heartbeat_task.abort();
                                 graceful_shutdown(&mut encrypted).await?;
                                 return Err(reconnect_err);
                             }
@@ -523,6 +562,7 @@ pub async fn run_daemon(
                 let _ = send_response(&mut writer, &response).await;
 
                 if is_disconnect {
+                    heartbeat_task.abort();
                     graceful_shutdown(&mut encrypted).await?;
                     return Ok(());
                 }
@@ -533,11 +573,13 @@ pub async fn run_daemon(
             DaemonEvent::Accept(Err(_)) => {
                 // Idle timeout
                 eprintln!("daemon: idle timeout, shutting down");
+                heartbeat_task.abort();
                 graceful_shutdown(&mut encrypted).await?;
                 return Ok(());
             }
             DaemonEvent::Signal(name) => {
                 eprintln!("daemon: received {name}, shutting down");
+                heartbeat_task.abort();
                 graceful_shutdown(&mut encrypted).await?;
                 return Ok(());
             }
@@ -892,8 +934,8 @@ async fn handle_peer_message(
 
 /// Check if the keepalive timeout has been exceeded.
 /// Returns `true` if the elapsed time since the last peer message exceeds the timeout.
-fn is_keepalive_expired(last_peer_msg: Instant, timeout: Duration) -> bool {
-    last_peer_msg.elapsed() > timeout
+fn is_keepalive_expired(recv_idle_for: Duration, timeout: Duration) -> bool {
+    recv_idle_for > timeout
 }
 
 // ---------------------------------------------------------------------------
@@ -1772,33 +1814,25 @@ mod tests {
 
     #[test]
     fn keepalive_not_expired_when_recent() {
-        let now = Instant::now();
-        // Just created — well within the 45s timeout.
-        assert!(!is_keepalive_expired(now, KEEPALIVE_TIMEOUT));
+        // Just received a frame — well within the 90s timeout.
+        assert!(!is_keepalive_expired(Duration::from_secs(0), KEEPALIVE_TIMEOUT));
     }
 
     #[test]
     fn keepalive_expired_after_timeout() {
-        // Simulate an Instant that is 46 seconds in the past.
-        let stale = Instant::now() - Duration::from_secs(46);
-        assert!(is_keepalive_expired(stale, KEEPALIVE_TIMEOUT));
+        assert!(is_keepalive_expired(Duration::from_secs(91), KEEPALIVE_TIMEOUT));
     }
 
     #[test]
     fn keepalive_not_expired_just_before_threshold() {
-        // 44 seconds ago — should still be within the 45s window.
-        let recent = Instant::now() - Duration::from_secs(44);
-        assert!(!is_keepalive_expired(recent, KEEPALIVE_TIMEOUT));
+        assert!(!is_keepalive_expired(Duration::from_secs(89), KEEPALIVE_TIMEOUT));
     }
 
     #[test]
     fn keepalive_custom_timeout() {
         let timeout = Duration::from_secs(10);
-        let stale = Instant::now() - Duration::from_secs(11);
-        assert!(is_keepalive_expired(stale, timeout));
-
-        let fresh = Instant::now() - Duration::from_secs(5);
-        assert!(!is_keepalive_expired(fresh, timeout));
+        assert!(is_keepalive_expired(Duration::from_secs(11), timeout));
+        assert!(!is_keepalive_expired(Duration::from_secs(5), timeout));
     }
 
     #[test]

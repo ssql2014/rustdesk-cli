@@ -13,6 +13,7 @@ use crypto_box::{
 use ed25519_dalek::VerifyingKey;
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 use xsalsa20poly1305::{XSalsa20Poly1305, aead::KeyInit};
 
 use crate::transport::Transport;
@@ -116,6 +117,7 @@ pub struct EncryptedStream<T: Transport> {
     cipher: XSalsa20Poly1305,
     send_seq: u64,
     recv_seq: u64,
+    last_recv_at: Instant,
 }
 
 impl<T: Transport> EncryptedStream<T> {
@@ -126,6 +128,7 @@ impl<T: Transport> EncryptedStream<T> {
             cipher: XSalsa20Poly1305::new(key),
             send_seq: 0,
             recv_seq: 0,
+            last_recv_at: Instant::now(),
         }
     }
 
@@ -147,14 +150,28 @@ impl<T: Transport> EncryptedStream<T> {
         self.inner.send(&ciphertext).await
     }
 
+    /// Send a raw zero-length heartbeat frame without touching the crypto counters.
+    pub async fn send_heartbeat(&mut self) -> Result<()> {
+        self.inner.send(&[]).await
+    }
+
     /// Receive and decrypt a message.
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         let ciphertext = self.inner.recv().await?;
+        self.last_recv_at = Instant::now();
+        if ciphertext.is_empty() {
+            return Ok(Vec::new());
+        }
         self.recv_seq += 1;
         let nonce = Self::make_nonce(self.recv_seq);
         self.cipher
             .decrypt(&nonce, ciphertext.as_ref())
             .map_err(|_| anyhow::anyhow!("Decryption failed: invalid ciphertext or wrong key"))
+    }
+
+    /// Return how long it has been since the last successfully received frame.
+    pub fn recv_idle_for(&self) -> Duration {
+        self.last_recv_at.elapsed()
     }
 
     /// Close the underlying transport.
@@ -379,5 +396,25 @@ mod tests {
         send_task.await.unwrap();
         let result = recv_task.await.unwrap();
         assert!(result.is_err(), "decryption with wrong key should fail");
+    }
+
+    #[tokio::test]
+    async fn encrypted_stream_heartbeat_bypasses_encryption_and_sequence() {
+        let (ct, st) = DuplexTransport::pair();
+        let key = [11u8; 32];
+        let mut client = EncryptedStream::new(ct, &key);
+        let mut server = EncryptedStream::new(st, &key);
+
+        client.send_heartbeat().await.unwrap();
+        let heartbeat = server.recv().await.unwrap();
+        assert!(heartbeat.is_empty());
+        assert_eq!(client.send_seq, 0);
+        assert_eq!(server.recv_seq, 0);
+
+        client.send(b"payload").await.unwrap();
+        let payload = server.recv().await.unwrap();
+        assert_eq!(payload, b"payload");
+        assert_eq!(client.send_seq, 1);
+        assert_eq!(server.recv_seq, 1);
     }
 }

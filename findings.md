@@ -1,34 +1,25 @@
 # Findings & Decisions
 
-## Deployment Inputs
-- Peer ID: `308235080`
-- Password: `Evas@2026`
-- ID server: `115.238.185.55:50076`
-- Relay server: `115.238.185.55:50077`
-- Server key: `SWc0NIWF0wR7kd8rHdGNaCHXtp7dirUImEtrVmRfQdc=`
+## Root Cause
+- The background daemon spawned from `cargo run -- connect ...` was not fully detached from the parent process/session.
+- The detached startup path also signaled readiness too early by writing `/tmp/rustdesk-cli.lock` before `initialize_stream_for_mode()` completed.
 
-## Deployment Payload
-- Target file: `/home/evas/rmsnorm_op.py`
-- Expected verification output: `SUCCESS: RMSNorm verification passed.`
+## Why Foreground `--daemon` Worked
+- Running `target/debug/rustdesk-cli --daemon ...` directly bypassed the parent/child handoff.
+- That confirmed the connection/auth/relay logic itself was not the primary problem.
 
-## Planned Execution Order
-1. `cargo run -- connect ...`
-2. `cargo run -- exec --command "cat > /home/evas/rmsnorm_op.py ..."`
-3. `cargo run -- exec --command "python3 /home/evas/rmsnorm_op.py"`
-4. Fallback to terminal piping only if daemon exec fails
+## Code Changes
+- In [`src/daemon.rs`](/Users/qlss/Documents/Projects/rustdesk-cli/src/daemon.rs):
+  - added Unix `pre_exec` + `libc::setsid()` in `spawn_daemon()` so the background daemon starts in its own session
+  - moved `LockFile::write(SOCKET_PATH)` to after `initialize_stream_for_mode()`
+  - now writes a startup error if post-auth stream initialization fails before readiness is published
 
-## Actual Execution Findings
-- `cargo run -- connect ...` reported success, but the detached daemon died immediately and left only a stale lock/socket.
-- Running `target/debug/rustdesk-cli --daemon ...` in the foreground kept the session alive and allowed `exec` to work reliably enough for deployment.
-- The script file was created at `/home/evas/rmsnorm_op.py`.
-- Initial verification failed because the remote host lacked `numpy`.
-- Remote Python environment details:
-  - Ubuntu 22.04.5 LTS
-  - user `evas`
-  - no `pip`
-  - no `ensurepip`
-- User-space recovery worked:
-  - bootstrapped `pip` via `curl https://bootstrap.pypa.io/get-pip.py`
-  - installed `numpy` into `~/.local`
-- Final verification output from the remote host:
-  - `SUCCESS: RMSNorm verification passed.`
+## Live Verification
+- `cargo run -- connect 308235080 --password 'Evas@2026' --id-server 115.238.185.55:50076 --relay-server 115.238.185.55:50077 --key 'SWc0NIWF0wR7kd8rHdGNaCHXtp7dirUImEtrVmRfQdc='`
+  returned `connected id=308235080 width=1920 height=1080`
+- After a 3-second delay, `cargo run -- status` returned:
+  - `connected id=308235080 width=1920 height=1080`
+
+## Test Outcome
+- `cargo test` passed once rerun without an active live daemon left over from the handoff check
+

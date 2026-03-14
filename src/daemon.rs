@@ -10,6 +10,8 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -152,6 +154,17 @@ pub fn spawn_daemon(
         cmd.arg("--connect-timeout").arg(t.to_string());
     }
 
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            // Fully detach so the daemon is not tied to the parent's process group.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
     // Detach: redirect stdio so parent can exit
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -261,19 +274,20 @@ pub async fn run_daemon(
         }
     };
 
-    // Lock file signals readiness — written AFTER auth succeeds so the
-    // CLI won't see "connected" until the peer is actually reachable.
-    LockFile::write(SOCKET_PATH)?;
-
     let mut encrypted = conn_result.encrypted;
     let peer_info = conn_result.peer_info;
 
     if let Err(e) = initialize_stream_for_mode(&mut encrypted, active_conn_type).await {
+        let message = format!("daemon init failed: {e:#}");
+        let _ = write_startup_error(&message);
         eprintln!("daemon: failed to initialize connection stream: {e:#}");
         let _ = encrypted.close().await;
         cleanup();
         return Ok(());
     }
+
+    // Lock file signals readiness only after the post-auth stream is usable.
+    LockFile::write(SOCKET_PATH)?;
 
     // Initialize session control-plane state with real peer info.
     let mut session = Session::new();

@@ -1,317 +1,59 @@
-# Task Plan: rustdesk-cli CLI Design, Implementation, and Testing
+# Task Plan: Implement Terminal Session Support
 
 ## Goal
-Lock down the `rustdesk-cli` CLI contract with integration tests that verify help output, JSON responses, batch mode, exit codes, and `--region` parsing against the current stubbed implementation.
+Add direct terminal-session support using the existing RustDesk terminal protobufs, including a terminal-mode connection flow, `OpenTerminal` after login, stdin/stdout streaming, and CLI wiring in `src/main.rs`.
 
 ## Current Phase
-Phase 2: Real Screenshot Capture
+Phase 5
 
 ## Phases
 ### Phase 1: Requirements & Discovery
-- [x] Understand user intent
-- [x] Inspect the current `Cargo.toml`
-- [x] Confirm there is no existing `tests/` directory
+- [x] Read skill instructions and existing planning files
+- [x] Read terminal protocol research notes
+- [x] Inspect `proto/message.proto`, `src/connection.rs`, `src/terminal.rs`, and `src/main.rs`
 - **Status:** complete
 
-### Phase 2: Planning & Structure
-- [x] Define test coverage areas
-- [x] Choose `assert_cmd` and `predicates` test approach
-- [x] Plan JSON parsing assertions
+### Phase 2: Connection Flow Refactor
+- [x] Reuse the existing relay/login flow with configurable `ConnType`
+- [x] Support terminal login union in `LoginRequest`
+- [x] Keep the desktop/default path unchanged
 - **Status:** complete
 
-### Phase 3: Implementation
-- [x] Add dev-dependencies
-- [x] Create `tests/cli_test.rs`
-- [x] Cover help, JSON outputs, batch mode, exit codes, and region parsing
+### Phase 3: Terminal Session Implementation
+- [x] Add direct terminal connect/open helpers
+- [x] Stream local stdin to `TerminalAction::Data`
+- [x] Stream `TerminalResponse::Data` to local stdout
+- [x] Close cleanly on EOF / remote close
 - **Status:** complete
 
-### Phase 4: Testing & Verification
-- [x] Run `cargo test`
-- [x] Fix test failures if any
-- [x] Confirm all requested assertions are present
+### Phase 4: CLI Wiring
+- [x] Expose terminal mode in `src/main.rs`
+- [x] Reuse the existing connection arguments and password handling
+- [x] Keep existing daemon-based commands intact
 - **Status:** complete
 
-### Phase 5: Delivery
-- [x] Review changed files
-- [x] Ensure deliverables are complete
-- [ ] Deliver summary to user
-- **Status:** in_progress
+### Phase 5: Verification
+- [x] Run `cargo build`
+- [x] Resolve any compile errors or warnings introduced by the change
+- [x] Summarize behavior and remaining risks
+- **Status:** complete
 
 ## Key Questions
-1. Which response fields should be asserted exactly versus only for presence?
-2. How should region parse failures be tested when clap exits before command execution?
-3. How much of the batch JSON payload should be locked down in this first test pass?
+1. Which parts of the current desktop connection flow should be generalized rather than duplicated?
+2. Which exact protobuf fields must be set for terminal mode (`ConnType`, `LoginRequest.union`, `TerminalAction`)?
+3. What is the least disruptive CLI shape for exposing direct terminal mode?
 
 ## Decisions Made
 | Decision | Rationale |
 |----------|-----------|
-| Prefer a small subcommand set over many aliases | Keeps the agent interface predictable and easier to script |
-| Make `--json` a global machine-output mode | Gives agents one consistent parsing contract across commands |
-| Keep text output one line per command success | Simple for humans, still stable for logs and fallback parsing |
-| Add per-step results in `do --json` output | Agents need to know exactly which step failed without replaying logs |
-| Keep command implementations stubbed but typed | Lets the CLI surface stabilize before transport/session logic exists |
-| Parse JSON in tests instead of string-matching whole objects | Keeps tests stable across harmless field-order changes |
+| Reuse the existing `src/terminal.rs` message helpers instead of replacing the file | The repo already contains well-tested terminal action/response helpers |
+| Add a reusable connection-mode path instead of copy-pasting `src/connection.rs` | Terminal mode only changes a few protocol fields; duplication would drift |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| Missing `PredicateBooleanExt` import in tests | 1 | Added the trait import and reran `cargo test` |
+|       | 1       |            |
 
 ## Notes
-- Re-read this plan before major decisions.
-- Keep `DESIGN.md` as the source of truth for output format and flags.
-
-## 2026-03-14 Real Screenshot Capture
-
-### Goal
-Replace the stubbed capture path with real `ScreenshotRequest` / `ScreenshotResponse` handling over the encrypted RustDesk stream and keep the existing CLI/daemon shape compiling.
-
-### Phases
-#### Phase 1: Discovery
-- [x] Read `proto/message.proto` for the exact screenshot protobufs
-- [x] Inspect current capture handling in `src/main.rs` and `src/daemon.rs`
-- [x] Confirm how encrypted stream helpers are structured in `src/terminal.rs`
-- **Status:** complete
-
-#### Phase 2: Implementation
-- [x] Add `src/capture.rs` with screenshot send/receive helpers
-- [x] Wire daemon capture handling through the new module
-- [x] Update CLI capture handling to consume real image bytes
-- [x] Run `cargo build`
-- **Status:** complete
-
-## 2026-03-14 Unit Test Expansion
-
-### Goal
-Add focused unit tests for session state transitions and protocol helpers, then verify they pass alongside the existing CLI integration suite.
-
-### Phases
-#### Phase 1: Discovery
-- [x] Read `src/session.rs`
-- [x] Read `src/protocol.rs`
-- [x] Confirm current integration test coverage in `tests/cli_test.rs`
-- **Status:** complete
-
-#### Phase 2: Implementation
-- [x] Add `#[cfg(test)]` coverage in `src/session.rs`
-- [x] Add `#[cfg(test)]` coverage in `src/protocol.rs`
-- **Status:** complete
-
-#### Phase 3: Verification
-- [x] Run `cargo test`
-- [x] Fix any compile/test failures
-- [x] Confirm both unit and integration suites pass
-- **Status:** complete
-
-## 2026-03-14 Drag And Scroll Session Commands
-
-### Goal
-Add session-layer drag and scroll commands that emit the expected mouse protocol messages, then verify they pass with the existing unit and integration coverage.
-
-### Phases
-#### Phase 1: Discovery
-- [x] Read `src/session.rs`
-- [x] Read `src/protocol.rs`
-- [x] Read `DESIGN.md`
-- [x] Confirm where `SessionCommand` is used
-- **Status:** complete
-
-#### Phase 2: Implementation
-- [x] Add `Drag` and `Scroll` to `SessionCommand`
-- [x] Add scroll mask constants to `MouseEvent`
-- [x] Implement drag and scroll dispatch behavior
-- [x] Add unit tests for the new commands
-- **Status:** complete
-
-#### Phase 3: Verification
-- [x] Run `cargo test`
-- [x] Confirm unit and integration suites still pass
-- **Status:** complete
-
-## 2026-03-14 Transport Layer
-
-### Goal
-Add a reusable transport abstraction with RustDesk-style length-prefixed framing, wire it into the crate, and verify it with unit and integration tests.
-
-### Phases
-#### Phase 1: Discovery
-- [x] Read `TASK_LEO.md`
-- [x] Read `src/protocol.rs`
-- [x] Read `src/daemon.rs`
-- [x] Check current crate/module state before editing
-- **Status:** complete
-
-#### Phase 2: Implementation
-- [x] Create `src/transport.rs`
-- [x] Add the `Transport` trait
-- [x] Implement `TcpTransport`
-- [x] Implement `FramedTransport`
-- [x] Add duplex-based framing tests
-- [x] Add `mod transport;` to `src/main.rs`
-- **Status:** complete
-
-#### Phase 3: Verification
-- [x] Run `cargo test`
-- [x] Fix compile or test regressions
-- [x] Confirm full suite passes cleanly
-- **Status:** complete
-
-## 2026-03-14 Rendezvous Client
-
-### Goal
-Add a UDP rendezvous client built on the prost-generated RustDesk signaling types, cover registration/hole-punch/relay flows with unit tests, and keep the full crate test suite green.
-
-### Phases
-#### Phase 1: Discovery
-- [x] Read `RESEARCH.md` sections 8 and 10
-- [x] Inspect `src/proto.rs`
-- [x] Inspect the generated `hbb.rs` types
-- [x] Confirm current crate/module state before editing
-- **Status:** complete
-
-#### Phase 2: Implementation
-- [x] Create `src/rendezvous.rs`
-- [x] Implement `RendezvousClient::connect`
-- [x] Implement `register_peer`
-- [x] Implement `punch_hole`
-- [x] Implement `request_relay`
-- [x] Add UDP unit tests
-- [x] Add `mod rendezvous;` to `src/main.rs`
-- **Status:** complete
-
-#### Phase 3: Verification
-- [x] Run `cargo test`
-- [x] Confirm unit and integration suites pass
-- **Status:** complete
-
-## 2026-03-14 Live Rendezvous Server Test
-
-### Goal
-Add an ignored integration test that exercises the real RustDesk ID server over UDP using the rendezvous client and verify it with the exact ignored-test command.
-
-### Phases
-#### Phase 1: Discovery
-- [x] Read `TEST_CONFIG.md`
-- [x] Read `src/rendezvous.rs`
-- [x] Read `src/proto.rs`
-- [x] Confirm how to import binary-only modules from an integration test
-- **Status:** complete
-
-#### Phase 2: Implementation
-- [x] Create `tests/live_server_test.rs`
-- [x] Add ignored live UDP test for `RegisterPeer`
-- [x] Add ignored live UDP test coverage for `PunchHoleRequest`
-- **Status:** complete
-
-#### Phase 3: Verification
-- [x] Run `cargo test --test live_server_test -- --ignored`
-- [x] Fix live test assumptions based on actual server response
-- [x] Confirm ignored live test passes
-- **Status:** complete
-
-## 2026-03-14 Live Relay Test And Connect Flags
-
-### Goal
-Extend the ignored live-server coverage to include relay TCP reachability and add `--id-server`, `--relay-server`, and `--key` to the `connect` CLI flow through daemon startup.
-
-### Phases
-#### Phase 1: Discovery
-- [x] Read `TEST_CONFIG.md`
-- [x] Read `src/main.rs`
-- [x] Read `src/daemon.rs`
-- [x] Read `src/rendezvous.rs`
-- [x] Check where `connect` flags are threaded and rendered
-- **Status:** complete
-
-#### Phase 2: Implementation
-- [x] Extend `tests/live_server_test.rs` with a relay TCP test
-- [x] Add `request_relay_for` to carry relay hints from punch-hole output
-- [x] Add `--id-server`, `--relay-server`, and `--key` flags to the `connect` command
-- [x] Thread the new connect flags through `spawn_daemon` and `run_daemon`
-- **Status:** complete
-
-#### Phase 3: Verification
-- [x] Run `cargo test`
-- [x] Run `cargo test --test live_server_test -- --ignored`
-- [x] Adjust the live relay test based on observed hbbs behavior
-- [x] Confirm both normal and ignored suites pass
-- **Status:** complete
-
-## 2026-03-14 E2E Auth Probe
-
-### Goal
-Verify the ignored live rendezvous/relay tests still pass, then add an ignored end-to-end auth probe that drives relay binding, crypto handshake, and login far enough to capture the first real server-side failure.
-
-### Phases
-#### Phase 1: Discovery
-- [x] Read `src/crypto.rs`
-- [x] Read `src/proto.rs`
-- [x] Read the generated `Message`, `Hash`, `PublicKey`, and `LoginRequest` shapes
-- [x] Check for existing full-connection code in the repo
-- **Status:** complete
-
-#### Phase 2: Implementation
-- [x] Create `tests/e2e_connect_test.rs`
-- [x] Reuse binary-only modules via `#[path = ...]` imports
-- [x] Implement the ignored relay/auth probe
-- [x] Add stage-specific failure context for live debugging
-- **Status:** complete
-
-#### Phase 3: Verification
-- [x] Run `cargo test --test live_server_test -- --ignored`
-- [x] Confirm both ignored live rendezvous/relay tests pass
-- [x] Run `cargo test --test e2e_connect_test -- --ignored`
-- [x] Capture the current live failure point for the auth probe
-- [x] Run `cargo test` to confirm the regular suite stays green
-- **Status:** complete
-
-## 2026-03-14 Text-Mode CLI Pivot Commands
-
-### Goal
-Add `shell`, `exec`, and `clipboard get/set` to the CLI and session layers, keeping the existing command set intact and covered by tests.
-
-### Phases
-#### Phase 1: Discovery
-- [x] Read `TASK_LEO.md`
-- [x] Read `ARCHITECTURE_PIVOT.md`
-- [x] Inspect `src/session.rs`
-- [x] Inspect `src/main.rs`
-- [x] Inspect `src/daemon.rs`
-- [x] Inspect `tests/cli_test.rs`
-- **Status:** complete
-
-#### Phase 2: Implementation
-- [x] Add new `SessionCommand` variants and stub dispatch behavior
-- [x] Add session unit tests for the new commands
-- [x] Add CLI subcommands and batch parsing/response support
-- [x] Add CLI integration tests for the new commands
-- **Status:** complete
-
-#### Phase 3: Verification
-- [x] Run targeted `cargo test` coverage
-- [x] Fix compile or test regressions
-- [x] Confirm the full requested command surface is covered
-- **Status:** complete
-
-## 2026-03-14 Terminal Protocol Optimizations (Research)
-
-### Goal
-Research and document RustDesk protocol optimizations for terminal and text-heavy channels, focusing on compression, session persistence, and flow control.
-
-### Phases
-#### Phase 1: Discovery
-- [x] Read `TASK_NOVA_TEXTOPT.md`
-- [x] Research `zstd` compression details and thresholds
-- [x] Investigate `terminal_id` and `terminal_persistent` logic
-- [x] Map the `cliprdr` clipboard protocol flow
-- [x] Check for keystroke batching and flow control behavior
-- **Status:** complete
-
-#### Phase 2: Implementation
-- [x] Document findings in `RESEARCH.md` Section 13
-- [x] Renumber subsequent sections for consistency
-- **Status:** complete
-
-#### Phase 3: Verification
-- [x] Verify section numbering in `RESEARCH.md`
-- **Status:** complete
+- The research docs explicitly require `ConnType::TERMINAL`, `LoginRequest` terminal union, and `OpenTerminal` after login.
+- `src/terminal.rs` already has protocol helpers and tests for `TerminalAction` / `TerminalResponse`.

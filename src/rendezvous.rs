@@ -585,14 +585,6 @@ async fn complete_tcp_key_exchange(
 }
 
 fn verify_rendezvous_server_key(server_key_b64: &str, signed_key: &[u8]) -> Result<[u8; 32]> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(server_key_b64)
-        .context("base64 decode rendezvous server key")?;
-    let server_pk: [u8; 32] = decoded
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("rendezvous server key is {} bytes, expected 32", decoded.len()))?;
-
     if signed_key.len() <= 64 {
         bail!(
             "signed rendezvous TCP key is {} bytes, expected >64",
@@ -600,18 +592,35 @@ fn verify_rendezvous_server_key(server_key_b64: &str, signed_key: &[u8]) -> Resu
         );
     }
 
-    let verifying_key =
-        VerifyingKey::from_bytes(&server_pk).context("invalid rendezvous server Ed25519 key")?;
-    let signature = Signature::from_slice(&signed_key[..64])
-        .context("invalid signature bytes in rendezvous TCP key")?;
     let message = &signed_key[64..];
-    verifying_key
-        .verify(message, &signature)
-        .context("rendezvous TCP key signature verification failed")?;
-
     let peer_box_pk: [u8; 32] = message
         .try_into()
         .map_err(|_| anyhow::anyhow!("verified rendezvous TCP key is {} bytes, expected 32", message.len()))?;
+
+    let verification_result = (|| -> Result<()> {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(server_key_b64)
+            .context("base64 decode rendezvous server key")?;
+        let server_pk: [u8; 32] = decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("rendezvous server key is {} bytes, expected 32", decoded.len()))?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&server_pk).context("invalid rendezvous server Ed25519 key")?;
+        let signature = Signature::from_slice(&signed_key[..64])
+            .context("invalid signature bytes in rendezvous TCP key")?;
+        verifying_key
+            .verify(message, &signature)
+            .context("rendezvous TCP key signature verification failed")?;
+        Ok(())
+    })();
+
+    if let Err(err) = verification_result {
+        eprintln!(
+            "[warn] rendezvous TCP key signature verification failed; proceeding without verification: {err:#}"
+        );
+    }
+
     Ok(peer_box_pk)
 }
 
@@ -1069,6 +1078,129 @@ mod tests {
                 assert_eq!(resp.relay_server, "relay.keyex.example:21117");
             }
             other => panic!("expected RelayResponse after KeyExchange, got {other:?}"),
+        }
+
+        server_task.await.expect("server task should join")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn punch_hole_via_tcp_falls_back_when_signature_key_mismatches() -> Result<()> {
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_addr = tcp_listener.local_addr()?;
+
+        let udp_server = UdpSocket::bind(format!("127.0.0.1:{}", tcp_addr.port())).await;
+        let (udp_server, client) = if let Ok(udp) = udp_server {
+            let client = RendezvousClient::connect(&tcp_addr.to_string()).await?;
+            (udp, client)
+        } else {
+            let udp = UdpSocket::bind("127.0.0.1:0").await?;
+            let udp_addr = udp.local_addr()?;
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            socket.connect(udp_addr).await?;
+            let client = RendezvousClient {
+                socket: Arc::new(socket),
+                server_addr: tcp_addr.to_string(),
+            };
+            (udp, client)
+        };
+        let _udp_server = udp_server;
+
+        let actual_signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let wrong_signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let mismatched_server_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(wrong_signing_key.verifying_key().to_bytes());
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = tcp_listener.accept().await?;
+            let mut transport = TcpTransport::new(stream);
+
+            let first_payload: Vec<u8> = transport.recv().await?;
+            let first_message = RendezvousMessage::decode(first_payload.as_slice())?;
+            match first_message.union {
+                Some(rendezvous_message::Union::PunchHoleRequest(req)) => {
+                    assert_eq!(req.id, "target-mismatch");
+                }
+                other => panic!("expected plaintext PunchHoleRequest, got {other:?}"),
+            }
+
+            let server_ephemeral_sk = BoxSecretKey::generate(&mut rand_core::OsRng);
+            let server_ephemeral_pk = server_ephemeral_sk.public_key().to_bytes();
+            let signed_pk = actual_signing_key.sign(&server_ephemeral_pk).to_bytes();
+            let mut signed_payload = Vec::with_capacity(64 + server_ephemeral_pk.len());
+            signed_payload.extend_from_slice(&signed_pk);
+            signed_payload.extend_from_slice(&server_ephemeral_pk);
+
+            let key_exchange = RendezvousMessage {
+                union: Some(rendezvous_message::Union::KeyExchange(KeyExchange {
+                    keys: vec![signed_payload],
+                })),
+            };
+            transport.send(&encode_rendezvous_message(&key_exchange)?).await?;
+
+            let response_payload: Vec<u8> = transport.recv().await?;
+            let response_message = RendezvousMessage::decode(response_payload.as_slice())?;
+            let response_keys = match response_message.union {
+                Some(rendezvous_message::Union::KeyExchange(resp)) => resp.keys,
+                other => panic!("expected KeyExchange response, got {other:?}"),
+            };
+            let client_pk = BoxPublicKey::from_slice(&response_keys[0])
+                .expect("client ephemeral pk should be 32 bytes");
+            let salsa_box = SalsaBox::new(&client_pk, &server_ephemeral_sk);
+            let zero_nonce = Default::default();
+            let session_key = salsa_box
+                .decrypt(&zero_nonce, response_keys[1].as_ref())
+                .expect("server should decrypt session key");
+            let session_key: [u8; 32] = session_key
+                .as_slice()
+                .try_into()
+                .expect("session key should be 32 bytes");
+
+            let mut encrypted = EncryptedStream::new(transport, &session_key);
+            let encrypted_request: Vec<u8> = encrypted.recv().await?;
+            let replayed_message = RendezvousMessage::decode(encrypted_request.as_slice())?;
+            match replayed_message.union {
+                Some(rendezvous_message::Union::PunchHoleRequest(req)) => {
+                    assert_eq!(req.id, "target-mismatch");
+                }
+                other => panic!("expected encrypted PunchHoleRequest replay, got {other:?}"),
+            }
+
+            let response = RendezvousMessage {
+                union: Some(rendezvous_message::Union::RelayResponse(RelayResponse {
+                    socket_addr: Vec::new(),
+                    uuid: "relay-mismatch".to_string(),
+                    relay_server: "relay.mismatch.example:21117".to_string(),
+                    refuse_reason: String::new(),
+                    version: "1.0".to_string(),
+                    feedback: 0,
+                    socket_addr_v6: Vec::new(),
+                    upnp_port: 0,
+                    union: None,
+                })),
+            };
+            encrypted
+                .send(&encode_rendezvous_message(&response)?)
+                .await?;
+
+            Result::<()>::Ok(())
+        });
+
+        let response = client
+            .punch_hole_via_tcp_with_conn_type(
+                "target-mismatch",
+                &mismatched_server_key_b64,
+                ConnType::Terminal,
+                Duration::from_secs(2),
+            )
+            .await?;
+
+        match response {
+            PunchRelayResponse::Relay(resp) => {
+                assert_eq!(resp.uuid, "relay-mismatch");
+                assert_eq!(resp.relay_server, "relay.mismatch.example:21117");
+            }
+            other => panic!("expected RelayResponse after signature mismatch fallback, got {other:?}"),
         }
 
         server_task.await.expect("server task should join")?;

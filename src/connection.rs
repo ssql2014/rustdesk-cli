@@ -51,7 +51,7 @@ pub struct ConnectionResult {
     pub encrypted: EncryptedStream<TcpTransport>,
 }
 
-const PUNCH_HOLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const PUNCH_HOLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
 const PUNCH_HOLE_GRACE_DELAY: Duration = Duration::from_millis(300);
 const RELAY_PORT: u16 = 21117;
 

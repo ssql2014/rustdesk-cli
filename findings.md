@@ -61,5 +61,10 @@
 - `cargo test punch_hole_via_tcp_handles_key_exchange_then_replays_request -- --nocapture` passed.
 - `cargo test` passed fully.
 
+## Follow-Up Findings
+- The provided `--key` can legitimately differ from the hbbs signing key on self-hosted servers.
+- Hard-failing signature verification breaks real deployments more often than it protects them in the current CLI design, so a warning-plus-fallback is the pragmatic behavior until a separate hbbs key is modeled explicitly.
+- The 2-second TCP punch-hole timeout was too short once KeyExchange added multiple extra round trips; 6 seconds passes the local regression suite and matches the higher-latency deployment reports better.
+
 ## Visual/Browser Findings
 - None.

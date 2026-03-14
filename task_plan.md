@@ -53,3 +53,7 @@ Phase 4
 ## Notes
 - `PunchHoleRequest` over TCP currently goes out in plaintext and only accepts plaintext `PunchHoleResponse` / `RelayResponse`.
 - `proto/rendezvous.proto` already defines `KeyExchange`.
+
+## Follow-Up Fixes
+- Issue `#39`: when the provided key does not verify the hbbs TCP signature, the client now logs a warning and proceeds with the embedded rendezvous key instead of aborting the handshake.
+- Issue `#40`: `PUNCH_HOLE_RESPONSE_TIMEOUT` was increased from `2s` to `6s` to account for the longer encrypted TCP rendezvous flow.

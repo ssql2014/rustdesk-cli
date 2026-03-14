@@ -62,6 +62,7 @@
 | Build verification | `cargo build` | project compiles with TCP KeyExchange fix | passed | ✓ |
 | Targeted regression | `cargo test punch_hole_via_tcp_handles_key_exchange_then_replays_request -- --nocapture` | TCP KeyExchange flow succeeds | passed | ✓ |
 | Full test suite | `cargo test` | no regressions | passed | ✓ |
+| Signature mismatch fallback | `cargo test` | mismatched provided key does not abort TCP KeyExchange | passed | ✓ |
 
 ## Error Log
 | Timestamp | Error | Attempt | Resolution |

@@ -52,6 +52,7 @@ pub struct ConnectionResult {
 }
 
 const PUNCH_HOLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const PUNCH_HOLE_GRACE_DELAY: Duration = Duration::from_millis(300);
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -112,6 +113,7 @@ pub(crate) async fn connect_with_mode(
     let session_uuid: String = uuid_bytes.iter().map(|b| format!("{b:02x}")).collect();
     eprintln!("[debug] Phase 2: sending PunchHole (uuid={})...", &session_uuid[..8]);
 
+    let mut received_punch_hole_response = false;
     let punch_hole_relay_hint = match timeout(
         PUNCH_HOLE_RESPONSE_TIMEOUT,
         client.punch_hole_with_conn_type(&config.peer_id, &config.server_key, conn_type),
@@ -119,6 +121,7 @@ pub(crate) async fn connect_with_mode(
     .await
     {
         Ok(Ok(resp)) => {
+            received_punch_hole_response = true;
             check_punch_hole_failure(&resp)?;
             if !resp.relay_server.is_empty() {
                 Some(resp.relay_server)
@@ -139,44 +142,61 @@ pub(crate) async fn connect_with_mode(
         }
     };
 
-    // Send RequestRelay to hbbs via TCP (with correct BytesCodec framing).
-    // hbbs forwards this to the peer, who then connects to hbbr with our UUID.
-    let requested_relay_server = punch_hole_relay_hint
-        .as_deref()
-        .unwrap_or(&config.relay_server);
-    let relay_addr = match tokio::time::timeout(
-        tokio::time::Duration::from_secs(15),
-        client.request_relay_via_tcp_with_conn_type(
-            &config.peer_id,
-            requested_relay_server,
-            &[],
-            &config.server_key,
-            &session_uuid,
-            conn_type,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(relay_response)) => {
-            if !relay_response.refuse_reason.is_empty() {
-                bail!("relay refused: {}", relay_response.refuse_reason);
+    let relay_addr = if let Some(relay_addr) = punch_hole_relay_hint {
+        eprintln!(
+            "[debug] Phase 2: using relay from PunchHoleResponse, skipping RequestRelay: {}",
+            relay_addr
+        );
+        relay_addr
+    } else {
+        // Fall back to RequestRelay only when PunchHoleResponse times out or
+        // does not provide relay information.
+        let requested_relay_server = &config.relay_server;
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(15),
+            client.request_relay_via_tcp_with_conn_type(
+                &config.peer_id,
+                requested_relay_server,
+                &[],
+                &config.server_key,
+                &session_uuid,
+                conn_type,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(relay_response)) => {
+                if !relay_response.refuse_reason.is_empty() {
+                    bail!("relay refused: {}", relay_response.refuse_reason);
+                }
+                eprintln!(
+                    "[debug] Phase 2: got RelayResponse, relay={:?}",
+                    relay_response.relay_server
+                );
+                if relay_response.relay_server.is_empty() {
+                    config.relay_server.clone()
+                } else {
+                    relay_response.relay_server
+                }
             }
-            eprintln!("[debug] Phase 2: got RelayResponse, relay={:?}", relay_response.relay_server);
-            if relay_response.relay_server.is_empty() {
+            Ok(Err(e)) => {
+                eprintln!("[debug] Phase 2: RequestRelay TCP failed: {e:#}, using default relay");
                 config.relay_server.clone()
-            } else {
-                relay_response.relay_server
             }
-        }
-        Ok(Err(e)) => {
-            eprintln!("[debug] Phase 2: RequestRelay TCP failed: {e:#}, using default relay");
-            config.relay_server.clone()
-        }
-        Err(_) => {
-            eprintln!("[debug] Phase 2: RequestRelay timed out, using default relay");
-            config.relay_server.clone()
+            Err(_) => {
+                eprintln!("[debug] Phase 2: RequestRelay timed out, using default relay");
+                config.relay_server.clone()
+            }
         }
     };
+
+    if received_punch_hole_response {
+        eprintln!(
+            "[debug] Phase 2: waiting {}ms grace period before hbbr connect",
+            PUNCH_HOLE_GRACE_DELAY.as_millis()
+        );
+        tokio::time::sleep(PUNCH_HOLE_GRACE_DELAY).await;
+    }
 
     // Phase 3: Connect to hbbr with the same UUID.
     eprintln!("[debug] Phase 3: connecting to relay {}...", relay_addr);

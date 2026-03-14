@@ -105,10 +105,22 @@ async fn send_action<T: Transport>(
 ///
 /// Skips non-terminal messages (e.g. video frames the server may still send).
 /// Returns `None` if the stream is closed before a terminal message arrives.
+fn terminal_response_timeout_error(timeout_duration: Duration) -> anyhow::Error {
+    anyhow::anyhow!(
+        "timed out waiting for TerminalResponse after {}s",
+        timeout_duration.as_secs_f64()
+    )
+}
+
+pub fn is_terminal_response_timeout(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("timed out waiting for TerminalResponse after")
+}
+
 async fn recv_terminal_response<T: Transport>(
     stream: &mut EncryptedStream<T>,
+    timeout_duration: Duration,
 ) -> Result<terminal_response::Union> {
-    timeout(TERMINAL_RESPONSE_TIMEOUT, async {
+    timeout(timeout_duration, async {
         loop {
             let raw = stream.recv().await.context("reading terminal response")?;
             let msg = Message::decode(raw.as_slice()).context("decoding Message")?;
@@ -124,10 +136,7 @@ async fn recv_terminal_response<T: Transport>(
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!(
-        "timed out waiting for TerminalResponse after {}s",
-        TERMINAL_RESPONSE_TIMEOUT.as_secs()
-    ))?
+    .map_err(|_| terminal_response_timeout_error(timeout_duration))?
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +159,7 @@ pub async fn connect_terminal(config: &ConnectionConfig) -> Result<TerminalConne
 
     let terminal_info = match timeout(
         INITIAL_TERMINAL_OPENED_PROBE_TIMEOUT,
-        recv_terminal_response(&mut encrypted),
+        recv_terminal_response(&mut encrypted, TERMINAL_RESPONSE_TIMEOUT),
     )
     .await
     {
@@ -267,7 +276,10 @@ pub async fn open_terminal<T: Transport>(
     .context("sending OpenTerminal")?;
 
     // Wait for TerminalOpened.
-    let resp = timeout(OPEN_TERMINAL_TIMEOUT, recv_terminal_response(stream))
+    let resp = timeout(
+        OPEN_TERMINAL_TIMEOUT,
+        recv_terminal_response(stream, TERMINAL_RESPONSE_TIMEOUT),
+    )
         .await
         .map_err(|_| anyhow::anyhow!(
             "timed out waiting for TerminalOpened after {}s",
@@ -320,7 +332,14 @@ pub async fn send_terminal_data<T: Transport>(
 pub async fn recv_terminal_data<T: Transport>(
     stream: &mut EncryptedStream<T>,
 ) -> Result<TerminalEvent> {
-    let resp = recv_terminal_response(stream)
+    recv_terminal_data_with_timeout(stream, TERMINAL_RESPONSE_TIMEOUT).await
+}
+
+pub async fn recv_terminal_data_with_timeout<T: Transport>(
+    stream: &mut EncryptedStream<T>,
+    timeout_duration: Duration,
+) -> Result<TerminalEvent> {
+    let resp = recv_terminal_response(stream, timeout_duration)
         .await
         .context("receiving terminal data")?;
 

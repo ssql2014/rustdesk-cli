@@ -915,16 +915,11 @@ async fn exec_command(
 
     // 2. Drain initial prompt/banner with idle timeout.
     loop {
-        match tokio::time::timeout(
-            EXEC_PROMPT_DRAIN_TIMEOUT,
-            terminal::recv_terminal_data(encrypted),
-        )
-        .await
-        {
-            Ok(Ok(TerminalEvent::Data(_))) => {
+        match terminal::recv_terminal_data_with_timeout(encrypted, EXEC_PROMPT_DRAIN_TIMEOUT).await {
+            Ok(TerminalEvent::Data(_)) => {
                 // Keep draining.
             }
-            Ok(Ok(TerminalEvent::Closed { exit_code })) => {
+            Ok(TerminalEvent::Closed { exit_code }) => {
                 return Ok(SessionResponse::ok_with_data(
                     "Terminal closed before exec",
                     serde_json::json!({
@@ -936,15 +931,17 @@ async fn exec_command(
                     }),
                 ));
             }
-            Ok(Ok(TerminalEvent::Error(msg))) => {
+            Ok(TerminalEvent::Error(msg)) => {
                 let _ = terminal::close_terminal(encrypted, tid).await;
                 anyhow::bail!("terminal error during prompt drain: {msg}");
             }
-            Ok(Err(e)) => {
+            Err(e) if terminal::is_terminal_response_timeout(&e) => {
+                break; // Idle timeout — prompt fully drained.
+            }
+            Err(e) => {
                 let _ = terminal::close_terminal(encrypted, tid).await;
                 anyhow::bail!("recv error during prompt drain: {e:#}");
             }
-            Err(_) => break, // Idle timeout — prompt fully drained.
         }
     }
 
@@ -966,20 +963,15 @@ async fn exec_command(
             break;
         }
 
-        match tokio::time::timeout(
-            remaining,
-            terminal::recv_terminal_data(encrypted),
-        )
-        .await
-        {
-            Ok(Ok(TerminalEvent::Data(data))) => {
+        match terminal::recv_terminal_data_with_timeout(encrypted, remaining).await {
+            Ok(TerminalEvent::Data(data)) => {
                 collected.extend_from_slice(&data);
                 // Check if sentinel output has appeared.
                 if find_sentinel_output(&String::from_utf8_lossy(&collected), &sentinel).is_some() {
                     break;
                 }
             }
-            Ok(Ok(TerminalEvent::Closed { exit_code })) => {
+            Ok(TerminalEvent::Closed { exit_code }) => {
                 // Terminal closed before sentinel — return partial output.
                 let stdout = String::from_utf8_lossy(&collected).trim().to_string();
                 let _ = terminal::close_terminal(encrypted, tid).await;
@@ -994,17 +986,17 @@ async fn exec_command(
                     }),
                 ));
             }
-            Ok(Ok(TerminalEvent::Error(msg))) => {
+            Ok(TerminalEvent::Error(msg)) => {
                 let _ = terminal::close_terminal(encrypted, tid).await;
                 anyhow::bail!("terminal error during exec: {msg}");
             }
-            Ok(Err(e)) => {
-                let _ = terminal::close_terminal(encrypted, tid).await;
-                anyhow::bail!("recv error during exec: {e:#}");
-            }
-            Err(_) => {
+            Err(e) if terminal::is_terminal_response_timeout(&e) => {
                 timed_out = true;
                 break;
+            }
+            Err(e) => {
+                let _ = terminal::close_terminal(encrypted, tid).await;
+                anyhow::bail!("recv error during exec: {e:#}");
             }
         }
     }

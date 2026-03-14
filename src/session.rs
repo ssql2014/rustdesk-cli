@@ -53,6 +53,7 @@ pub enum SessionCommand {
     Shell,
     Exec {
         command: String,
+        timeout: Option<u64>,
     },
     ClipboardGet,
     ClipboardSet {
@@ -192,7 +193,7 @@ impl Session {
                 ))
             }
 
-            SessionCommand::Exec { command } => {
+            SessionCommand::Exec { command, .. } => {
                 self.require_connected()?;
                 Ok((
                     SessionResponse::ok_with_data(
@@ -520,6 +521,7 @@ mod tests {
         let (response, messages) = session
             .dispatch(SessionCommand::Exec {
                 command: "whoami".to_string(),
+                timeout: Some(30),
             })
             .expect("exec should succeed");
 
@@ -762,6 +764,7 @@ mod tests {
             SessionCommand::Shell,
             SessionCommand::Exec {
                 command: "pwd".to_string(),
+                timeout: None,
             },
             SessionCommand::ClipboardGet,
             SessionCommand::ClipboardSet {

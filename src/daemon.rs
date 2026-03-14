@@ -41,7 +41,7 @@ const ERROR_PATH: &str = "/tmp/rustdesk-cli.error";
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const EXEC_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const EXEC_PROMPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-const EXEC_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_EXEC_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 const SHELL_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45); // 1.5× 30s keep_alive (§29)
@@ -556,7 +556,9 @@ async fn execute_daemon_command(
     cmd: SessionCommand,
 ) -> Result<SessionResponse> {
     match cmd {
-        SessionCommand::Exec { command } => exec_command(encrypted, &command).await,
+        SessionCommand::Exec { command, timeout } => {
+            exec_command(encrypted, &command, timeout).await
+        }
         SessionCommand::ClipboardGet => clipboard_get(encrypted).await,
         SessionCommand::ClipboardSet { text } => clipboard_set(encrypted, &text).await,
         SessionCommand::Capture {
@@ -895,6 +897,7 @@ fn is_keepalive_expired(last_peer_msg: Instant, timeout: Duration) -> bool {
 async fn exec_command(
     encrypted: &mut EncryptedStream<TcpTransport>,
     command: &str,
+    timeout_secs: Option<u64>,
 ) -> Result<SessionResponse> {
     // Generate unique sentinel marker using timestamp nanos.
     let sentinel_id = std::time::SystemTime::now()
@@ -954,7 +957,10 @@ async fn exec_command(
     // 4. Collect output until sentinel appears or completion timeout.
     let mut collected = Vec::new();
     let mut timed_out = false;
-    let deadline = tokio::time::Instant::now() + EXEC_COMPLETION_TIMEOUT;
+    let completion_timeout = timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_EXEC_COMPLETION_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + completion_timeout;
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1101,7 +1107,7 @@ async fn clipboard_get(
     encrypted: &mut EncryptedStream<TcpTransport>,
 ) -> Result<SessionResponse> {
     let cmd = "xclip -selection clipboard -o 2>/dev/null || pbpaste 2>/dev/null || echo -n ''";
-    let exec_resp = exec_command(encrypted, cmd).await?;
+    let exec_resp = exec_command(encrypted, cmd, None).await?;
 
     // Extract stdout from exec response to reshape into clipboard contract.
     let text = exec_resp
@@ -1132,7 +1138,7 @@ async fn clipboard_set(
          cat <<'__RDCLI_CLIP_EOF__' | pbcopy 2>/dev/null\n\
          {text}\n__RDCLI_CLIP_EOF__"
     );
-    exec_command(encrypted, &cmd).await?;
+    exec_command(encrypted, &cmd, None).await?;
 
     Ok(SessionResponse::ok_with_data(
         "Clipboard text updated",

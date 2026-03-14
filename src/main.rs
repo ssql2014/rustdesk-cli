@@ -89,6 +89,9 @@ enum Commands {
         /// Command to execute remotely
         #[arg(long)]
         command: String,
+        /// Maximum time to wait for command completion in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
     },
     /// Get or set remote clipboard text
     Clipboard {
@@ -540,8 +543,9 @@ fn run() -> i32 {
                 ),
             ),
         },
-        Commands::Exec { command } => match send_to_daemon(&SessionCommand::Exec {
+        Commands::Exec { command, timeout } => match send_to_daemon(&SessionCommand::Exec {
             command: command.clone(),
+            timeout: Some(timeout),
         }) {
             Ok(resp) if resp.success => {
                 let data = resp.data.unwrap_or_else(|| json!({}));

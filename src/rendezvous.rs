@@ -749,8 +749,6 @@ mod tests {
 
     #[tokio::test]
     async fn request_relay_via_tcp_sends_over_tcp_and_returns_response() -> Result<()> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         // Bind both a UDP server (for RendezvousClient::connect) and a TCP
         // server (for the actual RequestRelay exchange) on the same port.
         // We use port 0 twice — the OS assigns different ephemeral ports, so

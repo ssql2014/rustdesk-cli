@@ -20,7 +20,7 @@ use crate::proto::hbb::{
     PublicKey, PunchHoleResponse, SupportedDecoding, login_request, login_response,
     message, option_message, punch_hole_response,
 };
-use crate::rendezvous::RendezvousClient;
+use crate::rendezvous::{PunchRelayResponse, RendezvousClient};
 use crate::transport::{TcpTransport, Transport};
 
 // ---------------------------------------------------------------------------
@@ -110,23 +110,38 @@ pub(crate) async fn connect_with_mode(
     // hbbs (so hbbs can forward to the peer) and hbbr (to bind the relay).
     let mut uuid_bytes = [0_u8; 16];
     OsRng.fill_bytes(&mut uuid_bytes);
-    let session_uuid: String = uuid_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    eprintln!("[debug] Phase 2: sending PunchHole (uuid={})...", &session_uuid[..8]);
+    let client_uuid: String = uuid_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    eprintln!("[debug] Phase 2: sending PunchHole (client_uuid={})...", &client_uuid[..8]);
 
-    let mut received_punch_hole_response = false;
+    let mut received_rendezvous_response = false;
+    let mut peer_relay_uuid: Option<String> = None;
     let punch_hole_relay_hint = match timeout(
         PUNCH_HOLE_RESPONSE_TIMEOUT,
-        client.punch_hole_with_conn_type(&config.peer_id, &config.server_key, conn_type),
+        client.punch_hole_or_relay_with_conn_type(&config.peer_id, &config.server_key, conn_type),
     )
     .await
     {
-        Ok(Ok(resp)) => {
-            received_punch_hole_response = true;
+        Ok(Ok(PunchRelayResponse::PunchHole(resp))) => {
+            received_rendezvous_response = true;
             check_punch_hole_failure(&resp)?;
             if !resp.relay_server.is_empty() {
                 Some(resp.relay_server)
             } else {
                 None
+            }
+        }
+        Ok(Ok(PunchRelayResponse::Relay(resp))) => {
+            received_rendezvous_response = true;
+            if !resp.refuse_reason.is_empty() {
+                bail!("relay refused: {}", resp.refuse_reason);
+            }
+            if !resp.uuid.is_empty() {
+                peer_relay_uuid = Some(resp.uuid);
+            }
+            if !resp.relay_server.is_empty() {
+                Some(resp.relay_server)
+            } else {
+                Some(config.relay_server.clone())
             }
         }
         Ok(Err(e)) => {
@@ -144,7 +159,7 @@ pub(crate) async fn connect_with_mode(
 
     let relay_addr = if let Some(relay_addr) = punch_hole_relay_hint {
         eprintln!(
-            "[debug] Phase 2: using relay from PunchHoleResponse, skipping RequestRelay: {}",
+            "[debug] Phase 2: using relay from rendezvous response, skipping RequestRelay: {}",
             relay_addr
         );
         relay_addr
@@ -190,7 +205,9 @@ pub(crate) async fn connect_with_mode(
         }
     };
 
-    if received_punch_hole_response {
+    let relay_uuid = peer_relay_uuid.unwrap_or(client_uuid);
+
+    if received_rendezvous_response {
         eprintln!(
             "[debug] Phase 2: waiting {}ms grace period before hbbr connect",
             PUNCH_HOLE_GRACE_DELAY.as_millis()
@@ -199,13 +216,16 @@ pub(crate) async fn connect_with_mode(
     }
 
     // Phase 3: Connect to hbbr with the same UUID.
-    eprintln!("[debug] Phase 3: connecting to relay {}...", relay_addr);
+    eprintln!(
+        "[debug] Phase 3: connecting to relay {} with uuid {}...",
+        relay_addr,
+        &relay_uuid[..relay_uuid.len().min(8)]
+    );
     let transport = relay_connect_with_type(
         &relay_addr,
-        &session_uuid,
+        &relay_uuid,
         &config.peer_id,
         &config.server_key,
-        conn_type,
     )
     .await?;
     eprintln!("[debug] Phase 3: relay bound, waiting for peer handshake...");
@@ -286,7 +306,6 @@ async fn relay_connect_with_type(
     uuid: &str,
     peer_id: &str,
     licence_key: &str,
-    conn_type: ConnType,
 ) -> Result<TcpTransport> {
     let mut transport = TcpTransport::connect(relay_addr)
         .await
@@ -302,7 +321,7 @@ async fn relay_connect_with_type(
                 relay_server: String::new(),
                 secure: true,
                 licence_key: licence_key.to_string(),
-                conn_type: conn_type as i32,
+                conn_type: ConnType::DefaultConn as i32,
                 token: String::new(),
                 control_permissions: None,
             },

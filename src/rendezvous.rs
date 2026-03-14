@@ -21,6 +21,11 @@ pub struct RendezvousClient {
     server_addr: String,
 }
 
+pub enum PunchRelayResponse {
+    PunchHole(PunchHoleResponse),
+    Relay(RelayResponse),
+}
+
 impl RendezvousClient {
     pub async fn connect(server_addr: &str) -> Result<Self> {
         let bind_addr = if server_addr.contains('[') { "[::]:0" } else { "0.0.0.0:0" };
@@ -106,6 +111,23 @@ impl RendezvousClient {
         licence_key: &str,
         conn_type: ConnType,
     ) -> Result<PunchHoleResponse> {
+        match self
+            .punch_hole_or_relay_with_conn_type(target_id, licence_key, conn_type)
+            .await?
+        {
+            PunchRelayResponse::PunchHole(response) => Ok(response),
+            PunchRelayResponse::Relay(response) => {
+                bail!("unexpected RelayResponse to PunchHoleRequest: {response:?}")
+            }
+        }
+    }
+
+    pub async fn punch_hole_or_relay_with_conn_type(
+        &self,
+        target_id: &str,
+        licence_key: &str,
+        conn_type: ConnType,
+    ) -> Result<PunchRelayResponse> {
         let udp_port = self.socket.local_addr()?.port() as i32;
         let request = RendezvousMessage {
             union: Some(rendezvous_message::Union::PunchHoleRequest(PunchHoleRequest {
@@ -123,7 +145,12 @@ impl RendezvousClient {
         };
 
         match self.send_request(&request).await?.union {
-            Some(rendezvous_message::Union::PunchHoleResponse(response)) => Ok(response),
+            Some(rendezvous_message::Union::PunchHoleResponse(response)) => {
+                Ok(PunchRelayResponse::PunchHole(response))
+            }
+            Some(rendezvous_message::Union::RelayResponse(response)) => {
+                Ok(PunchRelayResponse::Relay(response))
+            }
             other => bail!("unexpected rendezvous response to PunchHoleRequest: {other:?}"),
         }
     }

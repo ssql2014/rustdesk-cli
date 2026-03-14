@@ -1,61 +1,40 @@
 # Findings & Decisions
 
-## Requirements
-- Read `docs/research/terminal_proto_additions.md` and `docs/research/post_login_protocol.md`.
-- Reuse the existing connection flow from `src/connection.rs` for a terminal-specific connect path.
-- Use `ConnType::TERMINAL` in the rendezvous/relay flow.
-- Send `LoginRequest` with the terminal union set.
-- After `LoginResponse`, send `TerminalAction(OpenTerminal)`.
-- Stream local stdin to `TerminalAction::Data` and terminal output back to stdout.
-- Wire the new mode into `src/main.rs`.
-- Verify with `cargo build`.
-
 ## Research Findings
-- `proto/rendezvous.proto` defines `ConnType::TERMINAL = 5`.
-- `proto/message.proto` defines:
-  - `LoginRequest.union.terminal`
-  - `Message.union.terminal_action`
-  - `Message.union.terminal_response`
-  - `OpenTerminal { terminal_id, rows, cols }`
-  - `TerminalData { terminal_id, data, compressed }`
-- `src/terminal.rs` already contains tested helpers for:
-  - sending `TerminalAction`
-  - waiting for `TerminalOpened`
-  - sending `TerminalData`
-  - decoding `TerminalResponse::Data`, `Closed`, and `Error`
-- `src/connection.rs` currently hard-codes desktop/default mode in three places:
-  - UDP `PunchHoleRequest.conn_type`
-  - TCP `RequestRelay.conn_type`
-  - `LoginRequest.union` is always `None`
-- `src/main.rs` currently exposes an existing daemon-backed `shell` command, but there is no direct terminal-mode connection path.
-- The implemented shape is `rustdesk-cli connect <peer-id> --terminal ...` rather than replacing the existing daemon-backed `shell` command.
-- Terminal mode now reuses the shared connection path with:
-  - `ConnType::Terminal` in PunchHole, RequestRelay-over-TCP, and relay binding
-  - `LoginRequest.union = Terminal { service_id: "" }`
-  - `open_terminal()` immediately after `LoginResponse`
-  - a byte-streaming stdin/stdout loop in `src/terminal.rs`
+- `hbbs` may send a TCP `RendezvousMessage::KeyExchange` before accepting functional requests.
+- The required handshake is:
+  1. connect raw TCP
+  2. receive `KeyExchange` with server Ed25519 public key
+  3. generate random 32-byte symmetric key
+  4. sealed-box that key to the server public key
+  5. send `KeyExchange` response with the sealed box
+  6. switch to an encrypted stream
+  7. send `PunchHoleRequest` over that encrypted stream
 
-## Technical Decisions
-| Decision | Rationale |
-|----------|-----------|
-| Generalize the connection flow with a configurable mode | Needed to keep desktop and terminal login behavior aligned |
-| Reuse `src/terminal.rs` for protocol framing and add session orchestration there | Keeps terminal-specific behavior in one module |
-| Expose terminal mode on the connect path rather than replacing daemon shell support | Avoids breaking the current `shell` workflow while adding the requested direct terminal session |
-| Reject `--json` with `connect --terminal` | Interactive stdout streaming and JSON output are incompatible on the same stdout channel |
+## Existing Code Findings
+- `src/rendezvous.rs` `punch_hole_via_tcp_with_conn_type()` currently:
+  - opens raw TCP
+  - sends plaintext `PunchHoleRequest`
+  - reads framed `RendezvousMessage`s
+  - only accepts `PunchHoleResponse`, `RelayResponse`, and `RegisterPeerResponse`
+- `src/rendezvous.rs` `request_relay_via_tcp_with_conn_type()` also assumes plaintext `RelayResponse`.
+- `src/connection.rs` expects `punch_hole_via_tcp_with_conn_type()` to hide the transport details and return only logical rendezvous results.
 
-## Issues Encountered
-| Issue | Resolution |
-|-------|------------|
-| The repo already has `src/terminal.rs`, despite the request saying to create it | Reused and extended the existing file instead of duplicating terminal logic |
+## Crypto / Transport Findings
+- `Cargo.toml` already depends on `crypto_box = 0.9`, and the installed crate exposes `PublicKey::seal`, which implements `crypto_box_seal`.
+- The repo already has `TcpTransport::new(TcpStream)` and BytesCodec framing, so the same framing can be preserved after handshake.
+- The existing `crate::crypto::EncryptedStream` is not a direct fit:
+  - it uses `XSalsa20-Poly1305`
+  - the new research explicitly calls for `ChaCha20-Poly1305`
 
-## Resources
-- `docs/research/terminal_proto_additions.md`
-- `docs/research/post_login_protocol.md`
-- `proto/message.proto`
-- `proto/rendezvous.proto`
-- `src/connection.rs`
-- `src/terminal.rs`
-- `src/main.rs`
+## Likely Implementation Direction
+- Add a small encrypted transport wrapper local to rendezvous TCP, or add a generic ChaCha20-Poly1305 encrypted framed transport helper.
+- Keep the handshake internal to `punch_hole_via_tcp_with_conn_type()` so callers do not need API changes.
+- Add a TCP rendezvous test that simulates:
+  - server sends `KeyExchange`
+  - client responds with sealed key
+  - subsequent encrypted request is a `PunchHoleRequest`
+  - server replies with encrypted `RelayResponse` or `PunchHoleResponse`
 
 ## Visual/Browser Findings
 - None.

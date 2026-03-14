@@ -336,7 +336,7 @@ async fn handshake_and_auth(
     // Step 7: Send LoginRequest — encrypted.
     let login_req = Message {
         union: Some(message::Union::LoginRequest(LoginRequest {
-            username: String::new(),
+            username: my_id.to_string(),
             password: pw_hash.to_vec(),
             my_id: my_id.to_string(),
             my_name: "rustdesk-cli".to_string(),
@@ -345,7 +345,10 @@ async fn handshake_and_auth(
             session_id: rand_session_id(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             os_login: None,
-            my_platform: std::env::consts::OS.to_string(),
+            my_platform: match std::env::consts::OS {
+                "macos" => "macOS".to_string(),
+                os => os.to_string(),
+            },
             hwid: Vec::new(),
             avatar: String::new(),
             union: None,

@@ -46,6 +46,7 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const EXEC_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const EXEC_PROMPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_EXEC_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_EXEC_COMPLETION_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHELL_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(90); // 1.5× 60s keep_alive
@@ -1195,9 +1196,7 @@ async fn exec_command(
     // 4. Collect output until sentinel appears or completion timeout.
     let mut collected = Vec::new();
     let mut timed_out = false;
-    let completion_timeout = timeout_secs
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_EXEC_COMPLETION_TIMEOUT);
+    let completion_timeout = exec_completion_timeout(timeout_secs);
     let deadline = tokio::time::Instant::now() + completion_timeout;
 
     loop {
@@ -1262,6 +1261,13 @@ async fn exec_command(
             "timed_out": timed_out,
         }),
     ))
+}
+
+fn exec_completion_timeout(timeout_secs: Option<u64>) -> Duration {
+    match timeout_secs {
+        Some(secs) => Duration::from_secs(secs).min(MAX_EXEC_COMPLETION_TIMEOUT),
+        None => DEFAULT_EXEC_COMPLETION_TIMEOUT,
+    }
 }
 
 /// Find the sentinel output line (sentinel followed by digit(s) = exit code).
@@ -2079,6 +2085,16 @@ mod tests {
         let timeout = Duration::from_secs(10);
         assert!(is_keepalive_expired(Duration::from_secs(11), timeout));
         assert!(!is_keepalive_expired(Duration::from_secs(5), timeout));
+    }
+
+    #[test]
+    fn exec_completion_timeout_uses_override_and_caps_at_max() {
+        assert_eq!(exec_completion_timeout(None), DEFAULT_EXEC_COMPLETION_TIMEOUT);
+        assert_eq!(exec_completion_timeout(Some(123)), Duration::from_secs(123));
+        assert_eq!(
+            exec_completion_timeout(Some(7200)),
+            MAX_EXEC_COMPLETION_TIMEOUT
+        );
     }
 
     #[test]

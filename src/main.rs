@@ -47,6 +47,8 @@ const EXIT_PERMISSION: i32 = 4;
 
 const DEFAULT_WIDTH: i32 = 1920;
 const DEFAULT_HEIGHT: i32 = 1080;
+const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 30;
+const MAX_EXEC_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Parser)]
 #[command(name = "rustdesk-cli")]
@@ -110,7 +112,11 @@ enum Commands {
         #[arg(long)]
         command: String,
         /// Maximum time to wait for command completion in seconds
-        #[arg(long, default_value_t = 30)]
+        #[arg(
+            long,
+            default_value_t = DEFAULT_EXEC_TIMEOUT_SECS,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_EXEC_TIMEOUT_SECS)
+        )]
         timeout: u64,
         /// Peer ID for a direct one-shot exec without the daemon
         #[arg(long)]
@@ -744,10 +750,7 @@ fn run() -> i32 {
                 };
             }
 
-            match send_to_daemon(&SessionCommand::Exec {
-                command: command.clone(),
-                timeout: Some(timeout),
-            }) {
+            match send_to_daemon(&build_exec_session_command(command.clone(), timeout)) {
                 Ok(resp) if resp.success => {
                     let data = resp.data.unwrap_or_else(|| json!({}));
                     let stdout = data
@@ -1420,6 +1423,17 @@ fn send_to_daemon_streaming(
     last_response.ok_or_else(|| anyhow::anyhow!("daemon closed without sending a response"))
 }
 
+fn build_exec_session_command(command: String, timeout: u64) -> SessionCommand {
+    SessionCommand::Exec {
+        command,
+        timeout: Some(timeout),
+    }
+}
+
+fn exec_timeout_duration(timeout_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(timeout_secs.min(MAX_EXEC_TIMEOUT_SECS))
+}
+
 fn direct_push(
     peer_id: &str,
     password: Option<&str>,
@@ -1504,8 +1518,9 @@ fn direct_exec(
     );
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
+        let timeout_duration = exec_timeout_duration(timeout_secs);
         let connection = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
+            timeout_duration,
             connection::connect_with_mode(
                 &config,
                 crate::proto::hbb::ConnType::Terminal,
@@ -1559,7 +1574,7 @@ fn direct_exec(
         let wrapped = format!("{command}\necho '{sentinel}'$?\n");
         crate::terminal::send_terminal_data(&mut encrypted, tid, wrapped.as_bytes()).await?;
 
-        let completion_timeout = std::time::Duration::from_secs(timeout_secs);
+        let completion_timeout = timeout_duration;
         let deadline = tokio::time::Instant::now() + completion_timeout;
         let mut collected = Vec::new();
         let mut timed_out = false;
@@ -2572,4 +2587,53 @@ fn parse_modifier_list(value: &str) -> Vec<Modifier> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_timeout_is_parsed_and_passed_to_session_command() {
+        let cli = Cli::try_parse_from([
+            "rustdesk-cli",
+            "exec",
+            "--command",
+            "whoami",
+            "--timeout",
+            "123",
+        ])
+        .expect("exec cli should parse");
+
+        let (command, timeout) = match cli.command {
+            Commands::Exec {
+                command, timeout, ..
+            } => (command, timeout),
+            _ => panic!("expected exec command"),
+        };
+
+        assert_eq!(timeout, 123);
+        match build_exec_session_command(command, timeout) {
+            SessionCommand::Exec { command, timeout } => {
+                assert_eq!(command, "whoami");
+                assert_eq!(timeout, Some(123));
+            }
+            other => panic!("expected SessionCommand::Exec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_timeout_rejects_values_above_max() {
+        let result = Cli::try_parse_from([
+            "rustdesk-cli",
+            "exec",
+            "--command",
+            "whoami",
+            "--timeout",
+            "3601",
+        ]);
+        let err = result.err().expect("timeout above max should fail");
+
+        assert!(err.to_string().contains("3600"));
+    }
 }

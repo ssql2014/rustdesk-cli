@@ -25,8 +25,8 @@ use crate::capture;
 use crate::connection::{self, ConnectionConfig};
 use crate::crypto::EncryptedStream;
 use crate::proto::hbb::{
-    CaptureDisplays, ImageQuality, Message, Misc, OptionMessage, SupportedDecoding, TestDelay,
-    message, misc, option_message,
+    CaptureDisplays, ConnType, ImageQuality, Message, Misc, OptionMessage,
+    SupportedDecoding, TestDelay, login_request, message, misc, option_message,
 };
 use crate::protocol::DisplayInfo;
 use crate::session::{
@@ -51,6 +51,22 @@ const RECONNECT_BACKOFFS: [Duration; RECONNECT_MAX_ATTEMPTS] = [
     Duration::from_secs(2),
     Duration::from_secs(4),
 ];
+
+fn conn_type_for_command(cmd: &SessionCommand) -> ConnType {
+    match cmd {
+        SessionCommand::Shell | SessionCommand::Exec { .. } => ConnType::Terminal,
+        _ => ConnType::DefaultConn,
+    }
+}
+
+fn login_union_for_conn_type(conn_type: ConnType) -> Option<login_request::Union> {
+    match conn_type {
+        ConnType::Terminal => Some(login_request::Union::Terminal(crate::proto::hbb::Terminal {
+            service_id: String::new(),
+        })),
+        _ => None,
+    }
+}
 
 /// Lock file contents — written by the daemon, read by the CLI.
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,7 +240,8 @@ pub async fn run_daemon(
     // Timeout prevents hanging on unreachable servers or bad credentials.
     let timeout_secs = connect_timeout.unwrap_or(30);
     let idle_timeout = Duration::from_secs(timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT.as_secs()));
-    let conn_result = match connect_with_timeout(&config, timeout_secs).await {
+    let mut active_conn_type = ConnType::DefaultConn;
+    let conn_result = match connect_with_timeout(&config, timeout_secs, active_conn_type).await {
         Ok(r) => r,
         Err(ConnectWithTimeoutError::Connect(e)) => {
             let message = format!("{e:#}");
@@ -251,18 +268,8 @@ pub async fn run_daemon(
     let mut encrypted = conn_result.encrypted;
     let peer_info = conn_result.peer_info;
 
-    // Send OptionMessage: disable audio/camera, enable terminal persistence,
-    // keep clipboard enabled, low image quality for text-mode.
-    if let Err(e) = send_option_message(&mut encrypted).await {
-        eprintln!("daemon: failed to send OptionMessage: {e:#}");
-        let _ = encrypted.close().await;
-        cleanup();
-        return Ok(());
-    }
-
-    // Session init (§29): CaptureDisplays + refresh_video.
-    if let Err(e) = send_session_init(&mut encrypted).await {
-        eprintln!("daemon: failed to send session init: {e:#}");
+    if let Err(e) = initialize_stream_for_mode(&mut encrypted, active_conn_type).await {
+        eprintln!("daemon: failed to initialize connection stream: {e:#}");
         let _ = encrypted.close().await;
         cleanup();
         return Ok(());
@@ -342,7 +349,7 @@ pub async fn run_daemon(
             DaemonEvent::PeerMessage(Err(e)) => {
                 eprintln!("daemon: peer connection error: {e:#}");
                 // Connection lost — attempt reconnect.
-                match reconnect_encrypted_stream(&config, &mut session, |resp| {
+                match reconnect_encrypted_stream(&config, &mut session, active_conn_type, |resp| {
                     eprintln!(
                         "daemon: {}",
                         resp.message.as_deref().unwrap_or("reconnecting...")
@@ -353,10 +360,6 @@ pub async fn run_daemon(
                     Ok(new_conn) => {
                         encrypted = new_conn.encrypted;
                         last_peer_msg = Instant::now();
-                        // Re-send session init after reconnect.
-                        if let Err(e) = send_session_init(&mut encrypted).await {
-                            eprintln!("daemon: failed to re-send session init: {e:#}");
-                        }
                     }
                     Err(reconnect_err) => {
                         graceful_shutdown(&mut encrypted).await?;
@@ -371,7 +374,7 @@ pub async fn run_daemon(
                         "daemon: keepalive timeout — no message from peer in {:.0}s, reconnecting",
                         last_peer_msg.elapsed().as_secs_f64()
                     );
-                    match reconnect_encrypted_stream(&config, &mut session, |resp| {
+                    match reconnect_encrypted_stream(&config, &mut session, active_conn_type, |resp| {
                         eprintln!(
                             "daemon: {}",
                             resp.message.as_deref().unwrap_or("reconnecting...")
@@ -382,9 +385,6 @@ pub async fn run_daemon(
                         Ok(new_conn) => {
                             encrypted = new_conn.encrypted;
                             last_peer_msg = Instant::now();
-                            if let Err(e) = send_session_init(&mut encrypted).await {
-                                eprintln!("daemon: failed to re-send session init: {e:#}");
-                            }
                         }
                         Err(reconnect_err) => {
                             graceful_shutdown(&mut encrypted).await?;
@@ -415,6 +415,29 @@ pub async fn run_daemon(
                 };
 
                 let is_disconnect = matches!(cmd, SessionCommand::Disconnect);
+                let desired_conn_type = conn_type_for_command(&cmd);
+
+                if desired_conn_type != active_conn_type {
+                    match reconnect_encrypted_stream(&config, &mut session, desired_conn_type, |resp| {
+                        eprintln!(
+                            "daemon: {}",
+                            resp.message.as_deref().unwrap_or("reconnecting...")
+                        );
+                    })
+                    .await
+                    {
+                        Ok(new_conn) => {
+                            encrypted = new_conn.encrypted;
+                            active_conn_type = desired_conn_type;
+                            last_peer_msg = Instant::now();
+                        }
+                        Err(reconnect_err) => {
+                            let resp = SessionResponse::error(format!("{reconnect_err:#}"));
+                            let _ = send_response(&mut writer, &resp).await;
+                            continue;
+                        }
+                    }
+                }
 
                 // Shell takes over the UDS connection for bidirectional streaming.
                 // The ack response is sent inside shell_session; on return we
@@ -423,7 +446,7 @@ pub async fn run_daemon(
                     if let Err(e) = shell_session(&mut encrypted, buf_reader, writer).await {
                         eprintln!("daemon: shell session error: {e:#}");
                         if should_reconnect(&e) {
-                            match reconnect_encrypted_stream(&config, &mut session, |resp| {
+                            match reconnect_encrypted_stream(&config, &mut session, active_conn_type, |resp| {
                                 eprintln!(
                                     "daemon: {}",
                                     resp.message.as_deref().unwrap_or("reconnecting...")
@@ -433,6 +456,7 @@ pub async fn run_daemon(
                             {
                                 Ok(new_conn) => {
                                     encrypted = new_conn.encrypted;
+                                    last_peer_msg = Instant::now();
                                 }
                                 Err(reconnect_err) => {
                                     graceful_shutdown(&mut encrypted).await?;
@@ -450,12 +474,18 @@ pub async fn run_daemon(
                         if !should_reconnect(&command_err) {
                             SessionResponse::error(format!("{command_err:#}"))
                         } else {
-                        let reconnect_result = reconnect_encrypted_stream(&config, &mut session, |_resp| {})
+                        let reconnect_result = reconnect_encrypted_stream(
+                            &config,
+                            &mut session,
+                            active_conn_type,
+                            |_resp| {},
+                        )
                             .await;
 
                         match reconnect_result {
                             Ok(new_conn) => {
                                 encrypted = new_conn.encrypted;
+                                last_peer_msg = Instant::now();
                                 match execute_daemon_command(&mut encrypted, &mut session, cmd).await {
                                     Ok(resp) => resp,
                                     Err(retry_err) => SessionResponse::error(format!(
@@ -504,10 +534,11 @@ pub async fn run_daemon(
 async fn connect_with_timeout(
     config: &ConnectionConfig,
     timeout_secs: u64,
+    conn_type: ConnType,
 ) -> std::result::Result<connection::ConnectionResult, ConnectWithTimeoutError> {
     tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        connection::connect(config),
+        connection::connect_with_mode(config, conn_type, login_union_for_conn_type(conn_type)),
     )
     .await
     .map_err(|_| ConnectWithTimeoutError::TimedOut(timeout_secs))?
@@ -615,14 +646,19 @@ where
 async fn reconnect_encrypted_stream<N>(
     config: &ConnectionConfig,
     session: &mut Session,
+    conn_type: ConnType,
     notify: N,
 ) -> Result<connection::ConnectionResult>
 where
     N: FnMut(&SessionResponse),
 {
-    let conn = reconnect_with_retry(|| connection::connect(config), notify).await?;
+    let conn = reconnect_with_retry(
+        || connection::connect_with_mode(config, conn_type, login_union_for_conn_type(conn_type)),
+        notify,
+    )
+    .await?;
     let mut encrypted = conn.encrypted;
-    send_option_message(&mut encrypted).await?;
+    initialize_stream_for_mode(&mut encrypted, conn_type).await?;
 
     session.state = ConnectionState::Connected;
     session.peer_info = Some(PeerInfoState {
@@ -649,6 +685,17 @@ where
         peer_info: conn.peer_info,
         encrypted,
     })
+}
+
+async fn initialize_stream_for_mode(
+    encrypted: &mut EncryptedStream<TcpTransport>,
+    conn_type: ConnType,
+) -> Result<()> {
+    if conn_type == ConnType::DefaultConn {
+        send_option_message(encrypted).await?;
+        send_session_init(encrypted).await?;
+    }
+    Ok(())
 }
 
 fn should_reconnect(err: &anyhow::Error) -> bool {

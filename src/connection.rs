@@ -62,8 +62,6 @@ pub struct ConnectionResult {
 /// 4. NaCl key exchange + password authentication
 /// 5. Returns PeerInfo + encrypted stream
 pub async fn connect(config: &ConnectionConfig) -> Result<ConnectionResult> {
-    let server_pk = decode_server_key(&config.server_key)?;
-
     // Phase 1: Register with hbbs and start heartbeat.
     eprintln!("[debug] Phase 1: registering with hbbs...");
     let client = RendezvousClient::connect(&config.id_server)
@@ -158,7 +156,6 @@ pub async fn connect(config: &ConnectionConfig) -> Result<ConnectionResult> {
     // Phase 4: NaCl handshake + authentication.
     let result = handshake_and_auth(
         transport,
-        &server_pk,
         &config.password,
         &config.peer_id,
         &my_id,
@@ -261,7 +258,6 @@ async fn relay_connect(relay_addr: &str, uuid: &str, peer_id: &str, licence_key:
 /// Takes ownership of the transport.
 async fn handshake_and_auth(
     mut transport: TcpTransport,
-    server_ed25519_pk: &[u8; 32],
     password: &str,
     peer_id: &str,
     client_id: &str,

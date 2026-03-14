@@ -55,6 +55,10 @@ pub enum SessionCommand {
         command: String,
         timeout: Option<u64>,
     },
+    Push {
+        local_path: String,
+        remote_path: String,
+    },
     ClipboardGet,
     ClipboardSet {
         text: String,
@@ -203,6 +207,23 @@ impl Session {
                             "stdout": "stub exec output",
                             "stderr": "",
                             "exit_code": 0,
+                        }),
+                    ),
+                    vec![],
+                ))
+            }
+
+            SessionCommand::Push {
+                local_path,
+                remote_path,
+            } => {
+                self.require_connected()?;
+                Ok((
+                    SessionResponse::ok_with_data(
+                        format!("Pushed `{local_path}` to `{remote_path}`"),
+                        serde_json::json!({
+                            "local_path": local_path,
+                            "remote_path": remote_path,
                         }),
                     ),
                     vec![],

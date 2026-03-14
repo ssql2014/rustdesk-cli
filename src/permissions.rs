@@ -92,7 +92,6 @@ impl PermissionManager {
         self.confirm("Allow opening an interactive remote shell?")
     }
 
-    #[allow(dead_code)]
     pub fn ensure_path_allowed(&self, path: &str) -> Result<()> {
         if let Some(rules) = &self.sandbox_rules {
             if let Some(blocked_path) = rules
@@ -105,6 +104,14 @@ impl PermissionManager {
         }
 
         Ok(())
+    }
+
+    pub fn ensure_push_allowed(&self, local_path: &str, remote_path: &str) -> Result<()> {
+        self.ensure_path_allowed(local_path)?;
+        self.ensure_path_allowed(remote_path)?;
+        self.confirm(&format!(
+            "Allow pushing local file `{local_path}` to remote path `{remote_path}`?"
+        ))
     }
 
     fn confirm(&self, prompt: &str) -> Result<()> {

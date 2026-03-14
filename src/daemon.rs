@@ -27,6 +27,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::capture;
 use crate::connection::{self, ConnectionConfig};
 use crate::crypto::EncryptedStream;
+use crate::file_transfer::{PushProgress, PushTransfer};
 use crate::proto::hbb::{
     CaptureDisplays, ConnType, ImageQuality, Message, Misc, OptionMessage,
     SupportedDecoding, TestDelay, login_request, message, misc, option_message,
@@ -584,6 +585,63 @@ pub async fn run_daemon(
                     continue;
                 }
 
+                if let SessionCommand::Push {
+                    local_path,
+                    remote_path,
+                } = &cmd
+                {
+                    let response = match push_file_command(
+                        &mut encrypted,
+                        &mut writer,
+                        local_path,
+                        remote_path,
+                    )
+                    .await
+                    {
+                        Ok(resp) => resp,
+                        Err(command_err) if should_reconnect(&command_err) => {
+                            match reconnect_encrypted_stream(
+                                &config,
+                                &mut session,
+                                active_conn_type,
+                                |_resp| {},
+                            )
+                            .await
+                            {
+                                Ok(new_conn) => {
+                                    encrypted = new_conn.encrypted;
+                                    match push_file_command(
+                                        &mut encrypted,
+                                        &mut writer,
+                                        local_path,
+                                        remote_path,
+                                    )
+                                    .await
+                                    {
+                                        Ok(resp) => resp,
+                                        Err(retry_err) => SessionResponse::error(format!(
+                                            "push failed after reconnect: {retry_err:#}"
+                                        )),
+                                    }
+                                }
+                                Err(reconnect_err) => {
+                                    let resp = SessionResponse::error(format!(
+                                        "connection lost: {command_err:#}; reconnect failed: {reconnect_err:#}"
+                                    ));
+                                    let _ = send_response(&mut writer, &resp).await;
+                                    heartbeat_task.abort();
+                                    graceful_shutdown(&mut encrypted).await?;
+                                    return Err(reconnect_err);
+                                }
+                            }
+                        }
+                        Err(command_err) => SessionResponse::error(format!("{command_err:#}")),
+                    };
+
+                    let _ = send_response(&mut writer, &response).await;
+                    continue;
+                }
+
                 let response = match execute_daemon_command(&mut encrypted, &mut session, cmd.clone()).await {
                     Ok(resp) => resp,
                     Err(command_err) => {
@@ -716,6 +774,67 @@ async fn execute_daemon_command(
             Ok(resp)
         }
     }
+}
+
+async fn push_file_command(
+    encrypted: &mut EncryptedStream<TcpTransport>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<SessionResponse> {
+    let mut transfer = PushTransfer::begin(
+        encrypted,
+        Path::new(local_path),
+        remote_path,
+    )
+    .await?;
+
+    send_response(writer, &push_progress_response(remote_path, transfer.progress())).await?;
+
+    let mut last_reported = transfer.progress().sent_bytes;
+    while transfer.send_next_block(encrypted).await? {
+        let progress = transfer.progress();
+        if progress.sent_bytes == progress.total_bytes
+            || progress.sent_bytes.saturating_sub(last_reported) >= 1024 * 1024
+        {
+            send_response(writer, &push_progress_response(remote_path, progress.clone())).await?;
+            last_reported = progress.sent_bytes;
+        }
+    }
+
+    transfer.wait_for_done(encrypted).await?;
+    let result = transfer.result();
+    Ok(SessionResponse::ok_with_data(
+        format!(
+            "Pushed `{}` to `{}`",
+            result.local_path.display(),
+            result.remote_path
+        ),
+        serde_json::json!({
+            "kind": "complete",
+            "job_id": result.job_id,
+            "local_path": result.local_path.display().to_string(),
+            "remote_path": result.remote_path,
+            "total_bytes": result.total_bytes,
+            "sent_bytes": result.sent_bytes,
+            "transferred_bytes": result.transferred_bytes,
+            "resumed_bytes": result.resumed_bytes,
+        }),
+    ))
+}
+
+fn push_progress_response(remote_path: &str, progress: PushProgress) -> SessionResponse {
+    SessionResponse::ok_with_data(
+        format!("push progress {}/{}", progress.sent_bytes, progress.total_bytes),
+        serde_json::json!({
+            "kind": "progress",
+            "remote_path": remote_path,
+            "sent_bytes": progress.sent_bytes,
+            "total_bytes": progress.total_bytes,
+            "transferred_bytes": progress.transferred_bytes,
+            "resumed_bytes": progress.resumed_bytes,
+        }),
+    )
 }
 
 fn reconnecting_response(attempt: usize, backoff: Duration) -> SessionResponse {

@@ -7,6 +7,8 @@ mod crypto;
 #[allow(dead_code)]
 mod daemon;
 #[allow(dead_code)]
+mod file_transfer;
+#[allow(dead_code)]
 mod proto;
 #[allow(dead_code)]
 mod protocol;
@@ -22,7 +24,13 @@ mod transport;
 mod version;
 mod session;
 
-use std::{process, str::FromStr};
+use std::{
+    io::{BufRead, BufReader, Write},
+    net::Shutdown,
+    os::unix::net::UnixStream as StdUnixStream,
+    process,
+    str::FromStr,
+};
 
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde_json::{Value, json};
@@ -103,6 +111,13 @@ enum Commands {
         /// Maximum time to wait for command completion in seconds
         #[arg(long, default_value_t = 30)]
         timeout: u64,
+    },
+    /// Push a local file to the remote machine
+    Push {
+        /// Local file path to upload
+        local_path: String,
+        /// Destination path on the remote machine
+        remote_path: String,
     },
     /// Get or set remote clipboard text
     Clipboard {
@@ -652,6 +667,106 @@ fn run() -> i32 {
                 ),
             }
         }
+        Commands::Push {
+            local_path,
+            remote_path,
+        } => {
+            if let Err(e) = permissions.ensure_push_allowed(&local_path, &remote_path) {
+                return emit_response(
+                    cli.json,
+                    error_response(
+                        "push",
+                        "permission_error",
+                        &e.to_string(),
+                        EXIT_PERMISSION,
+                    ),
+                );
+            }
+
+            match send_to_daemon_streaming(
+                &SessionCommand::Push {
+                    local_path: local_path.clone(),
+                    remote_path: remote_path.clone(),
+                },
+                |resp| {
+                    if cli.json {
+                        return;
+                    }
+                    let Some(data) = resp.data.as_ref() else {
+                        return;
+                    };
+                    if data.get("kind").and_then(Value::as_str) != Some("progress") {
+                        return;
+                    }
+                    let sent = data.get("sent_bytes").and_then(Value::as_u64).unwrap_or(0);
+                    let total = data.get("total_bytes").and_then(Value::as_u64).unwrap_or(0);
+                    let resumed = data
+                        .get("resumed_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let pct = if total == 0 {
+                        100.0
+                    } else {
+                        (sent as f64 / total as f64) * 100.0
+                    };
+                    eprint!(
+                        "\rpush sent={sent}/{total} bytes ({pct:.1}%) resumed={resumed}"
+                    );
+                    let _ = std::io::stderr().flush();
+                },
+            ) {
+                Ok(resp) if resp.success => {
+                    if !cli.json {
+                        eprintln!();
+                    }
+                    let data = resp.data.unwrap_or_else(|| json!({}));
+                    let total_bytes = data
+                        .get("total_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let sent_bytes = data
+                        .get("sent_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let resumed_bytes = data
+                        .get("resumed_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    emit_response(
+                        cli.json,
+                        push_response(&local_path, &remote_path, sent_bytes, total_bytes, resumed_bytes),
+                    )
+                }
+                Ok(resp) => {
+                    if !cli.json {
+                        eprintln!();
+                    }
+                    emit_response(
+                        cli.json,
+                        error_response(
+                            "push",
+                            "connection_error",
+                            resp.message.as_deref().unwrap_or("push failed"),
+                            EXIT_CONNECTION,
+                        ),
+                    )
+                }
+                Err(e) => {
+                    if !cli.json {
+                        eprintln!();
+                    }
+                    emit_response(
+                        cli.json,
+                        error_response(
+                            "push",
+                            "connection_error",
+                            &e.to_string(),
+                            EXIT_CONNECTION,
+                        ),
+                    )
+                }
+            }
+        }
         Commands::Clipboard { command } => match command {
             ClipboardCommands::Get => match send_to_daemon(&SessionCommand::ClipboardGet) {
                 Ok(resp) if resp.success => {
@@ -1099,6 +1214,37 @@ fn send_to_daemon(cmd: &SessionCommand) -> Result<SessionResponse, anyhow::Error
     rt.block_on(daemon::send_command(cmd))
 }
 
+fn send_to_daemon_streaming(
+    cmd: &SessionCommand,
+    mut on_response: impl FnMut(&SessionResponse),
+) -> Result<SessionResponse, anyhow::Error> {
+    let lock = daemon::LockFile::read()?;
+    let mut stream = StdUnixStream::connect(&lock.socket)?;
+    let mut payload = serde_json::to_vec(cmd)?;
+    payload.push(b'\n');
+    stream.write_all(&payload)?;
+    stream.shutdown(Shutdown::Write)?;
+
+    let mut last_response = None;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response: SessionResponse = serde_json::from_str(line.trim())?;
+        on_response(&response);
+        last_response = Some(response);
+    }
+
+    last_response.ok_or_else(|| anyhow::anyhow!("daemon closed without sending a response"))
+}
+
 fn error_response(command: &str, code: &str, message: &str, exit_code: i32) -> Response {
     Response {
         text: format!("{code}: {message}"),
@@ -1206,6 +1352,30 @@ fn exec_response(command: &str, stdout: &str, stderr: &str, exit_code: i32) -> R
             "stdout": stdout,
             "stderr": stderr,
             "exit_code": exit_code
+        }),
+        exit_code: EXIT_SUCCESS,
+    }
+}
+
+fn push_response(
+    local_path: &str,
+    remote_path: &str,
+    sent_bytes: u64,
+    total_bytes: u64,
+    resumed_bytes: u64,
+) -> Response {
+    Response {
+        text: format!(
+            "push sent_bytes={sent_bytes} total_bytes={total_bytes} resumed_bytes={resumed_bytes} remote={remote_path}"
+        ),
+        json: json!({
+            "ok": true,
+            "command": "push",
+            "local_path": local_path,
+            "remote_path": remote_path,
+            "sent_bytes": sent_bytes,
+            "total_bytes": total_bytes,
+            "resumed_bytes": resumed_bytes
         }),
         exit_code: EXIT_SUCCESS,
     }

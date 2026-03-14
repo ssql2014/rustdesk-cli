@@ -2,76 +2,69 @@
 
 ## Session: 2026-03-15
 
-### Phase 1: Discovery
+### Phase 1: Preparation
 - **Status:** complete
 - Actions taken:
   - Read the `planning-with-files` skill instructions.
-  - Read `docs/research/tcp_key_exchange.md`.
-  - Inspected `src/rendezvous.rs`, `src/connection.rs`, `src/crypto.rs`, and `src/transport.rs`.
-  - Confirmed the existing code path currently sends plaintext `PunchHoleRequest` over TCP.
-  - Confirmed the existing dependency set already includes sealed-box support through `crypto_box`.
+  - Read `docs/plans/rmsnorm_deployment.md`.
+  - Prepared the exact remote deployment inputs and command sequence.
 - Files created/modified:
-  - `task_plan.md` (reset for issue #38)
-  - `findings.md` (reset for issue #38)
-  - `progress.md` (reset for issue #38)
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
 
-### Phase 2: Design
+### Phase 2: Remote Connection
 - **Status:** complete
 - Actions taken:
-  - Confirmed `crypto_box` already supports sealed-box behavior.
-  - Checked the official RustDesk client flow to resolve the ambiguity in the local research summary.
-  - Chose to keep the handshake internal to the rendezvous TCP helper and reuse the existing encrypted framed transport model.
+  - Ran `cargo run -- connect 308235080 --password 'Evas@2026' --id-server 115.238.185.55:50076 --relay-server 115.238.185.55:50077 --key 'SWc0NIWF0wR7kd8rHdGNaCHXtp7dirUImEtrVmRfQdc='`.
+  - Confirmed the CLI reported `connected id=308235080 width=1920 height=1080`.
+  - Found that the detached daemon exited immediately afterward.
+  - Started `target/debug/rustdesk-cli --daemon ...` in the foreground as a workaround.
+  - Verified the foreground daemon with `cargo run -- status` and `cargo run -- exec --command "whoami"`.
 - Files created/modified:
-  - `task_plan.md` (updated)
-  - `findings.md` (updated)
-  - `progress.md` (updated)
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
 
-### Phase 3: Implementation
+### Phase 3: Deployment
 - **Status:** complete
 - Actions taken:
-  - Added base64 decoding support for the rendezvous server key.
-  - Implemented signed ephemeral key verification for TCP `KeyExchange`.
-  - Replied to hbbs with a two-key `KeyExchange` response and upgraded the stream to `EncryptedStream<TcpTransport>`.
-  - Replayed `PunchHoleRequest` over the encrypted stream.
-  - Added a focused TCP rendezvous regression test.
-  - Updated one integration test to include local `transport` and `crypto` modules because `src/rendezvous.rs` is compiled there via `#[path = ...]`.
+  - Uploaded `/home/evas/rmsnorm_op.py` via `cargo run -- exec --timeout 60 --command "cat > /home/evas/rmsnorm_op.py << 'PYEOF' ..."`
+  - Confirmed the file exists on the remote host.
+  - First verification failed with `ModuleNotFoundError: No module named 'numpy'`.
+  - Checked the remote environment: Ubuntu 22.04, `evas`, no `pip`, no `ensurepip`, `curl` available.
+  - Bootstrapped `pip` in user space and installed `numpy`.
+  - Re-ran `python3 /home/evas/rmsnorm_op.py` successfully.
 - Files created/modified:
-  - `Cargo.toml` (updated)
-  - `src/rendezvous.rs` (updated)
-  - `tests/live_server_test.rs` (updated)
-  - `task_plan.md` (updated)
-  - `findings.md` (updated)
-  - `progress.md` (updated)
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
 
 ### Phase 4: Verification
 - **Status:** complete
 - Actions taken:
-  - Added debug logging around hbbs TCP `KeyExchange` parsing.
-  - Ran `cargo build`.
-  - Ran the live terminal connection command equivalent for the current CLI:
-    - `cargo run -- connect 308235080 --terminal --password 'Evas@2026' --id-server 115.238.185.55:50076 --relay-server 115.238.185.55:50077 --key 'SWc0NIWF0wR7kd8rHdGNaCHXtp7dirUImEtrVmRfQdc='`
-  - Confirmed the tested server reset the TCP punch socket instead of sending `KeyExchange`, then completed the session through relay fallback.
-  - Added layout-parsing unit tests.
-  - Ran the full `cargo test` suite.
+  - Captured final remote output: `SUCCESS: RMSNorm verification passed.`
+  - Stopped the temporary foreground daemon with `SIGINT`.
 - Files created/modified:
-  - `src/rendezvous.rs` (updated)
-  - `task_plan.md` (updated)
-  - `findings.md` (updated)
-  - `progress.md` (updated)
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
 
 ## Test Results
-| Test | Input | Expected | Actual | Status |
-|------|-------|----------|--------|--------|
-| Dependency audit | `Cargo.toml` + cargo registry | sealed-box support available | `crypto_box::PublicKey::seal` found | ✓ |
-| Transport audit | `src/transport.rs` + `src/crypto.rs` | determine reusable pieces | framing reusable, cipher wrapper not reusable | ✓ |
-| Build verification | `cargo build` | project compiles with TCP KeyExchange fix | passed | ✓ |
-| Live terminal run | `cargo run -- connect 308235080 --terminal ...` | observe hbbs KeyExchange or reproduce failure | hbbs reset TCP punch socket, relay fallback succeeded, terminal prompt opened | ✓ |
-| Layout parsing unit tests | `cargo test` | both signed payload layouts accepted | passed | ✓ |
-| Full test suite | `cargo test` | no regressions | passed | ✓ |
-| Signature mismatch fallback | `cargo test` | mismatched provided key does not abort TCP KeyExchange | passed | ✓ |
+| Step | Expected | Actual | Status |
+|------|----------|--------|--------|
+| `connect` | persistent daemon session | CLI connected, detached daemon died immediately | partial |
+| foreground `--daemon` | usable persistent session | worked | ✓ |
+| `exec whoami` | confirm remote exec | `evas` | ✓ |
+| script upload | create `/home/evas/rmsnorm_op.py` | exit code `0` | ✓ |
+| first verification | success string | failed: `ModuleNotFoundError: No module named 'numpy'` | partial |
+| pip bootstrap | install pip in user space | worked | ✓ |
+| numpy import | confirm dependency available | `2.2.6` | ✓ |
+| final verification | success string | `SUCCESS: RMSNorm verification passed.` | ✓ |
 
 ## Error Log
 | Timestamp | Error | Attempt | Resolution |
 |-----------|-------|---------|------------|
-| 2026-03-15 | Local research summary conflicted with the upstream client’s actual TCP handshake flow | 1 | Used the official RustDesk source as the protocol authority and implemented that behavior |
-| 2026-03-15 | The bug report’s `cargo run -- direct ...` command no longer matched the current CLI | 1 | Translated it to `cargo run -- connect <peer> --terminal ...` |
+| 2026-03-15 | Detached daemon died after `connect` | 1 | Ran internal `--daemon` in foreground and used that session |
+| 2026-03-15 | Direct terminal fallback dropped on command output | 1 | Used foreground daemon instead |
+| 2026-03-15 | Remote host missing `numpy` | 1 | Installed `pip` in user space and then installed `numpy` |

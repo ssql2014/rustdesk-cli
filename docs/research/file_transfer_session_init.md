@@ -1,10 +1,10 @@
 # Research: File Transfer Session Initialization
 
-This document details how the RustDesk protocol initializes dedicated file transfer sessions, distinct from desktop or terminal sessions.
+This document details how the RustDesk protocol initializes dedicated file transfer sessions and the corrected message flow for pushing (uploading) files.
 
 ## 1. Connection Type (ConnType)
 
-File transfer is a first-class session type in the RustDesk protocol.
+File transfer is a unique session type in the RustDesk protocol.
 
 - **Enum Name:** `FILE_TRANSFER`
 - **Integer Value:** `1`
@@ -36,21 +36,29 @@ message FileTransfer {
 ```
 
 ### Protocol Sequence:
-1. **Connect:** Establish TCP to peer/relay with `ConnType::FILE_TRANSFER`.
+1. **Connect:** Establish TCP to peer/relay with `ConnType::FILE_TRANSFER (1)`.
 2. **Handshake:** Perform NaCl KeyExchange.
 3. **Login:** Send `LoginRequest` with the `file_transfer` union variant populated.
 4. **Authorization:** Wait for `LoginResponse(PeerInfo)`. 
     - Note: If no password was provided, the peer will trigger its CM UI for manual "Accept/Deny".
 
-## 4. Push (Upload) Initiation Flow
+## 4. Corrected Initiation Flow
 
-Leo's discovery regarding `ReceiveRequest` is confirmed by the official implementation. To "Push" a file from the CLI to the peer:
-
+### Push (Upload) Flow
+To "Push" a file from the CLI to the peer:
 1. **Client Action:** Client sends `FileAction::Receive(FileTransferReceiveRequest)`.
-    - Note the terminology: The client is requesting that the *peer* "receive" a file.
-2. **Digest:** The client must provide a `FileEntry` list and a `FileTransferDigest` for the file(s) being pushed.
-3. **Peer Confirmation:** The peer responds with a `FileResponse::Digest` indicating how much of the file it already has (for resuming).
-4. **Data:** Client sends `FileResponse::Block` messages.
+    - **Logic:** The client is requesting that the *peer* "receive" a file.
+    - **Metadata:** Includes `path` (remote destination), `files` (list of entries), and `id` (job ID).
+2. **Peer Confirmation:** The peer responds with `FileResponse::Digest` to indicate its current state of that file.
+3. **Data:** Client sends `FileResponse::Block` messages.
+
+### Pull (Download) Flow
+To "Pull" a file from the peer to the local CLI:
+1. **Client Action:** Client sends `FileAction::Send(FileTransferSendRequest)`.
+    - **Logic:** The client is asking the *peer* to "send" a file.
+2. **Peer Response:** Peer responds with `FileResponse::Digest` containing file metadata.
+3. **Client Confirmation:** Client sends `FileAction::SendConfirm` with an `OffsetBlk`.
+4. **Data:** Peer starts sending `FileResponse::Block` messages.
 
 ## 5. Summary Table
 
@@ -61,9 +69,9 @@ Leo's discovery regarding `ReceiveRequest` is confirmed by the official implemen
 | **Multiplexing** | Shared | Usually Shared | **Always Separate** |
 | **CM Approval** | Required | Required | Required |
 
-## Implementation Notes for rustdesk-cli
+## Implementation Notes for Leo
 
-To implement `rustdesk-cli push` robustly:
+To fix the `push` command:
 1.  Initiate a completely new connection with `ConnType::FILE_TRANSFER`.
 2.  Populate field 17 in the `LoginRequest`.
-3.  Follow the "Peer-Receives" flow: Send `FileTransferReceiveRequest` with a pre-calculated digest of the local file.
+3.  Ensure the initial action is `FileAction::Receive` for uploads.

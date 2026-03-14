@@ -1,12 +1,13 @@
 //! Rendezvous client for RustDesk's hbbs server.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use prost::Message;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -152,6 +153,87 @@ impl RendezvousClient {
                 Ok(PunchRelayResponse::Relay(response))
             }
             other => bail!("unexpected rendezvous response to PunchHoleRequest: {other:?}"),
+        }
+    }
+
+    pub async fn punch_hole_via_tcp_with_conn_type(
+        &self,
+        target_id: &str,
+        licence_key: &str,
+        conn_type: ConnType,
+        timeout_duration: Duration,
+    ) -> Result<PunchRelayResponse> {
+        let udp_port = self.socket.local_addr()?.port() as i32;
+        let request = RendezvousMessage {
+            union: Some(rendezvous_message::Union::PunchHoleRequest(PunchHoleRequest {
+                id: target_id.to_string(),
+                nat_type: NatType::UnknownNat as i32,
+                licence_key: licence_key.to_string(),
+                conn_type: conn_type as i32,
+                token: String::new(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                udp_port,
+                force_relay: true,
+                upnp_port: 0,
+                socket_addr_v6: Vec::new(),
+            })),
+        };
+
+        let mut stream = tokio::net::TcpStream::connect(&self.server_addr)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open TCP to rendezvous server {} for PunchHoleRequest",
+                    self.server_addr
+                )
+            })?;
+
+        let mut buf = Vec::new();
+        request.encode(&mut buf)?;
+        bytescodec_send(&mut stream, &buf).await?;
+
+        let deadline = Instant::now() + timeout_duration;
+        let mut punch_response: Option<PunchHoleResponse> = None;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if let Some(response) = punch_response {
+                    return Ok(PunchRelayResponse::PunchHole(response));
+                }
+                bail!(
+                    "timed out waiting for PunchHoleResponse or RelayResponse over TCP after {}s",
+                    timeout_duration.as_secs()
+                );
+            }
+
+            let resp_bytes = match timeout(remaining, bytescodec_recv(&mut stream)).await {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(e)) => return Err(e).context("reading rendezvous response over TCP"),
+                Err(_) => {
+                    if let Some(response) = punch_response {
+                        return Ok(PunchRelayResponse::PunchHole(response));
+                    }
+                    bail!(
+                        "timed out waiting for PunchHoleResponse or RelayResponse over TCP after {}s",
+                        timeout_duration.as_secs()
+                    );
+                }
+            };
+
+            let response = RendezvousMessage::decode(resp_bytes.as_slice())
+                .context("decode rendezvous response from TCP")?;
+
+            match response.union {
+                Some(rendezvous_message::Union::PunchHoleResponse(resp)) => {
+                    punch_response = Some(resp);
+                }
+                Some(rendezvous_message::Union::RelayResponse(resp)) => {
+                    return Ok(PunchRelayResponse::Relay(resp));
+                }
+                Some(rendezvous_message::Union::RegisterPeerResponse(_)) => continue,
+                other => bail!("unexpected rendezvous response to TCP PunchHoleRequest: {other:?}"),
+            }
         }
     }
 

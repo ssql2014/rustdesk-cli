@@ -53,6 +53,7 @@ pub struct ConnectionResult {
 
 const PUNCH_HOLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const PUNCH_HOLE_GRACE_DELAY: Duration = Duration::from_millis(300);
+const RELAY_PORT: u16 = 21117;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -115,22 +116,25 @@ pub(crate) async fn connect_with_mode(
 
     let mut received_rendezvous_response = false;
     let mut peer_relay_uuid: Option<String> = None;
-    let punch_hole_relay_hint = match timeout(
-        PUNCH_HOLE_RESPONSE_TIMEOUT,
-        client.punch_hole_or_relay_with_conn_type(&config.peer_id, &config.server_key, conn_type),
-    )
-    .await
+    let punch_hole_relay_hint = match client
+        .punch_hole_via_tcp_with_conn_type(
+            &config.peer_id,
+            &config.server_key,
+            conn_type,
+            PUNCH_HOLE_RESPONSE_TIMEOUT,
+        )
+        .await
     {
-        Ok(Ok(PunchRelayResponse::PunchHole(resp))) => {
+        Ok(PunchRelayResponse::PunchHole(resp)) => {
             received_rendezvous_response = true;
             check_punch_hole_failure(&resp)?;
             if !resp.relay_server.is_empty() {
-                Some(resp.relay_server)
+                Some(normalize_relay_addr(&resp.relay_server))
             } else {
                 None
             }
         }
-        Ok(Ok(PunchRelayResponse::Relay(resp))) => {
+        Ok(PunchRelayResponse::Relay(resp)) => {
             received_rendezvous_response = true;
             if !resp.refuse_reason.is_empty() {
                 bail!("relay refused: {}", resp.refuse_reason);
@@ -139,20 +143,13 @@ pub(crate) async fn connect_with_mode(
                 peer_relay_uuid = Some(resp.uuid);
             }
             if !resp.relay_server.is_empty() {
-                Some(resp.relay_server)
+                Some(normalize_relay_addr(&resp.relay_server))
             } else {
-                Some(config.relay_server.clone())
+                Some(normalize_relay_addr(&config.relay_server))
             }
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             eprintln!("[debug] Phase 2: PunchHole request failed: {e:#}, continuing to relay");
-            None
-        }
-        Err(_) => {
-            eprintln!(
-                "[debug] Phase 2: PunchHoleResponse timed out after {}s, continuing to relay",
-                PUNCH_HOLE_RESPONSE_TIMEOUT.as_secs()
-            );
             None
         }
     };
@@ -174,8 +171,8 @@ pub(crate) async fn connect_with_mode(
                 requested_relay_server,
                 &[],
                 &config.server_key,
-                &session_uuid,
-                conn_type,
+                &client_uuid,
+                ConnType::DefaultConn,
             ),
         )
         .await
@@ -189,23 +186,23 @@ pub(crate) async fn connect_with_mode(
                     relay_response.relay_server
                 );
                 if relay_response.relay_server.is_empty() {
-                    config.relay_server.clone()
+                    normalize_relay_addr(&config.relay_server)
                 } else {
-                    relay_response.relay_server
+                    normalize_relay_addr(&relay_response.relay_server)
                 }
             }
             Ok(Err(e)) => {
                 eprintln!("[debug] Phase 2: RequestRelay TCP failed: {e:#}, using default relay");
-                config.relay_server.clone()
+                normalize_relay_addr(&config.relay_server)
             }
             Err(_) => {
                 eprintln!("[debug] Phase 2: RequestRelay timed out, using default relay");
-                config.relay_server.clone()
+                normalize_relay_addr(&config.relay_server)
             }
         }
     };
 
-    let relay_uuid = peer_relay_uuid.unwrap_or(client_uuid);
+    let relay_uuid = peer_relay_uuid.unwrap_or_else(|| client_uuid.clone());
 
     if received_rendezvous_response {
         eprintln!(
@@ -487,6 +484,25 @@ fn rand_session_id() -> u64 {
     let mut buf = [0u8; 8];
     rand_core::OsRng.fill_bytes(&mut buf);
     u64::from_le_bytes(buf)
+}
+
+fn normalize_relay_addr(relay_addr: &str) -> String {
+    if relay_addr.is_empty() {
+        return String::new();
+    }
+
+    if relay_addr.starts_with('[') {
+        if relay_addr.contains("]:") {
+            return relay_addr.to_string();
+        }
+        return format!("{relay_addr}:{RELAY_PORT}");
+    }
+
+    match relay_addr.matches(':').count() {
+        0 => format!("{relay_addr}:{RELAY_PORT}"),
+        1 => relay_addr.to_string(),
+        _ => format!("[{relay_addr}]:{RELAY_PORT}"),
+    }
 }
 
 fn build_login_option_message(conn_type: ConnType) -> OptionMessage {

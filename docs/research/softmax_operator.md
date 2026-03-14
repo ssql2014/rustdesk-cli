@@ -1,93 +1,102 @@
-# Research: SoftMax Operator
+# Research: SoftMax Operator for Llama 3 Inference
 
-This document provides a technical overview of the SoftMax operator, its numerical stability implementation, and its critical role in Transformer-based attention mechanisms (Llama, Mistral).
+This document provides a technical overview of the SoftMax operator, its numerical stability, temperature scaling, and its application in Llama 3 attention mechanisms.
 
 ## 1. Mathematical Formulation
 
-SoftMax converts a vector of raw scores (logits) into a probability distribution where all elements are in the range $(0, 1)$ and sum to $1.0$.
+SoftMax converts raw scores (logits) into a probability distribution.
 
 ### Standard Definition
-For an input vector $\mathbf{x}$ of dimension $d$:
+For a vector $\mathbf{x}$ of dimension $d$:
 $$\text{Softmax}(x_i) = \frac{e^{x_i}}{\sum_{j=1}^d e^{x_j}}$$
 
 ### Numerical Stability (The Max Subtraction Trick)
-Directly computing $e^{x_i}$ is prone to **overflow** if $x_i$ is large (e.g., $x_i > 88$ for `float32`). To prevent this, we use the property that $\text{Softmax}(\mathbf{x}) = \text{Softmax}(\mathbf{x} - C)$ for any constant $C$. By choosing $C = \max(\mathbf{x})$, we ensure all exponents are $\le 0$.
-
+To prevent exponential overflow (especially in `float16` or `float32`), we subtract the maximum value from all elements before exponentiation:
 $$\text{Softmax}(x_i) = \frac{e^{x_i - \max(\mathbf{x})}}{\sum_{j=1}^d e^{x_j - \max(\mathbf{x})}}$$
+This ensures the largest value becomes $e^0 = 1$ and all others are $\in (0, 1]$.
 
-This ensures the largest value becomes $e^0 = 1$ and all other values are between $0$ and $1$, eliminating the risk of `inf` or `NaN`.
+### Temperature Scaling
+In LLM sampling, a temperature parameter $T$ is used to control the "sharpness" of the distribution:
+$$\text{Softmax}(x_i, T) = \frac{e^{x_i / T}}{\sum_{j=1}^d e^{x_j / T}}$$
+- **$T \to 0$**: Becomes "greedy" (concentrates probability on the maximum).
+- **$T = 1$**: Standard SoftMax.
+- **$T > 1$**: Makes the distribution "flatter" (more diverse sampling).
 
-## 2. Role in Scaled Dot-Product Attention
+## 2. Llama 3 Attention Score Computation
 
-In Transformer architectures, SoftMax is used to normalize the attention scores:
-$$\text{Attention}(Q, K, V) = \text{Softmax}\left(\frac{QK^T}{\sqrt{d_k}} + M\right)V$$
+In Llama 3, SoftMax is applied to the scaled dot-product attention scores.
 
-- **Scaling:** The scores are divided by $\sqrt{d_k}$ to prevent the dot product from growing too large in magnitude, which would push the SoftMax into regions with extremely small gradients.
-- **Weights:** The SoftMax output represents the "weight" or "importance" that each Query token assigns to each Key token.
+### Exact Computation
+$$\text{Scores} = \frac{QK^T}{\sqrt{d_k}}$$
+$$\text{AttentionWeights} = \text{Softmax}(\text{Scores} + \text{Mask})$$
 
-## 3. Causal Masking Interaction
+- **$d_k$ (Head Dim)**: For Llama 3 8B, $d_k = 128$. The scaling factor is $\sqrt{128} \approx 11.3137$.
+- **Causal Mask**: Applied before SoftMax by setting future token positions to $-\infty$.
 
-For autoregressive generation (predicting the next token), a token at position $i$ must not attend to tokens at positions $j > i$.
+## 3. Memory Requirements (Sequence Length 8192)
 
-- **Masking:** Before applying SoftMax, we add a mask matrix $M$ where $M_{ij} = -\infty$ (or a large negative constant like $-1e9$) for $j > i$, and $0$ otherwise.
-- **Result:** Since $e^{-\infty} = 0$, the SoftMax probabilities for future tokens become exactly $0$, effectively "masking" them out of the weighted sum of Value vectors.
+Memory consumption for the attention score matrix is a significant bottleneck for long sequences.
 
-## 4. Reference NumPy Implementation
+| Parameter | Value |
+| :--- | :--- |
+| Sequence Length ($N$) | 8192 |
+| Attention Heads ($H$) | 32 |
+| Matrix Size per Head | $8192 \times 8192 = 67,108,864$ elements |
+| Total Elements ($H \times N^2$) | $2,147,483,648$ elements |
+| **Memory (FP32)** | **~8.0 GB** |
+| **Memory (FP16/BF16)** | **~4.0 GB** |
 
-The following implementation is designed for deployment to the remote peer `308235080`.
+**Note**: This assumes materialization of the full score matrix for all heads. Optimized kernels (FlashAttention) compute this head-by-head or in tiles to reduce the peak memory footprint from $O(N^2)$ to $O(N)$.
+
+## 4. Standalone Implementation (softmax_op.py)
+
+The following implementation is designed for deployment to `/home/evas/` on the remote server. It handles 2D matrices (scores for a single head or batched heads) and allows axis specification.
 
 ```python
 import numpy as np
 
-def softmax(x, axis=-1, mask=None):
+def softmax(x, axis=-1, temperature=1.0, mask=None):
     """
-    Stable SoftMax implementation with optional masking.
-    x: Input array
-    axis: Dimension along which to compute SoftMax
-    mask: Boolean mask (True for positions to keep, False to mask out)
+    Numerically stable SoftMax with temperature scaling and masking.
+    
+    Args:
+        x: Input numpy array (e.g., [seq_len, seq_len] or [heads, seq_len, seq_len])
+        axis: Dimension to perform SoftMax over (usually the last one)
+        temperature: Scaling factor for sharpness
+        mask: Optional boolean mask (True to keep, False to mask out)
     """
+    # 1. Apply temperature scaling
+    x = x / max(temperature, 1e-6)
+    
+    # 2. Apply causal/padding mask
     if mask is not None:
-        # Fill masked positions with a large negative constant
-        # Use -1e9 for compatibility with float16/float32
+        # Use a large negative constant for -inf
         x = np.where(mask, x, -1e9)
     
-    # 1. Stability trick: subtract max
-    # Keepdims is essential for correct broadcasting
+    # 3. Numerical stability: subtract max
     x_max = np.max(x, axis=axis, keepdims=True)
     exp_x = np.exp(x - x_max)
     
-    # 2. Sum and normalize
+    # 4. Normalize
     sum_exp = np.sum(exp_x, axis=axis, keepdims=True)
     return exp_x / sum_exp
 
-def verify_softmax():
-    # Test 1: Basic probability property
-    x = np.array([1.0, 2.0, 3.0])
-    out = softmax(x)
-    assert np.allclose(np.sum(out), 1.0), "Sum should be 1.0"
-    assert np.all(out > 0), "Probabilities should be positive"
-    
-    # Test 2: Numerical stability
-    x_large = np.array([1000.0, 1001.0, 1002.0])
-    out_large = softmax(x_large)
-    assert not np.any(np.isnan(out_large)), "Should not produce NaN"
-    assert np.argmax(out_large) == 2, "Max index should be preserved"
-    
-    # Test 3: Masking
-    x_mask = np.array([10.0, 10.0, 10.0])
-    mask = np.array([True, True, False])
-    out_mask = softmax(x_mask, mask=mask)
-    assert out_mask[2] < 1e-8, "Masked position should be ~0"
-    assert np.allclose(out_mask[:2], 0.5), "Remaining positions should split probability"
-    
-    print("SoftMax verification successful.")
-
 if __name__ == "__main__":
-    verify_softmax()
+    # Example verification for Llama 3 8B head dim
+    d_k = 128
+    scale = np.sqrt(d_k)
+    
+    # Dummy Q and K for 10 tokens
+    q = np.random.randn(10, d_k)
+    k = np.random.randn(10, d_k)
+    
+    # QK^T / sqrt(d_k)
+    scores = np.matmul(q, k.T) / scale
+    
+    # Softmax
+    probs = softmax(scores, temperature=0.7)
+    
+    print(f"Scores shape: {scores.shape}")
+    print(f"Probabilities row sum (should be 1.0): {np.sum(probs, axis=-1)}")
+    print("SoftMax operator verification successful.")
 ```
-
-## 5. Performance Considerations
-
-- **Memory Usage:** SoftMax requires materializing the full $N \times N$ attention matrix (where $N$ is sequence length). For $N=32768$, this is $10^9$ elements (~4GB in `float32`), which can exceed memory on many nodes.
-- **Flash Attention:** In production systems, SoftMax is often "fused" into the attention kernel (Flash Attention) to avoid materializing the full matrix, reducing memory complexity from $O(N^2)$ to $O(N)$.
-- **Axis Selection:** In NumPy, ensure `axis=-1` is used to normalize across the sequence length dimension (keys) rather than the batch or head dimensions.

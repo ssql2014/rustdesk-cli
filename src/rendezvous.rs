@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use prost::Message;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
@@ -11,17 +13,21 @@ use tokio::time::timeout;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::crypto::{self, EncryptedStream};
 use crate::proto::hbb::{
-    ConnType, NatType, PunchHoleRequest, PunchHoleResponse, RegisterPeer, RegisterPeerResponse,
-    RegisterPk, RegisterPkResponse, RelayResponse, RendezvousMessage, RequestRelay,
+    ConnType, KeyExchange, NatType, PunchHoleRequest, PunchHoleResponse, RegisterPeer,
+    RegisterPeerResponse, RegisterPk, RegisterPkResponse, RelayResponse, RendezvousMessage,
+    RequestRelay,
     rendezvous_message,
 };
+use crate::transport::{TcpTransport, Transport};
 
 pub struct RendezvousClient {
     socket: Arc<UdpSocket>,
     server_addr: String,
 }
 
+#[derive(Debug)]
 pub enum PunchRelayResponse {
     PunchHole(PunchHoleResponse),
     Relay(RelayResponse),
@@ -179,7 +185,7 @@ impl RendezvousClient {
             })),
         };
 
-        let mut stream = tokio::net::TcpStream::connect(&self.server_addr)
+        let stream = tokio::net::TcpStream::connect(&self.server_addr)
             .await
             .with_context(|| {
                 format!(
@@ -187,13 +193,19 @@ impl RendezvousClient {
                     self.server_addr
                 )
             })?;
+        let mut transport = Some(TcpTransport::new(stream));
 
-        let mut buf = Vec::new();
-        request.encode(&mut buf)?;
-        bytescodec_send(&mut stream, &buf).await?;
+        let request_bytes = encode_rendezvous_message(&request)?;
+        transport
+            .as_mut()
+            .expect("plain TCP transport should exist before KeyExchange")
+            .send(&request_bytes)
+            .await?;
 
         let deadline = Instant::now() + timeout_duration;
         let mut punch_response: Option<PunchHoleResponse> = None;
+        let mut encrypted: Option<EncryptedStream<TcpTransport>> = None;
+        let mut resent_after_key_exchange = false;
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -207,7 +219,19 @@ impl RendezvousClient {
                 );
             }
 
-            let resp_bytes = match timeout(remaining, bytescodec_recv(&mut stream)).await {
+            let recv_fut = async {
+                if let Some(stream) = encrypted.as_mut() {
+                    stream.recv().await
+                } else {
+                    transport
+                        .as_mut()
+                        .expect("plain TCP transport should exist before KeyExchange")
+                        .recv()
+                        .await
+                }
+            };
+
+            let resp_bytes: Vec<u8> = match timeout(remaining, recv_fut).await {
                 Ok(Ok(bytes)) => bytes,
                 Ok(Err(e)) => return Err(e).context("reading rendezvous response over TCP"),
                 Err(_) => {
@@ -230,6 +254,30 @@ impl RendezvousClient {
                 }
                 Some(rendezvous_message::Union::RelayResponse(resp)) => {
                     return Ok(PunchRelayResponse::Relay(resp));
+                }
+                Some(rendezvous_message::Union::KeyExchange(resp)) => {
+                    if encrypted.is_some() || resent_after_key_exchange {
+                        bail!("unexpected repeated TCP KeyExchange from rendezvous server");
+                    }
+
+                    let encrypted_stream = complete_tcp_key_exchange(
+                        transport
+                            .take()
+                            .expect("plain TCP transport should exist when KeyExchange starts"),
+                        licence_key,
+                        &resp,
+                    )
+                    .await
+                    .context("completing TCP rendezvous KeyExchange")?;
+                    encrypted = Some(encrypted_stream);
+
+                    if let Some(stream) = encrypted.as_mut() {
+                        stream
+                            .send(&request_bytes)
+                            .await
+                            .context("sending encrypted PunchHoleRequest over TCP")?;
+                    }
+                    resent_after_key_exchange = true;
                 }
                 Some(rendezvous_message::Union::RegisterPeerResponse(_)) => continue,
                 other => bail!("unexpected rendezvous response to TCP PunchHoleRequest: {other:?}"),
@@ -497,9 +545,82 @@ async fn bytescodec_recv<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Res
     Ok(payload)
 }
 
+fn encode_rendezvous_message(message: &RendezvousMessage) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    message.encode(&mut buf)?;
+    Ok(buf)
+}
+
+async fn complete_tcp_key_exchange(
+    mut transport: TcpTransport,
+    server_key_b64: &str,
+    key_exchange: &KeyExchange,
+) -> Result<EncryptedStream<TcpTransport>> {
+    let signed_key = key_exchange
+        .keys
+        .first()
+        .context("TCP KeyExchange missing server key payload")?;
+    let peer_box_pk = verify_rendezvous_server_key(server_key_b64, signed_key)
+        .context("verifying signed rendezvous TCP key")?;
+
+    let key_result = crypto::key_exchange_curve25519(&peer_box_pk)
+        .context("creating TCP rendezvous symmetric key")?;
+    let response = RendezvousMessage {
+        union: Some(rendezvous_message::Union::KeyExchange(KeyExchange {
+            keys: vec![
+                key_result.ephemeral_pk.to_vec(),
+                key_result.sealed_key,
+            ],
+        })),
+    };
+    let response_bytes = encode_rendezvous_message(&response)?;
+
+    // The response KeyExchange itself is still sent on the raw framed stream.
+    transport
+        .send(&response_bytes)
+        .await
+        .context("sending TCP KeyExchange response")?;
+
+    Ok(EncryptedStream::new(transport, &key_result.session_key))
+}
+
+fn verify_rendezvous_server_key(server_key_b64: &str, signed_key: &[u8]) -> Result<[u8; 32]> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(server_key_b64)
+        .context("base64 decode rendezvous server key")?;
+    let server_pk: [u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("rendezvous server key is {} bytes, expected 32", decoded.len()))?;
+
+    if signed_key.len() <= 64 {
+        bail!(
+            "signed rendezvous TCP key is {} bytes, expected >64",
+            signed_key.len()
+        );
+    }
+
+    let verifying_key =
+        VerifyingKey::from_bytes(&server_pk).context("invalid rendezvous server Ed25519 key")?;
+    let signature = Signature::from_slice(&signed_key[..64])
+        .context("invalid signature bytes in rendezvous TCP key")?;
+    let message = &signed_key[64..];
+    verifying_key
+        .verify(message, &signature)
+        .context("rendezvous TCP key signature verification failed")?;
+
+    let peer_box_pk: [u8; 32] = message
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("verified rendezvous TCP key is {} bytes, expected 32", message.len()))?;
+    Ok(peer_box_pk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::Transport;
+    use crypto_box::{PublicKey as BoxPublicKey, SalsaBox, SecretKey as BoxSecretKey, aead::Aead};
+    use ed25519_dalek::{Signer, SigningKey};
     use crate::proto::hbb::{RelayResponse, rendezvous_message};
 
     async fn bind_test_server() -> UdpSocket {
@@ -824,6 +945,132 @@ mod tests {
 
         assert_eq!(response.uuid, "tcp-relay-uuid");
         assert_eq!(response.relay_server, "relay.tcp.example:21117");
+        server_task.await.expect("server task should join")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn punch_hole_via_tcp_handles_key_exchange_then_replays_request() -> Result<()> {
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_addr = tcp_listener.local_addr()?;
+
+        let udp_server = UdpSocket::bind(format!("127.0.0.1:{}", tcp_addr.port())).await;
+        let (udp_server, client) = if let Ok(udp) = udp_server {
+            let client = RendezvousClient::connect(&tcp_addr.to_string()).await?;
+            (udp, client)
+        } else {
+            let udp = UdpSocket::bind("127.0.0.1:0").await?;
+            let udp_addr = udp.local_addr()?;
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            socket.connect(udp_addr).await?;
+            let client = RendezvousClient {
+                socket: Arc::new(socket),
+                server_addr: tcp_addr.to_string(),
+            };
+            (udp, client)
+        };
+        let _udp_server = udp_server;
+
+        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let server_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().to_bytes());
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = tcp_listener.accept().await?;
+            let mut transport = TcpTransport::new(stream);
+
+            let first_payload: Vec<u8> = transport.recv().await?;
+            let first_message = RendezvousMessage::decode(first_payload.as_slice())?;
+            match first_message.union {
+                Some(rendezvous_message::Union::PunchHoleRequest(req)) => {
+                    assert_eq!(req.id, "target-keyex");
+                    assert_eq!(req.conn_type, ConnType::Terminal as i32);
+                }
+                other => panic!("expected plaintext PunchHoleRequest, got {other:?}"),
+            }
+
+            let server_ephemeral_sk = BoxSecretKey::generate(&mut rand_core::OsRng);
+            let server_ephemeral_pk = server_ephemeral_sk.public_key().to_bytes();
+            let signed_pk = signing_key.sign(&server_ephemeral_pk).to_bytes();
+            let mut signed_payload = Vec::with_capacity(64 + server_ephemeral_pk.len());
+            signed_payload.extend_from_slice(&signed_pk);
+            signed_payload.extend_from_slice(&server_ephemeral_pk);
+
+            let key_exchange = RendezvousMessage {
+                union: Some(rendezvous_message::Union::KeyExchange(KeyExchange {
+                    keys: vec![signed_payload],
+                })),
+            };
+            transport.send(&encode_rendezvous_message(&key_exchange)?).await?;
+
+            let response_payload: Vec<u8> = transport.recv().await?;
+            let response_message = RendezvousMessage::decode(response_payload.as_slice())?;
+            let response_keys = match response_message.union {
+                Some(rendezvous_message::Union::KeyExchange(resp)) => resp.keys,
+                other => panic!("expected KeyExchange response, got {other:?}"),
+            };
+            assert_eq!(response_keys.len(), 2);
+
+            let client_pk = BoxPublicKey::from_slice(&response_keys[0])
+                .expect("client ephemeral pk should be 32 bytes");
+            let salsa_box = SalsaBox::new(&client_pk, &server_ephemeral_sk);
+            let zero_nonce = Default::default();
+            let session_key = salsa_box
+                .decrypt(&zero_nonce, response_keys[1].as_ref())
+                .expect("server should decrypt session key");
+            let session_key: [u8; 32] = session_key
+                .as_slice()
+                .try_into()
+                .expect("session key should be 32 bytes");
+
+            let mut encrypted = EncryptedStream::new(transport, &session_key);
+            let encrypted_request: Vec<u8> = encrypted.recv().await?;
+            let replayed_message = RendezvousMessage::decode(encrypted_request.as_slice())?;
+            match replayed_message.union {
+                Some(rendezvous_message::Union::PunchHoleRequest(req)) => {
+                    assert_eq!(req.id, "target-keyex");
+                    assert_eq!(req.conn_type, ConnType::Terminal as i32);
+                }
+                other => panic!("expected encrypted PunchHoleRequest replay, got {other:?}"),
+            }
+
+            let response = RendezvousMessage {
+                union: Some(rendezvous_message::Union::RelayResponse(RelayResponse {
+                    socket_addr: Vec::new(),
+                    uuid: "relay-after-keyex".to_string(),
+                    relay_server: "relay.keyex.example:21117".to_string(),
+                    refuse_reason: String::new(),
+                    version: "1.0".to_string(),
+                    feedback: 0,
+                    socket_addr_v6: Vec::new(),
+                    upnp_port: 0,
+                    union: None,
+                })),
+            };
+            encrypted
+                .send(&encode_rendezvous_message(&response)?)
+                .await?;
+
+            Result::<()>::Ok(())
+        });
+
+        let response = client
+            .punch_hole_via_tcp_with_conn_type(
+                "target-keyex",
+                &server_key_b64,
+                ConnType::Terminal,
+                Duration::from_secs(2),
+            )
+            .await?;
+
+        match response {
+            PunchRelayResponse::Relay(resp) => {
+                assert_eq!(resp.uuid, "relay-after-keyex");
+                assert_eq!(resp.relay_server, "relay.keyex.example:21117");
+            }
+            other => panic!("expected RelayResponse after KeyExchange, got {other:?}"),
+        }
+
         server_task.await.expect("server task should join")?;
         Ok(())
     }

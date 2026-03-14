@@ -4,6 +4,10 @@
 mod proto;
 #[path = "../src/rendezvous.rs"]
 mod rendezvous;
+#[path = "../src/transport.rs"]
+mod transport;
+#[path = "../src/crypto.rs"]
+mod crypto;
 
 use anyhow::Result;
 use rand_core::{OsRng, RngCore};

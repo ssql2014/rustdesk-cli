@@ -15,13 +15,55 @@
   - `findings.md` (reset for issue #38)
   - `progress.md` (reset for issue #38)
 
+### Phase 2: Design
+- **Status:** complete
+- Actions taken:
+  - Confirmed `crypto_box` already supports sealed-box behavior.
+  - Checked the official RustDesk client flow to resolve the ambiguity in the local research summary.
+  - Chose to keep the handshake internal to the rendezvous TCP helper and reuse the existing encrypted framed transport model.
+- Files created/modified:
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 3: Implementation
+- **Status:** complete
+- Actions taken:
+  - Added base64 decoding support for the rendezvous server key.
+  - Implemented signed ephemeral key verification for TCP `KeyExchange`.
+  - Replied to hbbs with a two-key `KeyExchange` response and upgraded the stream to `EncryptedStream<TcpTransport>`.
+  - Replayed `PunchHoleRequest` over the encrypted stream.
+  - Added a focused TCP rendezvous regression test.
+  - Updated one integration test to include local `transport` and `crypto` modules because `src/rendezvous.rs` is compiled there via `#[path = ...]`.
+- Files created/modified:
+  - `Cargo.toml` (updated)
+  - `src/rendezvous.rs` (updated)
+  - `tests/live_server_test.rs` (updated)
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 4: Verification
+- **Status:** complete
+- Actions taken:
+  - Ran `cargo build`.
+  - Ran the focused KeyExchange regression test.
+  - Ran the full `cargo test` suite.
+- Files created/modified:
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
 ## Test Results
 | Test | Input | Expected | Actual | Status |
 |------|-------|----------|--------|--------|
 | Dependency audit | `Cargo.toml` + cargo registry | sealed-box support available | `crypto_box::PublicKey::seal` found | ✓ |
 | Transport audit | `src/transport.rs` + `src/crypto.rs` | determine reusable pieces | framing reusable, cipher wrapper not reusable | ✓ |
+| Build verification | `cargo build` | project compiles with TCP KeyExchange fix | passed | ✓ |
+| Targeted regression | `cargo test punch_hole_via_tcp_handles_key_exchange_then_replays_request -- --nocapture` | TCP KeyExchange flow succeeds | passed | ✓ |
+| Full test suite | `cargo test` | no regressions | passed | ✓ |
 
 ## Error Log
 | Timestamp | Error | Attempt | Resolution |
 |-----------|-------|---------|------------|
-|           |       | 1       |            |
+| 2026-03-15 | Local research summary conflicted with the upstream client’s actual TCP handshake flow | 1 | Used the official RustDesk source as the protocol authority and implemented that behavior |

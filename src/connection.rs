@@ -156,7 +156,14 @@ pub async fn connect(config: &ConnectionConfig) -> Result<ConnectionResult> {
     eprintln!("[debug] Phase 3: relay bound, waiting for peer handshake...");
 
     // Phase 4: NaCl handshake + authentication.
-    let result = handshake_and_auth(transport, &server_pk, &config.password, &config.peer_id).await;
+    let result = handshake_and_auth(
+        transport,
+        &server_pk,
+        &config.password,
+        &config.peer_id,
+        &my_id,
+    )
+    .await;
 
     heartbeat.abort();
     result
@@ -256,7 +263,8 @@ async fn handshake_and_auth(
     mut transport: TcpTransport,
     server_ed25519_pk: &[u8; 32],
     password: &str,
-    my_id: &str,
+    peer_id: &str,
+    client_id: &str,
 ) -> Result<ConnectionResult> {
     // --- NaCl key exchange ---
 
@@ -336,9 +344,9 @@ async fn handshake_and_auth(
     // Step 7: Send LoginRequest — encrypted.
     let login_req = Message {
         union: Some(message::Union::LoginRequest(LoginRequest {
-            username: my_id.to_string(),
+            username: peer_id.to_string(),
             password: pw_hash.to_vec(),
-            my_id: my_id.to_string(),
+            my_id: client_id.to_string(),
             my_name: "rustdesk-cli".to_string(),
             option: None,
             video_ack_required: false,

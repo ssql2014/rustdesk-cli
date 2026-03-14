@@ -643,6 +643,59 @@ pub async fn run_daemon(
                     continue;
                 }
 
+                if let SessionCommand::Exec { command, timeout } = &cmd {
+                    let response = match exec_command_streaming(
+                        &mut encrypted,
+                        &mut writer,
+                        command,
+                        *timeout,
+                    )
+                    .await
+                    {
+                        Ok(resp) => resp,
+                        Err(command_err) if should_reconnect(&command_err) => {
+                            match reconnect_encrypted_stream(
+                                &config,
+                                &mut session,
+                                active_conn_type,
+                                |_resp| {},
+                            )
+                            .await
+                            {
+                                Ok(new_conn) => {
+                                    encrypted = new_conn.encrypted;
+                                    match exec_command_streaming(
+                                        &mut encrypted,
+                                        &mut writer,
+                                        command,
+                                        *timeout,
+                                    )
+                                    .await
+                                    {
+                                        Ok(resp) => resp,
+                                        Err(retry_err) => SessionResponse::error(format!(
+                                            "exec failed after reconnect: {retry_err:#}"
+                                        )),
+                                    }
+                                }
+                                Err(reconnect_err) => {
+                                    let resp = SessionResponse::error(format!(
+                                        "connection lost: {command_err:#}; reconnect failed: {reconnect_err:#}"
+                                    ));
+                                    let _ = send_response(&mut writer, &resp).await;
+                                    heartbeat_task.abort();
+                                    graceful_shutdown(&mut encrypted).await?;
+                                    return Err(reconnect_err);
+                                }
+                            }
+                        }
+                        Err(command_err) => SessionResponse::error(format!("{command_err:#}")),
+                    };
+
+                    let _ = send_response(&mut writer, &response).await;
+                    continue;
+                }
+
                 let response = match execute_daemon_command(&mut encrypted, &mut session, cmd.clone()).await {
                     Ok(resp) => resp,
                     Err(command_err) => {
@@ -1138,6 +1191,24 @@ async fn exec_command(
     command: &str,
     timeout_secs: Option<u64>,
 ) -> Result<SessionResponse> {
+    exec_command_inner(encrypted, command, timeout_secs, None).await
+}
+
+async fn exec_command_streaming(
+    encrypted: &mut EncryptedStream<TcpTransport>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    command: &str,
+    timeout_secs: Option<u64>,
+) -> Result<SessionResponse> {
+    exec_command_inner(encrypted, command, timeout_secs, Some(writer)).await
+}
+
+async fn exec_command_inner(
+    encrypted: &mut EncryptedStream<TcpTransport>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    mut stream_writer: Option<&mut tokio::net::unix::OwnedWriteHalf>,
+) -> Result<SessionResponse> {
     // Generate unique sentinel marker using timestamp nanos.
     let sentinel_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1208,6 +1279,9 @@ async fn exec_command(
 
         match terminal::recv_terminal_data_with_timeout(encrypted, remaining).await {
             Ok(TerminalEvent::Data(data)) => {
+                if let Some(writer) = stream_writer.as_deref_mut() {
+                    send_response(writer, &exec_output_chunk_response(&data)).await?;
+                }
                 collected.extend_from_slice(&data);
                 // Check if sentinel output has appeared.
                 if find_sentinel_output(&String::from_utf8_lossy(&collected), &sentinel).is_some() {
@@ -1268,6 +1342,16 @@ fn exec_completion_timeout(timeout_secs: Option<u64>) -> Duration {
         Some(secs) => Duration::from_secs(secs).min(MAX_EXEC_COMPLETION_TIMEOUT),
         None => DEFAULT_EXEC_COMPLETION_TIMEOUT,
     }
+}
+
+fn exec_output_chunk_response(data: &[u8]) -> SessionResponse {
+    SessionResponse::ok_with_data(
+        "exec output chunk",
+        serde_json::json!({
+            "kind": "chunk",
+            "chunk": String::from_utf8_lossy(data),
+        }),
+    )
 }
 
 /// Find the sentinel output line (sentinel followed by digit(s) = exit code).
@@ -1530,6 +1614,7 @@ async fn send_response(
     let mut data = serde_json::to_vec(resp)?;
     data.push(b'\n');
     writer.write_all(&data).await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -2095,6 +2180,15 @@ mod tests {
             exec_completion_timeout(Some(7200)),
             MAX_EXEC_COMPLETION_TIMEOUT
         );
+    }
+
+    #[test]
+    fn exec_output_chunk_response_marks_chunk_kind() {
+        let resp = exec_output_chunk_response(b"hello\n");
+        assert!(resp.success);
+        let data = resp.data.expect("chunk response should have data");
+        assert_eq!(data["kind"], "chunk");
+        assert_eq!(data["chunk"], "hello\n");
     }
 
     #[test]

@@ -750,7 +750,23 @@ fn run() -> i32 {
                 };
             }
 
-            match send_to_daemon(&build_exec_session_command(command.clone(), timeout)) {
+            let mut streamed_output = false;
+            match send_to_daemon_streaming(&build_exec_session_command(command.clone(), timeout), |resp| {
+                let Some(data) = resp.data.as_ref() else {
+                    return;
+                };
+                if data.get("kind").and_then(Value::as_str) != Some("chunk") {
+                    return;
+                }
+                if cli.json {
+                    return;
+                }
+                if let Some(chunk) = data.get("chunk").and_then(Value::as_str) {
+                    print!("{chunk}");
+                    let _ = std::io::stdout().flush();
+                    streamed_output = true;
+                }
+            }) {
                 Ok(resp) if resp.success => {
                     let data = resp.data.unwrap_or_else(|| json!({}));
                     let stdout = data
@@ -765,7 +781,16 @@ fn run() -> i32 {
                         .get("exit_code")
                         .and_then(Value::as_i64)
                         .unwrap_or(0) as i32;
-                    emit_response(cli.json, exec_response(&command, stdout, stderr, exit_code))
+                    if cli.json {
+                        emit_response(cli.json, exec_response(&command, stdout, stderr, exit_code))
+                    } else if streamed_output {
+                        emit_response(
+                            cli.json,
+                            exec_streaming_response(exit_code, data.get("timed_out").and_then(Value::as_bool).unwrap_or(false)),
+                        )
+                    } else {
+                        emit_response(cli.json, exec_response(&command, stdout, stderr, exit_code))
+                    }
                 }
                 Ok(resp) => emit_response(
                     cli.json,
@@ -1778,6 +1803,23 @@ fn exec_response(command: &str, stdout: &str, stderr: &str, exit_code: i32) -> R
             "stdout": stdout,
             "stderr": stderr,
             "exit_code": exit_code
+        }),
+        exit_code: EXIT_SUCCESS,
+    }
+}
+
+fn exec_streaming_response(exit_code: i32, timed_out: bool) -> Response {
+    let mut text = format!("exec exit_code={exit_code}");
+    if timed_out {
+        text.push_str(" timed_out=true");
+    }
+    Response {
+        text,
+        json: json!({
+            "ok": true,
+            "command": "exec",
+            "exit_code": exit_code,
+            "timed_out": timed_out,
         }),
         exit_code: EXIT_SUCCESS,
     }

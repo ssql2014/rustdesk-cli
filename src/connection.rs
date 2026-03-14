@@ -261,17 +261,6 @@ fn check_punch_hole_failure(resp: &PunchHoleResponse) -> Result<()> {
 // Internal: Relay TCP connection + binding
 // ---------------------------------------------------------------------------
 
-async fn relay_connect(relay_addr: &str, uuid: &str, peer_id: &str, licence_key: &str) -> Result<TcpTransport> {
-    relay_connect_with_type(
-        relay_addr,
-        uuid,
-        peer_id,
-        licence_key,
-        ConnType::DefaultConn,
-    )
-    .await
-}
-
 async fn relay_connect_with_type(
     relay_addr: &str,
     uuid: &str,

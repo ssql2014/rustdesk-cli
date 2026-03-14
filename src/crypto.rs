@@ -65,8 +65,20 @@ pub fn key_exchange(server_ed25519_pk: &[u8; 32]) -> Result<KeyExchangeResult> {
     // Ed25519 PK → Curve25519 PK
     let ed_pk = VerifyingKey::from_bytes(server_ed25519_pk)
         .context("Invalid Ed25519 public key")?;
-    let server_box_pk = BoxPublicKey::from(ed_pk.to_montgomery().to_bytes());
+    let their_box_pk = BoxPublicKey::from(ed_pk.to_montgomery().to_bytes());
+    key_exchange_with_box_pk(&their_box_pk)
+}
 
+/// Perform key exchange with a Curve25519 (X25519) box public key directly.
+///
+/// Used when the peer provides its ephemeral Curve25519 pk in the SignedId
+/// (via IdPk.pk), rather than an Ed25519 key that needs conversion.
+pub fn key_exchange_curve25519(their_pk_bytes: &[u8; 32]) -> Result<KeyExchangeResult> {
+    let their_box_pk = BoxPublicKey::from(*their_pk_bytes);
+    key_exchange_with_box_pk(&their_box_pk)
+}
+
+fn key_exchange_with_box_pk(their_box_pk: &BoxPublicKey) -> Result<KeyExchangeResult> {
     // Ephemeral Curve25519 key pair
     let ephemeral_sk = BoxSecretKey::generate(&mut OsRng);
     let ephemeral_pk = ephemeral_sk.public_key();
@@ -77,7 +89,7 @@ pub fn key_exchange(server_ed25519_pk: &[u8; 32]) -> Result<KeyExchangeResult> {
     session_key.copy_from_slice(&key_ga);
 
     // Seal session key with zeroed nonce
-    let salsa_box = SalsaBox::new(&server_box_pk, &ephemeral_sk);
+    let salsa_box = SalsaBox::new(their_box_pk, &ephemeral_sk);
     let zero_nonce = Default::default();
     let sealed_key = salsa_box
         .encrypt(&zero_nonce, session_key.as_ref())

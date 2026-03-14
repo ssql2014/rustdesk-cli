@@ -8,6 +8,8 @@ use prost::Message;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use crate::proto::hbb::{
     ConnType, NatType, PunchHoleRequest, PunchHoleResponse, RegisterPeer, RegisterPeerResponse,
     RegisterPk, RegisterPkResponse, RelayResponse, RendezvousMessage, RequestRelay,
@@ -16,6 +18,7 @@ use crate::proto::hbb::{
 
 pub struct RendezvousClient {
     socket: Arc<UdpSocket>,
+    server_addr: String,
 }
 
 impl RendezvousClient {
@@ -28,7 +31,10 @@ impl RendezvousClient {
             .connect(server_addr)
             .await
             .with_context(|| format!("failed to connect UDP socket to rendezvous server {server_addr}"))?;
-        Ok(Self { socket: Arc::new(socket) })
+        Ok(Self {
+            socket: Arc::new(socket),
+            server_addr: server_addr.to_string(),
+        })
     }
 
     /// Spawn a background task that sends RegisterPeer every 10 seconds to
@@ -112,6 +118,32 @@ impl RendezvousClient {
         }
     }
 
+    /// Fire-and-forget PunchHole: send the request without waiting for a response.
+    /// With correct licence_key, hbbs forwards to the peer and sends NO response
+    /// back to the requester.
+    pub async fn send_punch_hole(&self, target_id: &str, licence_key: &str) -> Result<()> {
+        let udp_port = self.socket.local_addr()?.port() as i32;
+        let request = RendezvousMessage {
+            union: Some(rendezvous_message::Union::PunchHoleRequest(PunchHoleRequest {
+                id: target_id.to_string(),
+                nat_type: NatType::UnknownNat as i32,
+                licence_key: licence_key.to_string(),
+                conn_type: ConnType::DefaultConn as i32,
+                token: String::new(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                udp_port,
+                force_relay: true,
+                upnp_port: 0,
+                socket_addr_v6: Vec::new(),
+            })),
+        };
+
+        let mut buf = Vec::new();
+        request.encode(&mut buf)?;
+        self.socket.send(&buf).await?;
+        Ok(())
+    }
+
     pub async fn request_relay(&self) -> Result<RelayResponse> {
         self.request_relay_for("", "", &[], "").await
     }
@@ -140,6 +172,59 @@ impl RendezvousClient {
         match self.send_request(&request).await?.union {
             Some(rendezvous_message::Union::RelayResponse(response)) => Ok(response),
             other => bail!("unexpected rendezvous response to RequestRelay: {other:?}"),
+        }
+    }
+
+    /// Send RequestRelay over TCP to hbbs using BytesCodec framing.
+    ///
+    /// hbbs ignores RequestRelay over UDP — it only processes them via TCP.
+    /// The client generates its own UUID; hbbs forwards to the peer, then
+    /// sends back a RelayResponse.
+    pub async fn request_relay_via_tcp(
+        &self,
+        target_id: &str,
+        relay_server: &str,
+        socket_addr: &[u8],
+        licence_key: &str,
+        uuid: &str,
+    ) -> Result<RelayResponse> {
+        let request = RendezvousMessage {
+            union: Some(rendezvous_message::Union::RequestRelay(RequestRelay {
+                id: target_id.to_string(),
+                uuid: uuid.to_string(),
+                socket_addr: socket_addr.to_vec(),
+                relay_server: relay_server.to_string(),
+                secure: true,
+                licence_key: licence_key.to_string(),
+                conn_type: ConnType::DefaultConn as i32,
+                token: String::new(),
+                control_permissions: None,
+            })),
+        };
+
+        let mut stream = tokio::net::TcpStream::connect(&self.server_addr)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open TCP to rendezvous server {} for RequestRelay",
+                    self.server_addr
+                )
+            })?;
+
+        // Send with BytesCodec framing (variable-length header, low 2 bits = header_size - 1).
+        let mut buf = Vec::new();
+        request.encode(&mut buf)?;
+        bytescodec_send(&mut stream, &buf).await?;
+
+        // Receive response with BytesCodec framing.
+        let resp_bytes = bytescodec_recv(&mut stream).await.context("reading RelayResponse over TCP")?;
+
+        let response = RendezvousMessage::decode(resp_bytes.as_slice())
+            .context("decode RelayResponse from TCP")?;
+
+        match response.union {
+            Some(rendezvous_message::Union::RelayResponse(r)) => Ok(r),
+            other => bail!("expected RelayResponse over TCP, got {other:?}"),
         }
     }
 
@@ -197,6 +282,52 @@ fn spawn_heartbeat(socket: Arc<UdpSocket>, id: String, period: Duration) -> Join
             }
         }
     })
+}
+
+/// Send a protobuf payload with BytesCodec framing over a TCP stream.
+/// (Standalone helper so rendezvous.rs doesn't depend on transport::FramedTransport.)
+async fn bytescodec_send<S: tokio::io::AsyncWrite + Unpin>(stream: &mut S, msg: &[u8]) -> Result<()> {
+    let len = msg.len();
+    if len <= 0x3F {
+        let b = ((len as u8) << 2) | 0b00;
+        stream.write_all(&[b]).await?;
+    } else if len <= 0x3FFF {
+        let val = ((len as u16) << 2) | 0b01;
+        stream.write_all(&val.to_le_bytes()).await?;
+    } else if len <= 0x3F_FFFF {
+        let val = ((len as u32) << 2) | 0b10;
+        let bytes = val.to_le_bytes();
+        stream.write_all(&bytes[..3]).await?;
+    } else if len <= 0x3FFF_FFFF {
+        let val = ((len as u32) << 2) | 0b11;
+        stream.write_all(&val.to_le_bytes()).await?;
+    } else {
+        bail!("bytescodec_send: payload too large: {len} bytes");
+    }
+    stream.write_all(msg).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Receive a BytesCodec-framed payload from a TCP stream.
+async fn bytescodec_recv<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
+    let mut first = [0_u8; 1];
+    stream.read_exact(&mut first).await?;
+    let tag = first[0] & 0x03;
+    let header_len = (tag + 1) as usize;
+    let mut raw = [0_u8; 4];
+    raw[0] = first[0];
+    if header_len > 1 {
+        stream.read_exact(&mut raw[1..header_len]).await?;
+    }
+    let combined = u32::from_le_bytes(raw);
+    let payload_len = (combined >> 2) as usize;
+    if payload_len > 64 * 1024 * 1024 {
+        bail!("bytescodec_recv: payload {payload_len} exceeds 64 MiB limit");
+    }
+    let mut payload = vec![0_u8; payload_len];
+    stream.read_exact(&mut payload).await?;
+    Ok(payload)
 }
 
 #[cfg(test)]
@@ -445,6 +576,89 @@ mod tests {
             .await?;
 
         assert_eq!(response.uuid, "relay-uuid");
+        server_task.await.expect("server task should join")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_relay_via_tcp_sends_over_tcp_and_returns_response() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Bind both a UDP server (for RendezvousClient::connect) and a TCP
+        // server (for the actual RequestRelay exchange) on the same port.
+        // We use port 0 twice — the OS assigns different ephemeral ports, so
+        // we bind TCP first and then point the UDP socket at it won't work.
+        // Instead: bind TCP, get its port, bind UDP on the same port.
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_addr = tcp_listener.local_addr()?;
+
+        let udp_server = UdpSocket::bind(format!("127.0.0.1:{}", tcp_addr.port())).await;
+        // If the OS won't let us reuse the port for UDP, bind on a different
+        // port and create the client manually.
+        let (udp_server, client) = if let Ok(udp) = udp_server {
+            let client = RendezvousClient::connect(&tcp_addr.to_string()).await?;
+            (udp, client)
+        } else {
+            let udp = UdpSocket::bind("127.0.0.1:0").await?;
+            let udp_addr = udp.local_addr()?;
+            // Client's UDP socket connects to the UDP server, but server_addr
+            // must point at the TCP listener for request_relay_via_tcp.
+            let bind_addr = "0.0.0.0:0";
+            let socket = UdpSocket::bind(bind_addr).await?;
+            socket.connect(udp_addr).await?;
+            let client = RendezvousClient {
+                socket: Arc::new(socket),
+                server_addr: tcp_addr.to_string(),
+            };
+            (udp, client)
+        };
+        // Keep udp_server alive so the client's UDP connect doesn't fail.
+        let _udp_server = udp_server;
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await?;
+
+            // Read framed message with BytesCodec framing.
+            let payload = bytescodec_recv(&mut stream).await?;
+
+            let message = RendezvousMessage::decode(payload.as_slice())?;
+            match message.union {
+                Some(rendezvous_message::Union::RequestRelay(req)) => {
+                    assert_eq!(req.id, "target-tcp");
+                    assert_eq!(req.relay_server, "relay.tcp.example:21117");
+                    assert_eq!(req.licence_key, "tcp-key");
+                    assert_eq!(req.uuid, "test-uuid-1234");
+                    assert!(req.secure);
+                }
+                other => panic!("expected RequestRelay over TCP, got {other:?}"),
+            }
+
+            let response = RendezvousMessage {
+                union: Some(rendezvous_message::Union::RelayResponse(RelayResponse {
+                    socket_addr: Vec::new(),
+                    uuid: "tcp-relay-uuid".to_string(),
+                    relay_server: "relay.tcp.example:21117".to_string(),
+                    refuse_reason: String::new(),
+                    version: "1.0".to_string(),
+                    feedback: 0,
+                    socket_addr_v6: Vec::new(),
+                    upnp_port: 0,
+                    union: None,
+                })),
+            };
+            let mut encoded = Vec::new();
+            response.encode(&mut encoded)?;
+            bytescodec_send(&mut stream, &encoded).await?;
+
+            Result::<()>::Ok(())
+        });
+
+        let response = client
+            .request_relay_via_tcp("target-tcp", "relay.tcp.example:21117", &[], "tcp-key", "test-uuid-1234")
+            .await?;
+
+        assert_eq!(response.uuid, "tcp-relay-uuid");
+        assert_eq!(response.relay_server, "relay.tcp.example:21117");
         server_task.await.expect("server task should join")?;
         Ok(())
     }

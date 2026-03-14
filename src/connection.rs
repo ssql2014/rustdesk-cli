@@ -16,7 +16,7 @@ use tokio::time::timeout;
 
 use crate::crypto::{self, EncryptedStream, KeyExchangeResult};
 use crate::proto::hbb::{
-    LoginRequest, Message, PeerInfo, PublicKey, PunchHoleResponse,
+    IdPk, LoginRequest, Message, PeerInfo, PublicKey, PunchHoleResponse,
     login_response, message, punch_hole_response,
 };
 use crate::rendezvous::RendezvousClient;
@@ -56,43 +56,20 @@ pub struct ConnectionResult {
 
 /// Connect to a remote RustDesk peer through the full protocol flow.
 ///
-/// 1. Rendezvous discovery via hbbs (PunchHole + relay fallback)
-/// 2. Relay TCP connection via hbbr
-/// 3. NaCl key exchange (Ed25519→Curve25519, crypto_box)
-/// 4. Password authentication (two-stage SHA256)
+/// 1. Register with hbbs + heartbeat warmup
+/// 2. Fire PunchHole (no wait — hbbs forwards silently on success)
+/// 3. Immediately connect to hbbr and send relay binding
+/// 4. NaCl key exchange + password authentication
 /// 5. Returns PeerInfo + encrypted stream
 pub async fn connect(config: &ConnectionConfig) -> Result<ConnectionResult> {
     let server_pk = decode_server_key(&config.server_key)?;
 
-    // Phase 1: Rendezvous discovery.
-    let relay_info = rendezvous_discover(config).await?;
-
-    // Phase 2: Relay TCP connection.
-    let relay_addr = relay_info
-        .relay_server
-        .as_deref()
-        .unwrap_or(&config.relay_server);
-    let transport = relay_connect(relay_addr, &relay_info.uuid, &config.peer_id, &config.server_key).await?;
-
-    // Phase 3+4: NaCl handshake + authentication (takes ownership of transport).
-    handshake_and_auth(transport, &server_pk, &config.password, &config.peer_id).await
-}
-
-// ---------------------------------------------------------------------------
-// Internal: Rendezvous discovery
-// ---------------------------------------------------------------------------
-
-struct RelayInfo {
-    relay_server: Option<String>,
-    uuid: String,
-}
-
-async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
+    // Phase 1: Register with hbbs and start heartbeat.
+    eprintln!("[debug] Phase 1: registering with hbbs...");
     let client = RendezvousClient::connect(&config.id_server)
         .await
         .context("failed to connect to rendezvous server")?;
 
-    // Register ourselves as a peer (required before punch-hole).
     let my_id = format!("cli-{}", std::process::id());
     let register_response = client
         .register_peer(&my_id, &[])
@@ -104,96 +81,88 @@ async fn rendezvous_discover(config: &ConnectionConfig) -> Result<RelayInfo> {
         let mut public_key = [0_u8; 32];
         OsRng.fill_bytes(&mut uuid);
         OsRng.fill_bytes(&mut public_key);
-
         client
             .register_pk(&my_id, &uuid, &public_key)
             .await
             .context("RegisterPk failed")?;
     }
 
-    // Start heartbeat to maintain presence on the rendezvous server.
-    // The first heartbeat fires immediately; yield to let it send before
-    // we proceed with PunchHole.
     let heartbeat = client.start_heartbeat(&my_id);
     tokio::task::yield_now().await;
 
-    // State warm-up: the server may need several sustained heartbeats
-    // before it will respond to PunchHoleRequests (Nova §28).
-    let warmup = config.warmup_secs;
-    if warmup > 0 {
-        tokio::time::sleep(tokio::time::Duration::from_secs(warmup)).await;
+    if config.warmup_secs > 0 {
+        eprintln!("[debug] Heartbeat warmup {}s...", config.warmup_secs);
+        tokio::time::sleep(tokio::time::Duration::from_secs(config.warmup_secs)).await;
     }
 
-    // Wrap remaining discovery in an async block so we always abort the
-    // heartbeat, even on error paths.
-    let result = async {
-        // Try PunchHole first (5s timeout).  If the server responds we
-        // extract its relay_server hint.  If it times out or fails (NAT
-        // traversal hanging) we fall back to direct relay request.
-        let (relay_hint, socket_hint) = match tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            client.punch_hole(&config.peer_id, &config.server_key),
-        )
+    // Phase 2: Generate UUID and send RequestRelay to hbbs via TCP.
+    // The official client generates its own UUID and sends it to both
+    // hbbs (so hbbs can forward to the peer) and hbbr (to bind the relay).
+    let mut uuid_bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut uuid_bytes);
+    let session_uuid: String = uuid_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    eprintln!("[debug] Phase 2: sending PunchHole + RequestRelay (uuid={})...", &session_uuid[..8]);
+
+    // Fire PunchHole first (UDP, fire-and-forget).
+    client
+        .send_punch_hole(&config.peer_id, &config.server_key)
         .await
-        {
-            Ok(Ok(ph_response)) => {
-                // PunchHole succeeded — check for hard failures.
-                check_punch_hole_failure(&ph_response)?;
-                let relay = if ph_response.relay_server.is_empty() {
-                    None
-                } else {
-                    Some(ph_response.relay_server.clone())
-                };
-                (relay, ph_response.socket_addr.clone())
+        .context("failed to send PunchHole")?;
+
+    // Send RequestRelay to hbbs via TCP (with correct BytesCodec framing).
+    // hbbs forwards this to the peer, who then connects to hbbr with our UUID.
+    let relay_addr = match tokio::time::timeout(
+        tokio::time::Duration::from_secs(15),
+        client.request_relay_via_tcp(
+            &config.peer_id,
+            &config.relay_server,
+            &[],
+            &config.server_key,
+            &session_uuid,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(relay_response)) => {
+            if !relay_response.refuse_reason.is_empty() {
+                bail!("relay refused: {}", relay_response.refuse_reason);
             }
-            Ok(Err(_)) | Err(_) => {
-                // PunchHole failed or timed out — fall back to relay.
-                (None, Vec::new())
+            eprintln!("[debug] Phase 2: got RelayResponse, relay={:?}", relay_response.relay_server);
+            if relay_response.relay_server.is_empty() {
+                config.relay_server.clone()
+            } else {
+                relay_response.relay_server
             }
-        };
-
-        // Request relay (10s timeout to avoid hanging forever when peer is offline).
-        let relay_target = relay_hint.as_deref().unwrap_or(&config.relay_server);
-        let relay_response = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            client.request_relay_for(
-                &config.peer_id,
-                relay_target,
-                &socket_hint,
-                &config.server_key,
-            ),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!(
-            "RequestRelay timed out — peer {} may be offline or unreachable",
-            config.peer_id
-        ))?
-        .context("RequestRelay failed")?;
-
-        if !relay_response.refuse_reason.is_empty() {
-            bail!("relay refused: {}", relay_response.refuse_reason);
         }
-        if relay_response.uuid.is_empty() {
-            bail!("relay server returned empty session uuid");
+        Ok(Err(e)) => {
+            eprintln!("[debug] Phase 2: RequestRelay TCP failed: {e:#}, using default relay");
+            config.relay_server.clone()
         }
+        Err(_) => {
+            eprintln!("[debug] Phase 2: RequestRelay timed out, using default relay");
+            config.relay_server.clone()
+        }
+    };
 
-        let uuid = relay_response.uuid;
-        let relay_addr = if relay_response.relay_server.is_empty() {
-            relay_hint
-        } else {
-            Some(relay_response.relay_server)
-        };
+    // Phase 3: Connect to hbbr with the same UUID.
+    eprintln!("[debug] Phase 3: connecting to relay {}...", relay_addr);
+    let transport = relay_connect(
+        &relay_addr,
+        &session_uuid,
+        &config.peer_id,
+        &config.server_key,
+    )
+    .await?;
+    eprintln!("[debug] Phase 3: relay bound, waiting for peer handshake...");
 
-        Ok(RelayInfo {
-            relay_server: relay_addr,
-            uuid,
-        })
-    }
-    .await;
+    // Phase 4: NaCl handshake + authentication.
+    let result = handshake_and_auth(transport, &server_pk, &config.password, &config.peer_id).await;
 
     heartbeat.abort();
     result
 }
+
+// (rendezvous_discover removed — connect() now handles the full flow inline)
 
 /// Check for immediate PunchHole failure codes and bail with a descriptive error.
 ///
@@ -292,23 +261,45 @@ async fn handshake_and_auth(
     // --- NaCl key exchange ---
 
     // Step 1: Receive SignedId from host.
-    let raw = timeout(Duration::from_secs(10), transport.recv())
+    // Longer timeout: peer needs time to receive PunchHole and connect to hbbr.
+    let raw = timeout(Duration::from_secs(30), transport.recv())
         .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for SignedId from peer"))?
+        .map_err(|_| anyhow::anyhow!("timed out waiting for SignedId from peer (30s)"))?
         .context("waiting for SignedId")?;
     let msg = Message::decode(raw.as_slice()).context("decode SignedId message")?;
 
-    match msg.union {
-        Some(message::Union::SignedId(_)) => {}
+    let signed_id = match msg.union {
+        Some(message::Union::SignedId(sid)) => sid,
         other => bail!("expected SignedId, got {other:?}"),
     };
 
-    // Step 2: Perform key exchange using the server's known Ed25519 PK.
+    // Step 2: Extract the peer's ephemeral Curve25519 pk from SignedId.
+    //
+    // SignedId.id format: [64-byte Ed25519 signature] [protobuf-encoded IdPk]
+    // IdPk { id: string, pk: bytes(32) } where pk is a Curve25519 box public key.
+    //
+    // We skip signature verification for now (would need the peer's Ed25519 signing
+    // key from the rendezvous server) and just parse the IdPk payload.
+    let signed_bytes = &signed_id.id;
+    if signed_bytes.len() <= 64 {
+        bail!("SignedId too short ({} bytes), expected >64", signed_bytes.len());
+    }
+
+    let id_pk_bytes = &signed_bytes[64..]; // strip Ed25519 signature
+    let id_pk = IdPk::decode(id_pk_bytes).context("decode IdPk from SignedId")?;
+
+    eprintln!("[debug] SignedId: peer_id={}, pk_len={}", id_pk.id, id_pk.pk.len());
+
+    let peer_box_pk: [u8; 32] = id_pk.pk.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!("peer Curve25519 pk is {} bytes, expected 32", id_pk.pk.len())
+    })?;
+
     let KeyExchangeResult {
         ephemeral_pk,
         sealed_key,
         session_key,
-    } = crypto::key_exchange(server_ed25519_pk).context("NaCl key exchange failed")?;
+    } = crypto::key_exchange_curve25519(&peer_box_pk)
+        .context("NaCl key exchange with peer's Curve25519 pk failed")?;
 
     // Step 3: Send PublicKey message to host.
     let pk_msg = Message {
@@ -365,20 +356,30 @@ async fn handshake_and_auth(
     encrypted.send(&buf).await?;
 
     // Step 8: Receive LoginResponse — encrypted.
-    let resp_raw = timeout(Duration::from_secs(10), encrypted.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for LoginResponse from peer"))?
-        .context("waiting for LoginResponse")?;
-    let resp_msg = Message::decode(resp_raw.as_slice()).context("decode LoginResponse")?;
+    // The peer may send TestDelay or other messages before LoginResponse;
+    // loop until we get the actual response.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let peer_info = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out waiting for LoginResponse from peer");
+        }
+        let resp_raw = timeout(remaining, encrypted.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for LoginResponse from peer"))?
+            .context("waiting for LoginResponse")?;
+        let resp_msg = Message::decode(resp_raw.as_slice()).context("decode LoginResponse")?;
 
-    let peer_info = match resp_msg.union {
-        Some(message::Union::LoginResponse(lr)) => match lr.union {
-            Some(login_response::Union::PeerInfo(info)) => info,
-            Some(login_response::Union::Error(e)) => bail!("login rejected: {e}"),
-            None => bail!("LoginResponse has no union field"),
-        },
-        Some(message::Union::PeerInfo(info)) => info,
-        other => bail!("expected LoginResponse, got {other:?}"),
+        match resp_msg.union {
+            Some(message::Union::LoginResponse(lr)) => match lr.union {
+                Some(login_response::Union::PeerInfo(info)) => break info,
+                Some(login_response::Union::Error(e)) => bail!("login rejected: {e}"),
+                None => bail!("LoginResponse has no union field"),
+            },
+            Some(message::Union::PeerInfo(info)) => break info,
+            Some(message::Union::TestDelay(_)) => continue, // skip TestDelay
+            other => bail!("expected LoginResponse, got {other:?}"),
+        }
     };
 
     Ok(ConnectionResult {

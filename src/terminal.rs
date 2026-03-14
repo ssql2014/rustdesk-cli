@@ -7,6 +7,7 @@
 use anyhow::{Context, Result, bail};
 use prost::Message as ProstMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{Duration, timeout};
 
 use crate::connection::{self, ConnectionConfig, ConnectionResult};
 use crate::crypto::EncryptedStream;
@@ -61,6 +62,9 @@ fn default_terminal_size() -> (u32, u32) {
     (rows, cols)
 }
 
+const TERMINAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const OPEN_TERMINAL_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ---------------------------------------------------------------------------
 // Send helpers
 // ---------------------------------------------------------------------------
@@ -91,19 +95,26 @@ async fn send_action<T: Transport>(
 async fn recv_terminal_response<T: Transport>(
     stream: &mut EncryptedStream<T>,
 ) -> Result<terminal_response::Union> {
-    loop {
-        let raw = stream.recv().await.context("reading terminal response")?;
-        let msg = Message::decode(raw.as_slice()).context("decoding Message")?;
+    timeout(TERMINAL_RESPONSE_TIMEOUT, async {
+        loop {
+            let raw = stream.recv().await.context("reading terminal response")?;
+            let msg = Message::decode(raw.as_slice()).context("decoding Message")?;
 
-        match msg.union {
-            Some(message::Union::TerminalResponse(tr)) => match tr.union {
-                Some(inner) => return Ok(inner),
-                None => bail!("TerminalResponse with empty union"),
-            },
-            // Ignore non-terminal messages (video frames, test delays, etc.)
-            _ => continue,
+            match msg.union {
+                Some(message::Union::TerminalResponse(tr)) => match tr.union {
+                    Some(inner) => return Ok(inner),
+                    None => bail!("TerminalResponse with empty union"),
+                },
+                // Ignore non-terminal messages (video frames, test delays, etc.)
+                _ => continue,
+            }
         }
-    }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!(
+        "timed out waiting for TerminalResponse after {}s",
+        TERMINAL_RESPONSE_TIMEOUT.as_secs()
+    ))?
 }
 
 // ---------------------------------------------------------------------------
@@ -223,8 +234,12 @@ pub async fn open_terminal<T: Transport>(
     .context("sending OpenTerminal")?;
 
     // Wait for TerminalOpened.
-    let resp = recv_terminal_response(stream)
+    let resp = timeout(OPEN_TERMINAL_TIMEOUT, recv_terminal_response(stream))
         .await
+        .map_err(|_| anyhow::anyhow!(
+            "timed out waiting for TerminalOpened after {}s",
+            OPEN_TERMINAL_TIMEOUT.as_secs()
+        ))?
         .context("waiting for TerminalOpened")?;
 
     match resp {

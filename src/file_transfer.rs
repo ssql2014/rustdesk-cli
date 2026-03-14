@@ -8,10 +8,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::crypto::EncryptedStream;
 use crate::proto::hbb::{
-    FileAction, FileResponse, FileTransferBlock, FileTransferDigest, FileTransferDone,
-    FileTransferError, FileTransferSendConfirmRequest, FileTransferSendRequest, Message,
-    TestDelay, file_action, file_response, file_transfer_send_confirm_request,
-    file_transfer_send_request, message, misc,
+    FileAction, FileEntry, FileResponse, FileTransferBlock, FileTransferDigest,
+    FileTransferDone, FileTransferError, FileTransferReceiveRequest,
+    FileTransferSendConfirmRequest, FileType, Message, TestDelay, file_action, file_response,
+    file_transfer_send_confirm_request, message, misc,
 };
 use crate::transport::Transport;
 
@@ -45,12 +45,19 @@ pub struct PushTransfer {
     transferred_bytes: u64,
     resumed_bytes: u64,
     job_id: i32,
+    skip_transfer: bool,
 }
 
 enum FileTransferEvent {
     Digest(FileTransferDigest),
+    Confirm(FileTransferSendConfirmRequest),
     Done(FileTransferDone),
     Error(FileTransferError),
+}
+
+struct RemoteTarget {
+    dir: String,
+    file_name: String,
 }
 
 impl PushTransfer {
@@ -68,16 +75,30 @@ impl PushTransfer {
 
         let total_bytes = metadata.len();
         let job_id = new_job_id();
+        let target = parse_remote_target(remote_path, local_path)?;
+        let modified_time = metadata
+            .modified()
+            .ok()
+            .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+
         send_message(
             stream,
             Message {
                 union: Some(message::Union::FileAction(FileAction {
-                    union: Some(file_action::Union::Send(FileTransferSendRequest {
+                    union: Some(file_action::Union::Receive(FileTransferReceiveRequest {
                         id: job_id,
-                        path: remote_path.to_string(),
-                        include_hidden: false,
+                        path: target.dir,
+                        files: vec![FileEntry {
+                            entry_type: FileType::File as i32,
+                            name: target.file_name,
+                            is_hidden: false,
+                            size: total_bytes,
+                            modified_time,
+                        }],
                         file_num: 1,
-                        file_type: file_transfer_send_request::FileType::Generic as i32,
+                        total_size: total_bytes,
                     })),
                 })),
             },
@@ -85,46 +106,47 @@ impl PushTransfer {
         .await
         .context("sending file transfer request")?;
 
-        let digest = loop {
+        // For upload, the sender announces its local file digest first. The
+        // remote side then replies with either SendConfirm(offset/skip) or a
+        // digest challenge describing the existing remote file.
+        send_local_digest(stream, job_id, total_bytes, modified_time, true)
+            .await
+            .context("sending local file digest")?;
+
+        let mut resumed_bytes = 0;
+        let mut skip_transfer = false;
+        loop {
             match recv_file_event(stream, job_id)
                 .await
-                .context("waiting for file transfer digest")?
+                .context("waiting for file transfer confirmation")?
             {
-                FileTransferEvent::Digest(digest) => break digest,
+                FileTransferEvent::Digest(digest) => {
+                    resumed_bytes = confirm_upload_from_remote_digest(
+                        stream,
+                        job_id,
+                        &digest,
+                        total_bytes,
+                    )
+                    .await?;
+                    break;
+                }
+                FileTransferEvent::Confirm(confirm) => {
+                    match confirm.union {
+                        Some(file_transfer_send_confirm_request::Union::Skip(true)) => {
+                            resumed_bytes = total_bytes;
+                            skip_transfer = true;
+                        }
+                        Some(file_transfer_send_confirm_request::Union::OffsetBlk(offset)) => {
+                            resumed_bytes = (offset as u64).min(total_bytes);
+                        }
+                        _ => {}
+                    }
+                    break;
+                }
                 FileTransferEvent::Error(err) => bail!("file transfer error: {}", err.error),
                 FileTransferEvent::Done(_) => continue,
             }
-        };
-
-        let resumed_bytes = if digest.is_identical {
-            digest
-                .transferred_size
-                .min(total_bytes)
-                .min(u32::MAX as u64)
-        } else {
-            0
-        };
-        let resume_offset = resumed_bytes as u32;
-        send_message(
-            stream,
-            Message {
-                union: Some(message::Union::FileAction(FileAction {
-                    union: Some(file_action::Union::SendConfirm(
-                        FileTransferSendConfirmRequest {
-                            id: job_id,
-                            file_num: digest.file_num,
-                            union: Some(
-                                file_transfer_send_confirm_request::Union::OffsetBlk(
-                                    resume_offset,
-                                ),
-                            ),
-                        },
-                    )),
-                })),
-            },
-        )
-        .await
-        .context("sending file transfer confirmation")?;
+        }
 
         let mut file = File::open(local_path)
             .await
@@ -149,6 +171,7 @@ impl PushTransfer {
             transferred_bytes: 0,
             resumed_bytes,
             job_id,
+            skip_transfer,
         })
     }
 
@@ -177,6 +200,10 @@ impl PushTransfer {
         &mut self,
         stream: &mut EncryptedStream<T>,
     ) -> Result<bool> {
+        if self.skip_transfer {
+            return Ok(false);
+        }
+
         let mut chunk = vec![0u8; FILE_TRANSFER_BLOCK_SIZE];
         let read = self
             .file
@@ -216,17 +243,78 @@ impl PushTransfer {
         &self,
         stream: &mut EncryptedStream<T>,
     ) -> Result<()> {
-        loop {
-            match recv_file_event(stream, self.job_id)
-                .await
-                .context("waiting for file transfer completion")?
-            {
-                FileTransferEvent::Done(done) if done.file_num == 0 => return Ok(()),
-                FileTransferEvent::Error(err) => bail!("file transfer error: {}", err.error),
-                FileTransferEvent::Digest(_) | FileTransferEvent::Done(_) => continue,
-            }
+        if self.skip_transfer {
+            return Ok(());
+        }
+
+        send_message(
+            stream,
+            Message {
+                union: Some(message::Union::FileResponse(FileResponse {
+                    union: Some(file_response::Union::Done(FileTransferDone {
+                        id: self.job_id,
+                        file_num: 0,
+                    })),
+                })),
+            },
+        )
+        .await
+        .context("sending file transfer completion")?;
+
+        match tokio::time::timeout(Duration::from_millis(500), recv_file_event(stream, self.job_id))
+            .await
+        {
+            Ok(Ok(FileTransferEvent::Error(err))) => bail!("file transfer error: {}", err.error),
+            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => Ok(()),
         }
     }
+}
+
+pub fn remote_target_dir(remote_path: &str, local_path: &Path) -> Result<String> {
+    Ok(parse_remote_target(remote_path, local_path)?.dir)
+}
+
+fn parse_remote_target(remote_path: &str, local_path: &Path) -> Result<RemoteTarget> {
+    let trimmed = remote_path.trim();
+    if trimmed.is_empty() {
+        bail!("remote path must not be empty");
+    }
+
+    let default_name = local_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("local path has no valid file name: {}", local_path.display()))?
+        .to_string();
+
+    if trimmed.ends_with('/') {
+        let dir = trimmed.trim_end_matches('/').to_string();
+        if dir.is_empty() {
+            return Ok(RemoteTarget {
+                dir: "/".to_string(),
+                file_name: default_name,
+            });
+        }
+        return Ok(RemoteTarget {
+            dir,
+            file_name: default_name,
+        });
+    }
+
+    if let Some((dir, file_name)) = trimmed.rsplit_once('/') {
+        let dir = if dir.is_empty() { "/" } else { dir };
+        if file_name.is_empty() {
+            bail!("remote path has no file name: {remote_path}");
+        }
+        return Ok(RemoteTarget {
+            dir: dir.to_string(),
+            file_name: file_name.to_string(),
+        });
+    }
+
+    Ok(RemoteTarget {
+        dir: ".".to_string(),
+        file_name: trimmed.to_string(),
+    })
 }
 
 fn compress_chunk(chunk: &[u8]) -> Result<(Vec<u8>, bool)> {
@@ -247,6 +335,76 @@ async fn send_message<T: Transport>(
     stream.send(&buf).await
 }
 
+async fn send_local_digest<T: Transport>(
+    stream: &mut EncryptedStream<T>,
+    job_id: i32,
+    total_bytes: u64,
+    modified_time: u64,
+    is_resume: bool,
+) -> Result<()> {
+    send_message(
+        stream,
+        Message {
+            union: Some(message::Union::FileResponse(FileResponse {
+                union: Some(file_response::Union::Digest(FileTransferDigest {
+                    id: job_id,
+                    file_num: 0,
+                    last_modified: modified_time,
+                    file_size: total_bytes,
+                    is_resume,
+                    ..Default::default()
+                })),
+            })),
+        },
+    )
+    .await
+}
+
+async fn send_confirm<T: Transport>(
+    stream: &mut EncryptedStream<T>,
+    job_id: i32,
+    file_num: i32,
+    resume_offset: u32,
+) -> Result<()> {
+    send_message(
+        stream,
+        Message {
+            union: Some(message::Union::FileAction(FileAction {
+                union: Some(file_action::Union::SendConfirm(
+                    FileTransferSendConfirmRequest {
+                        id: job_id,
+                        file_num,
+                        union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(
+                            resume_offset,
+                        )),
+                    },
+                )),
+            })),
+        },
+    )
+    .await
+}
+
+async fn confirm_upload_from_remote_digest<T: Transport>(
+    stream: &mut EncryptedStream<T>,
+    job_id: i32,
+    digest: &FileTransferDigest,
+    total_bytes: u64,
+) -> Result<u64> {
+    let resumed_bytes = if digest.is_identical {
+        digest
+            .transferred_size
+            .min(total_bytes)
+            .min(u32::MAX as u64)
+    } else {
+        0
+    };
+    send_confirm(stream, job_id, digest.file_num, resumed_bytes as u32)
+        .await
+        .context("sending file transfer confirmation")?;
+    Ok(resumed_bytes)
+}
+
 async fn recv_file_event<T: Transport>(
     stream: &mut EncryptedStream<T>,
     job_id: i32,
@@ -258,6 +416,12 @@ async fn recv_file_event<T: Transport>(
         }
         let msg = Message::decode(raw.as_slice()).context("decoding file transfer message")?;
         match msg.union {
+            Some(message::Union::FileAction(action)) => match action.union {
+                Some(file_action::Union::SendConfirm(confirm)) if confirm.id == job_id => {
+                    return Ok(FileTransferEvent::Confirm(confirm));
+                }
+                _ => continue,
+            },
             Some(message::Union::FileResponse(resp)) => match resp.union {
                 Some(file_response::Union::Digest(digest)) if digest.id == job_id => {
                     return Ok(FileTransferEvent::Digest(digest));
@@ -326,8 +490,12 @@ mod tests {
         fn pair() -> (Self, Self) {
             let (a, b) = duplex(1024 * 1024);
             (
-                Self { framed: FramedTransport::new(a) },
-                Self { framed: FramedTransport::new(b) },
+                Self {
+                    framed: FramedTransport::new(a),
+                },
+                Self {
+                    framed: FramedTransport::new(b),
+                },
             )
         }
     }
@@ -370,24 +538,42 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let raw = server.recv().await.unwrap();
             let msg = Message::decode(raw.as_slice()).unwrap();
-            let send_req = match msg.union.unwrap() {
+            let receive_req = match msg.union.unwrap() {
                 message::Union::FileAction(action) => match action.union.unwrap() {
-                    file_action::Union::Send(req) => req,
-                    other => panic!("unexpected send request: {other:?}"),
+                    file_action::Union::Receive(req) => req,
+                    other => panic!("unexpected receive request: {other:?}"),
                 },
                 other => panic!("unexpected message: {other:?}"),
             };
-            assert_eq!(send_req.path, "/remote/rope.bin");
-            assert_eq!(send_req.file_num, 1);
+            assert_eq!(receive_req.path, "/remote");
+            assert_eq!(receive_req.file_num, 1);
+            assert_eq!(receive_req.total_size, local_len);
+            assert_eq!(receive_req.files.len(), 1);
+            assert_eq!(receive_req.files[0].name, "rope.bin");
+            assert_eq!(receive_req.files[0].size, local_len);
+
+            let raw = server.recv().await.unwrap();
+            let msg = Message::decode(raw.as_slice()).unwrap();
+            let digest = match msg.union.unwrap() {
+                message::Union::FileResponse(resp) => match resp.union.unwrap() {
+                    file_response::Union::Digest(digest) => digest,
+                    other => panic!("unexpected digest response: {other:?}"),
+                },
+                other => panic!("unexpected message: {other:?}"),
+            };
+            assert_eq!(digest.id, receive_req.id);
+            assert_eq!(digest.file_size, local_len);
+            assert!(digest.is_resume);
 
             send_message(
                 &mut server,
                 Message {
                     union: Some(message::Union::FileResponse(FileResponse {
                         union: Some(file_response::Union::Digest(FileTransferDigest {
-                            id: send_req.id,
+                            id: receive_req.id,
                             file_num: 0,
                             file_size: local_len,
+                            is_upload: true,
                             is_identical: true,
                             transferred_size: 128 * 1024,
                             ..Default::default()
@@ -408,6 +594,10 @@ mod tests {
                 other => panic!("unexpected message: {other:?}"),
             };
             assert_eq!(confirm.file_num, 0);
+            assert_eq!(
+                confirm.union,
+                Some(file_transfer_send_confirm_request::Union::OffsetBlk(128 * 1024))
+            );
 
             let raw = server.recv().await.unwrap();
             let msg = Message::decode(raw.as_slice()).unwrap();
@@ -420,19 +610,16 @@ mod tests {
             };
             assert!(block.compressed);
 
-            send_message(
-                &mut server,
-                Message {
-                    union: Some(message::Union::FileResponse(FileResponse {
-                        union: Some(file_response::Union::Done(FileTransferDone {
-                            id: send_req.id,
-                            file_num: 0,
-                        })),
-                    })),
+            let raw = server.recv().await.unwrap();
+            let msg = Message::decode(raw.as_slice()).unwrap();
+            let done = match msg.union.unwrap() {
+                message::Union::FileResponse(resp) => match resp.union.unwrap() {
+                    file_response::Union::Done(done) => done,
+                    other => panic!("unexpected done response: {other:?}"),
                 },
-            )
-            .await
-            .unwrap();
+                other => panic!("unexpected message: {other:?}"),
+            };
+            assert_eq!(done.id, receive_req.id);
         });
 
         let mut transfer = PushTransfer::begin(&mut client, &local_path, "/remote/rope.bin")
@@ -448,5 +635,17 @@ mod tests {
 
         server_task.await.unwrap();
         let _ = tokio::fs::remove_file(local_path).await;
+    }
+
+    #[test]
+    fn remote_target_parses_file_destination() {
+        let local_path = PathBuf::from("/tmp/local.bin");
+        let target = parse_remote_target("/home/evas/rope_op.py", &local_path).unwrap();
+        assert_eq!(target.dir, "/home/evas");
+        assert_eq!(target.file_name, "rope_op.py");
+
+        let target = parse_remote_target("/home/evas/", &local_path).unwrap();
+        assert_eq!(target.dir, "/home/evas");
+        assert_eq!(target.file_name, "local.bin");
     }
 }

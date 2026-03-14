@@ -28,6 +28,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::Shutdown,
     os::unix::net::UnixStream as StdUnixStream,
+    path::Path,
     process,
     str::FromStr,
 };
@@ -118,6 +119,27 @@ enum Commands {
         local_path: String,
         /// Destination path on the remote machine
         remote_path: String,
+        /// Peer ID for a direct one-shot push without the daemon
+        #[arg(long)]
+        peer: Option<String>,
+        /// Password for a direct one-shot push
+        #[arg(long, env = "RUSTDESK_PASSWORD")]
+        password: Option<String>,
+        /// Override combined rendezvous/relay server address
+        #[arg(long)]
+        server: Option<String>,
+        /// Override RustDesk ID/rendezvous server address
+        #[arg(long = "id-server", alias = "hbbs")]
+        id_server: Option<String>,
+        /// Override RustDesk relay server address
+        #[arg(long = "relay-server", alias = "hbbr")]
+        relay_server: Option<String>,
+        /// Override RustDesk server public key
+        #[arg(long)]
+        key: Option<String>,
+        /// Direct connection timeout in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
     },
     /// Get or set remote clipboard text
     Clipboard {
@@ -670,6 +692,13 @@ fn run() -> i32 {
         Commands::Push {
             local_path,
             remote_path,
+            peer,
+            password,
+            server,
+            id_server,
+            relay_server,
+            key,
+            timeout,
         } => {
             if let Err(e) = permissions.ensure_push_allowed(&local_path, &remote_path) {
                 return emit_response(
@@ -681,6 +710,57 @@ fn run() -> i32 {
                         EXIT_PERMISSION,
                     ),
                 );
+            }
+
+            if let Some(peer_id) = peer {
+                if let Err(e) = permissions.ensure_connect_allowed(&peer_id) {
+                    return emit_response(
+                        cli.json,
+                        error_response(
+                            "push",
+                            "permission_error",
+                            &e.to_string(),
+                            EXIT_PERMISSION,
+                        ),
+                    );
+                }
+
+                match direct_push(
+                    &peer_id,
+                    password.as_deref(),
+                    server.as_deref(),
+                    id_server.as_deref(),
+                    relay_server.as_deref(),
+                    key.as_deref(),
+                    timeout,
+                    &local_path,
+                    &remote_path,
+                    cli.json,
+                ) {
+                    Ok((sent_bytes, total_bytes, resumed_bytes)) => {
+                        return emit_response(
+                            cli.json,
+                            push_response(
+                                &local_path,
+                                &remote_path,
+                                sent_bytes,
+                                total_bytes,
+                                resumed_bytes,
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        return emit_response(
+                            cli.json,
+                            error_response(
+                                "push",
+                                "connection_error",
+                                &e.to_string(),
+                                EXIT_CONNECTION,
+                            ),
+                        );
+                    }
+                }
             }
 
             match send_to_daemon_streaming(
@@ -1243,6 +1323,84 @@ fn send_to_daemon_streaming(
     }
 
     last_response.ok_or_else(|| anyhow::anyhow!("daemon closed without sending a response"))
+}
+
+fn direct_push(
+    peer_id: &str,
+    password: Option<&str>,
+    server: Option<&str>,
+    id_server: Option<&str>,
+    relay_server: Option<&str>,
+    key: Option<&str>,
+    timeout_secs: u64,
+    local_path: &str,
+    remote_path: &str,
+    json_mode: bool,
+) -> Result<(u64, u64, u64), anyhow::Error> {
+    let config = build_direct_connection_config(
+        peer_id,
+        password,
+        server,
+        id_server,
+        relay_server,
+        key,
+    );
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let remote_dir = crate::file_transfer::remote_target_dir(remote_path, Path::new(local_path))?;
+        let connection = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            connection::connect_with_mode(
+                &config,
+                crate::proto::hbb::ConnType::FileTransfer,
+                Some(crate::proto::hbb::login_request::Union::FileTransfer(
+                    crate::proto::hbb::FileTransfer {
+                        dir: remote_dir,
+                        show_hidden: false,
+                    },
+                )),
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("direct push timed out after {timeout_secs}s"))??;
+
+        let mut encrypted = connection.encrypted;
+        let mut transfer =
+            crate::file_transfer::PushTransfer::begin(&mut encrypted, Path::new(local_path), remote_path)
+                .await?;
+
+        if !json_mode {
+            render_push_progress(transfer.progress());
+        }
+
+        while transfer.send_next_block(&mut encrypted).await? {
+            if !json_mode {
+                render_push_progress(transfer.progress());
+            }
+        }
+        transfer.wait_for_done(&mut encrypted).await?;
+        let result = transfer.result();
+        let _ = encrypted.close().await;
+        if !json_mode {
+            eprintln!();
+        }
+        Ok((result.sent_bytes, result.total_bytes, result.resumed_bytes))
+    })
+}
+
+fn render_push_progress(progress: crate::file_transfer::PushProgress) {
+    let pct = if progress.total_bytes == 0 {
+        100.0
+    } else {
+        (progress.sent_bytes as f64 / progress.total_bytes as f64) * 100.0
+    };
+    eprint!(
+        "\rpush sent={}/{} bytes ({pct:.1}%) resumed={}",
+        progress.sent_bytes,
+        progress.total_bytes,
+        progress.resumed_bytes
+    );
+    let _ = std::io::stderr().flush();
 }
 
 fn error_response(command: &str, code: &str, message: &str, exit_code: i32) -> Response {

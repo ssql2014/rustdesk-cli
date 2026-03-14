@@ -427,7 +427,7 @@ async fn handshake_and_auth(
             password: pw_hash.to_vec(),
             my_id: client_id.to_string(),
             my_name: "rustdesk-cli".to_string(),
-            option: Some(build_login_option_message(conn_type)),
+            option: build_login_option_message(conn_type),
             video_ack_required: false,
             session_id: rand_session_id(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -505,15 +505,19 @@ fn normalize_relay_addr(relay_addr: &str) -> String {
     }
 }
 
-fn build_login_option_message(conn_type: ConnType) -> OptionMessage {
+fn build_login_option_message(conn_type: ConnType) -> Option<OptionMessage> {
     if conn_type == ConnType::Terminal {
-        return OptionMessage {
+        return Some(OptionMessage {
             terminal_persistent: option_message::BoolOption::Yes as i32,
             ..Default::default()
-        };
+        });
     }
 
-    OptionMessage {
+    if conn_type == ConnType::FileTransfer {
+        return None;
+    }
+
+    Some(OptionMessage {
         image_quality: ImageQuality::Best as i32,
         custom_fps: 0,
         disable_audio: option_message::BoolOption::Yes as i32,
@@ -525,7 +529,7 @@ fn build_login_option_message(conn_type: ConnType) -> OptionMessage {
             ..Default::default()
         }),
         ..Default::default()
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

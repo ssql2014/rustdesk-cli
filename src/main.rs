@@ -10,6 +10,7 @@ mod daemon;
 mod proto;
 #[allow(dead_code)]
 mod protocol;
+mod permissions;
 #[allow(dead_code)]
 mod rendezvous;
 #[allow(dead_code)]
@@ -26,12 +27,14 @@ use std::{process, str::FromStr};
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde_json::{Value, json};
 
+use crate::permissions::PermissionManager;
 use crate::session::{SessionCommand, SessionResponse};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_CONNECTION: i32 = 1;
 const EXIT_SESSION: i32 = 2;
 const EXIT_INPUT: i32 = 3;
+const EXIT_PERMISSION: i32 = 4;
 
 const DEFAULT_WIDTH: i32 = 1920;
 const DEFAULT_HEIGHT: i32 = 1080;
@@ -44,6 +47,14 @@ struct Cli {
     /// Emit machine-readable JSON output
     #[arg(long, global = true)]
     json: bool,
+
+    /// Auto-approve all permission prompts. Dangerous: intended for automation only.
+    #[arg(short = 'y', long = "dangerously-skip-permissions", global = true, default_value_t = false)]
+    dangerously_skip_permissions: bool,
+
+    /// Enable sandbox restrictions from rustdesk-cli.toml.
+    #[arg(long, global = true, default_value_t = false)]
+    sandbox: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -423,6 +434,24 @@ fn run() -> i32 {
         }
     };
 
+    let permissions = match PermissionManager::from_flags(
+        cli.dangerously_skip_permissions,
+        cli.sandbox,
+    ) {
+        Ok(permissions) => permissions,
+        Err(e) => {
+            return emit_response(
+                cli.json,
+                error_response(
+                    "permissions",
+                    "permission_error",
+                    &e.to_string(),
+                    EXIT_PERMISSION,
+                ),
+            );
+        }
+    };
+
     match cli.command {
         Commands::Connect {
             id,
@@ -449,6 +478,19 @@ fn run() -> i32 {
             } else {
                 password
             };
+
+            if let Err(e) = permissions.ensure_connect_allowed(&id) {
+                return emit_response(
+                    cli.json,
+                    error_response(
+                        "connect",
+                        "permission_error",
+                        &e.to_string(),
+                        EXIT_PERMISSION,
+                    ),
+                );
+            }
+
             if terminal_mode {
                 if cli.json {
                     return emit_response(
@@ -522,66 +564,94 @@ fn run() -> i32 {
             let _ = send_to_daemon(&SessionCommand::Disconnect);
             emit_response(cli.json, disconnect_response(true))
         }
-        Commands::Shell => match send_to_daemon(&SessionCommand::Shell) {
-            Ok(resp) if resp.success => emit_response(cli.json, shell_response()),
-            Ok(resp) => emit_response(
-                cli.json,
-                error_response(
-                    "shell",
-                    "connection_error",
-                    resp.message.as_deref().unwrap_or("shell failed"),
-                    EXIT_CONNECTION,
-                ),
-            ),
-            Err(e) => emit_response(
-                cli.json,
-                error_response(
-                    "shell",
-                    "connection_error",
-                    &e.to_string(),
-                    EXIT_CONNECTION,
-                ),
-            ),
-        },
-        Commands::Exec { command, timeout } => match send_to_daemon(&SessionCommand::Exec {
-            command: command.clone(),
-            timeout: Some(timeout),
-        }) {
-            Ok(resp) if resp.success => {
-                let data = resp.data.unwrap_or_else(|| json!({}));
-                let stdout = data
-                    .get("stdout")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let stderr = data
-                    .get("stderr")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let exit_code = data
-                    .get("exit_code")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0) as i32;
-                emit_response(cli.json, exec_response(&command, stdout, stderr, exit_code))
+        Commands::Shell => {
+            if let Err(e) = permissions.ensure_shell_allowed() {
+                return emit_response(
+                    cli.json,
+                    error_response(
+                        "shell",
+                        "permission_error",
+                        &e.to_string(),
+                        EXIT_PERMISSION,
+                    ),
+                );
             }
-            Ok(resp) => emit_response(
-                cli.json,
-                error_response(
-                    "exec",
-                    "connection_error",
-                    resp.message.as_deref().unwrap_or("exec failed"),
-                    EXIT_CONNECTION,
+
+            match send_to_daemon(&SessionCommand::Shell) {
+                Ok(resp) if resp.success => emit_response(cli.json, shell_response()),
+                Ok(resp) => emit_response(
+                    cli.json,
+                    error_response(
+                        "shell",
+                        "connection_error",
+                        resp.message.as_deref().unwrap_or("shell failed"),
+                        EXIT_CONNECTION,
+                    ),
                 ),
-            ),
-            Err(e) => emit_response(
-                cli.json,
-                error_response(
-                    "exec",
-                    "connection_error",
-                    &e.to_string(),
-                    EXIT_CONNECTION,
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "shell",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
                 ),
-            ),
-        },
+            }
+        }
+        Commands::Exec { command, timeout } => {
+            if let Err(e) = permissions.ensure_exec_allowed(&command) {
+                return emit_response(
+                    cli.json,
+                    error_response(
+                        "exec",
+                        "permission_error",
+                        &e.to_string(),
+                        EXIT_PERMISSION,
+                    ),
+                );
+            }
+
+            match send_to_daemon(&SessionCommand::Exec {
+                command: command.clone(),
+                timeout: Some(timeout),
+            }) {
+                Ok(resp) if resp.success => {
+                    let data = resp.data.unwrap_or_else(|| json!({}));
+                    let stdout = data
+                        .get("stdout")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let stderr = data
+                        .get("stderr")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let exit_code = data
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0) as i32;
+                    emit_response(cli.json, exec_response(&command, stdout, stderr, exit_code))
+                }
+                Ok(resp) => emit_response(
+                    cli.json,
+                    error_response(
+                        "exec",
+                        "connection_error",
+                        resp.message.as_deref().unwrap_or("exec failed"),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+                Err(e) => emit_response(
+                    cli.json,
+                    error_response(
+                        "exec",
+                        "connection_error",
+                        &e.to_string(),
+                        EXIT_CONNECTION,
+                    ),
+                ),
+            }
+        }
         Commands::Clipboard { command } => match command {
             ClipboardCommands::Get => match send_to_daemon(&SessionCommand::ClipboardGet) {
                 Ok(resp) if resp.success => {

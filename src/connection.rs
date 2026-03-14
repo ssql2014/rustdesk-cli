@@ -16,8 +16,8 @@ use tokio::time::timeout;
 
 use crate::crypto::{self, EncryptedStream, KeyExchangeResult};
 use crate::proto::hbb::{
-    IdPk, LoginRequest, Message, PeerInfo, PublicKey, PunchHoleResponse,
-    login_response, message, punch_hole_response,
+    ConnType, IdPk, LoginRequest, Message, PeerInfo, PublicKey, PunchHoleResponse,
+    login_request, login_response, message, punch_hole_response,
 };
 use crate::rendezvous::RendezvousClient;
 use crate::transport::{TcpTransport, Transport};
@@ -62,6 +62,14 @@ pub struct ConnectionResult {
 /// 4. NaCl key exchange + password authentication
 /// 5. Returns PeerInfo + encrypted stream
 pub async fn connect(config: &ConnectionConfig) -> Result<ConnectionResult> {
+    connect_with_mode(config, ConnType::DefaultConn, None).await
+}
+
+pub(crate) async fn connect_with_mode(
+    config: &ConnectionConfig,
+    conn_type: ConnType,
+    login_union: Option<login_request::Union>,
+) -> Result<ConnectionResult> {
     // Phase 1: Register with hbbs and start heartbeat.
     eprintln!("[debug] Phase 1: registering with hbbs...");
     let client = RendezvousClient::connect(&config.id_server)
@@ -103,7 +111,7 @@ pub async fn connect(config: &ConnectionConfig) -> Result<ConnectionResult> {
 
     // Fire PunchHole first (UDP, fire-and-forget).
     client
-        .send_punch_hole(&config.peer_id, &config.server_key)
+        .send_punch_hole_with_conn_type(&config.peer_id, &config.server_key, conn_type)
         .await
         .context("failed to send PunchHole")?;
 
@@ -111,12 +119,13 @@ pub async fn connect(config: &ConnectionConfig) -> Result<ConnectionResult> {
     // hbbs forwards this to the peer, who then connects to hbbr with our UUID.
     let relay_addr = match tokio::time::timeout(
         tokio::time::Duration::from_secs(15),
-        client.request_relay_via_tcp(
+        client.request_relay_via_tcp_with_conn_type(
             &config.peer_id,
             &config.relay_server,
             &[],
             &config.server_key,
             &session_uuid,
+            conn_type,
         ),
     )
     .await
@@ -144,11 +153,12 @@ pub async fn connect(config: &ConnectionConfig) -> Result<ConnectionResult> {
 
     // Phase 3: Connect to hbbr with the same UUID.
     eprintln!("[debug] Phase 3: connecting to relay {}...", relay_addr);
-    let transport = relay_connect(
+    let transport = relay_connect_with_type(
         &relay_addr,
         &session_uuid,
         &config.peer_id,
         &config.server_key,
+        conn_type,
     )
     .await?;
     eprintln!("[debug] Phase 3: relay bound, waiting for peer handshake...");
@@ -159,6 +169,7 @@ pub async fn connect(config: &ConnectionConfig) -> Result<ConnectionResult> {
         &config.password,
         &config.peer_id,
         &my_id,
+        login_union,
     )
     .await;
 
@@ -223,6 +234,23 @@ fn check_punch_hole_failure(resp: &PunchHoleResponse) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn relay_connect(relay_addr: &str, uuid: &str, peer_id: &str, licence_key: &str) -> Result<TcpTransport> {
+    relay_connect_with_type(
+        relay_addr,
+        uuid,
+        peer_id,
+        licence_key,
+        ConnType::DefaultConn,
+    )
+    .await
+}
+
+async fn relay_connect_with_type(
+    relay_addr: &str,
+    uuid: &str,
+    peer_id: &str,
+    licence_key: &str,
+    conn_type: ConnType,
+) -> Result<TcpTransport> {
     let mut transport = TcpTransport::connect(relay_addr)
         .await
         .with_context(|| format!("failed to connect TCP to relay {relay_addr}"))?;
@@ -237,7 +265,7 @@ async fn relay_connect(relay_addr: &str, uuid: &str, peer_id: &str, licence_key:
                 relay_server: String::new(),
                 secure: true,
                 licence_key: licence_key.to_string(),
-                conn_type: crate::proto::hbb::ConnType::DefaultConn as i32,
+                conn_type: conn_type as i32,
                 token: String::new(),
                 control_permissions: None,
             },
@@ -261,6 +289,7 @@ async fn handshake_and_auth(
     password: &str,
     peer_id: &str,
     client_id: &str,
+    login_union: Option<login_request::Union>,
 ) -> Result<ConnectionResult> {
     // --- NaCl key exchange ---
 
@@ -355,7 +384,7 @@ async fn handshake_and_auth(
             },
             hwid: Vec::new(),
             avatar: String::new(),
-            union: None,
+            union: login_union,
         })),
     };
     let mut buf = Vec::new();

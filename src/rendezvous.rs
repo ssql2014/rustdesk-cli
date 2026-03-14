@@ -96,13 +96,23 @@ impl RendezvousClient {
     }
 
     pub async fn punch_hole(&self, target_id: &str, licence_key: &str) -> Result<PunchHoleResponse> {
+        self.punch_hole_with_conn_type(target_id, licence_key, ConnType::DefaultConn)
+            .await
+    }
+
+    pub async fn punch_hole_with_conn_type(
+        &self,
+        target_id: &str,
+        licence_key: &str,
+        conn_type: ConnType,
+    ) -> Result<PunchHoleResponse> {
         let udp_port = self.socket.local_addr()?.port() as i32;
         let request = RendezvousMessage {
             union: Some(rendezvous_message::Union::PunchHoleRequest(PunchHoleRequest {
                 id: target_id.to_string(),
                 nat_type: NatType::UnknownNat as i32,
                 licence_key: licence_key.to_string(),
-                conn_type: ConnType::DefaultConn as i32,
+                conn_type: conn_type as i32,
                 token: String::new(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 udp_port,
@@ -122,13 +132,23 @@ impl RendezvousClient {
     /// With correct licence_key, hbbs forwards to the peer and sends NO response
     /// back to the requester.
     pub async fn send_punch_hole(&self, target_id: &str, licence_key: &str) -> Result<()> {
+        self.send_punch_hole_with_conn_type(target_id, licence_key, ConnType::DefaultConn)
+            .await
+    }
+
+    pub async fn send_punch_hole_with_conn_type(
+        &self,
+        target_id: &str,
+        licence_key: &str,
+        conn_type: ConnType,
+    ) -> Result<()> {
         let udp_port = self.socket.local_addr()?.port() as i32;
         let request = RendezvousMessage {
             union: Some(rendezvous_message::Union::PunchHoleRequest(PunchHoleRequest {
                 id: target_id.to_string(),
                 nat_type: NatType::UnknownNat as i32,
                 licence_key: licence_key.to_string(),
-                conn_type: ConnType::DefaultConn as i32,
+                conn_type: conn_type as i32,
                 token: String::new(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 udp_port,
@@ -155,6 +175,24 @@ impl RendezvousClient {
         socket_addr: &[u8],
         licence_key: &str,
     ) -> Result<RelayResponse> {
+        self.request_relay_for_with_conn_type(
+            target_id,
+            relay_server,
+            socket_addr,
+            licence_key,
+            ConnType::DefaultConn,
+        )
+        .await
+    }
+
+    pub async fn request_relay_for_with_conn_type(
+        &self,
+        target_id: &str,
+        relay_server: &str,
+        socket_addr: &[u8],
+        licence_key: &str,
+        conn_type: ConnType,
+    ) -> Result<RelayResponse> {
         let request = RendezvousMessage {
             union: Some(rendezvous_message::Union::RequestRelay(RequestRelay {
                 id: target_id.to_string(),
@@ -163,7 +201,7 @@ impl RendezvousClient {
                 relay_server: relay_server.to_string(),
                 secure: true,
                 licence_key: licence_key.to_string(),
-                conn_type: ConnType::DefaultConn as i32,
+                conn_type: conn_type as i32,
                 token: String::new(),
                 control_permissions: None,
             })),
@@ -188,6 +226,26 @@ impl RendezvousClient {
         licence_key: &str,
         uuid: &str,
     ) -> Result<RelayResponse> {
+        self.request_relay_via_tcp_with_conn_type(
+            target_id,
+            relay_server,
+            socket_addr,
+            licence_key,
+            uuid,
+            ConnType::DefaultConn,
+        )
+        .await
+    }
+
+    pub async fn request_relay_via_tcp_with_conn_type(
+        &self,
+        target_id: &str,
+        relay_server: &str,
+        socket_addr: &[u8],
+        licence_key: &str,
+        uuid: &str,
+        conn_type: ConnType,
+    ) -> Result<RelayResponse> {
         let request = RendezvousMessage {
             union: Some(rendezvous_message::Union::RequestRelay(RequestRelay {
                 id: target_id.to_string(),
@@ -196,7 +254,7 @@ impl RendezvousClient {
                 relay_server: relay_server.to_string(),
                 secure: true,
                 licence_key: licence_key.to_string(),
-                conn_type: ConnType::DefaultConn as i32,
+                conn_type: conn_type as i32,
                 token: String::new(),
                 control_permissions: None,
             })),

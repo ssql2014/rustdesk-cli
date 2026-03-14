@@ -55,6 +55,9 @@ enum Commands {
     Connect {
         /// Peer ID to connect to
         id: String,
+        /// Open a direct interactive terminal instead of spawning the daemon session
+        #[arg(long, default_value_t = false)]
+        terminal: bool,
         /// Password for the peer. Can also be set via RUSTDESK_PASSWORD env var
         #[arg(long, env = "RUSTDESK_PASSWORD")]
         password: Option<String>,
@@ -364,6 +367,46 @@ fn daemon_arg_value(args: &[String], flag: &str) -> Option<String> {
         .map(|w| w[1].clone())
 }
 
+fn build_direct_connection_config(
+    peer_id: &str,
+    password: Option<&str>,
+    server: Option<&str>,
+    id_server: Option<&str>,
+    relay_server: Option<&str>,
+    key: Option<&str>,
+) -> connection::ConnectionConfig {
+    let id_srv = match id_server {
+        Some(s) => s.to_string(),
+        None => match server {
+            Some(s) => {
+                let host = s.split(':').next().unwrap_or(s);
+                format!("{host}:21116")
+            }
+            None => "localhost:21116".to_string(),
+        },
+    };
+
+    let relay_srv = match relay_server {
+        Some(s) => s.to_string(),
+        None => match server {
+            Some(s) => {
+                let host = s.split(':').next().unwrap_or(s);
+                format!("{host}:21117")
+            }
+            None => "localhost:21117".to_string(),
+        },
+    };
+
+    connection::ConnectionConfig {
+        id_server: id_srv,
+        relay_server: relay_srv,
+        server_key: key.unwrap_or("").to_string(),
+        peer_id: peer_id.to_string(),
+        password: password.unwrap_or("").to_string(),
+        warmup_secs: 2,
+    }
+}
+
 fn run() -> i32 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -380,6 +423,7 @@ fn run() -> i32 {
     match cli.command {
         Commands::Connect {
             id,
+            terminal: terminal_mode,
             password,
             password_stdin,
             server,
@@ -402,6 +446,42 @@ fn run() -> i32 {
             } else {
                 password
             };
+            if terminal_mode {
+                if cli.json {
+                    return emit_response(
+                        cli.json,
+                        error_response(
+                            "connect",
+                            "input_error",
+                            "--json is not supported with interactive --terminal mode",
+                            EXIT_INPUT,
+                        ),
+                    );
+                }
+
+                let config = build_direct_connection_config(
+                    &id,
+                    password.as_deref(),
+                    server.as_deref(),
+                    id_server.as_deref(),
+                    relay_server.as_deref(),
+                    key.as_deref(),
+                );
+                let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+                return match rt.block_on(crate::terminal::run_terminal_session(&config)) {
+                    Ok(()) => EXIT_SUCCESS,
+                    Err(e) => emit_response(
+                        cli.json,
+                        error_response(
+                            "connect",
+                            "connection_error",
+                            &e.to_string(),
+                            EXIT_CONNECTION,
+                        ),
+                    ),
+                };
+            }
+
             match daemon::spawn_daemon(
                 &id,
                 password.as_deref(),

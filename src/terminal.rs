@@ -6,13 +6,16 @@
 
 use anyhow::{Context, Result, bail};
 use prost::Message as ProstMessage;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::connection::{self, ConnectionConfig, ConnectionResult};
 use crate::crypto::EncryptedStream;
 use crate::proto::hbb::{
-    CloseTerminal, Message, OpenTerminal, ResizeTerminal, TerminalAction, TerminalData,
-    message, terminal_action, terminal_response,
+    CloseTerminal, ConnType, Message, OpenTerminal, PeerInfo, ResizeTerminal,
+    Terminal as LoginTerminal, TerminalAction, TerminalData, login_request, message,
+    terminal_action, terminal_response,
 };
-use crate::transport::Transport;
+use crate::transport::{TcpTransport, Transport};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -26,6 +29,13 @@ pub struct TerminalInfo {
     pub service_id: String,
 }
 
+/// A live terminal-mode connection after login and `OpenTerminal`.
+pub struct TerminalConnection {
+    pub peer_info: PeerInfo,
+    pub terminal_info: TerminalInfo,
+    pub encrypted: EncryptedStream<TcpTransport>,
+}
+
 /// An event received from the remote terminal.
 #[derive(Debug)]
 pub enum TerminalEvent {
@@ -35,6 +45,20 @@ pub enum TerminalEvent {
     Closed { exit_code: i32 },
     /// An error occurred on the remote side.
     Error(String),
+}
+
+fn default_terminal_size() -> (u32, u32) {
+    let rows = std::env::var("LINES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(24);
+    let cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(80);
+    (rows, cols)
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +109,98 @@ async fn recv_terminal_response<T: Transport>(
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Establish a terminal-mode RustDesk connection and open the remote PTY.
+pub async fn connect_terminal(config: &ConnectionConfig) -> Result<TerminalConnection> {
+    let ConnectionResult {
+        peer_info,
+        mut encrypted,
+    } = connection::connect_with_mode(
+        config,
+        ConnType::Terminal,
+        Some(login_request::Union::Terminal(LoginTerminal {
+            service_id: String::new(),
+        })),
+    )
+    .await?;
+
+    let (rows, cols) = default_terminal_size();
+    let terminal_info = open_terminal(&mut encrypted, rows, cols)
+        .await
+        .context("opening remote terminal")?;
+
+    Ok(TerminalConnection {
+        peer_info,
+        terminal_info,
+        encrypted,
+    })
+}
+
+/// Run an interactive terminal session, wiring local stdin/stdout to the peer.
+pub async fn run_terminal_session(config: &ConnectionConfig) -> Result<()> {
+    let mut connection = connect_terminal(config).await?;
+    let terminal_id = connection.terminal_info.terminal_id;
+
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = [0_u8; 4096];
+
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stdin_tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut stdout = tokio::io::stdout();
+
+    loop {
+        enum Event {
+            Stdin(Option<Vec<u8>>),
+            Terminal(Result<TerminalEvent>),
+        }
+
+        let event = tokio::select! {
+            chunk = stdin_rx.recv() => Event::Stdin(chunk),
+            result = recv_terminal_data(&mut connection.encrypted) => Event::Terminal(result),
+        };
+
+        match event {
+            Event::Stdin(Some(data)) => {
+                send_terminal_data(&mut connection.encrypted, terminal_id, &data).await?;
+            }
+            Event::Stdin(None) => {
+                let _ = close_terminal(&mut connection.encrypted, terminal_id).await;
+                break;
+            }
+            Event::Terminal(Ok(TerminalEvent::Data(data))) => {
+                stdout
+                    .write_all(&data)
+                    .await
+                    .context("writing terminal stdout")?;
+                stdout
+                    .flush()
+                    .await
+                    .context("flushing terminal stdout")?;
+            }
+            Event::Terminal(Ok(TerminalEvent::Closed { .. })) => break,
+            Event::Terminal(Ok(TerminalEvent::Error(msg))) => {
+                bail!("terminal error: {msg}");
+            }
+            Event::Terminal(Err(e)) => {
+                return Err(e).context("receiving terminal output");
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Open a remote terminal with the given dimensions.
 ///

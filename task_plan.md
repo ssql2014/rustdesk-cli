@@ -1,7 +1,7 @@
-# Task Plan: Fix HBBS TCP KeyExchange in Rendezvous Flow
+# Task Plan: Debug HBBS TCP KeyExchange Decryption Failure
 
 ## Goal
-Implement the hbbs TCP `KeyExchange` handshake described in `docs/research/tcp_key_exchange.md` so `punch_hole_via_tcp_with_conn_type()` can upgrade to an encrypted TCP rendezvous stream before sending `PunchHoleRequest`, then verify the build and relevant tests.
+Confirm the exact hbbs TCP `KeyExchange.keys[0]` wire format, instrument the local handshake path, make parsing tolerant if necessary, and verify with build, a live terminal connection attempt, and the test suite.
 
 ## Current Phase
 Phase 4
@@ -9,50 +9,51 @@ Phase 4
 ## Phases
 ### Phase 1: Discovery
 - [x] Read the `planning-with-files` skill instructions
-- [x] Read `docs/research/tcp_key_exchange.md`
+- [x] Read `docs/research/key_exchange_client_response.md`
 - [x] Inspect current TCP rendezvous flow in `src/rendezvous.rs`
-- [x] Inspect available crypto and transport helpers
+- [x] Inspect official RustDesk client / server source for the KeyExchange format
 - **Status:** complete
 
 ### Phase 2: Design
-- [x] Determine whether existing dependencies can perform sealed-box crypto
-- [x] Determine whether existing encrypted transport can be reused
-- [x] Define the new hbbs TCP handshake helper shape
+- [x] Confirm whether `keys[0]` is still `signature || ephemeral_x25519_pk`
+- [x] Decide how to instrument the handshake without destabilizing the transport
+- [x] Decide whether to accept multiple possible payload layouts defensively
 - **Status:** complete
 
 ### Phase 3: Implementation
-- [x] Add TCP KeyExchange handshake logic
-- [x] Send encrypted `PunchHoleRequest` after handshake
-- [x] Add or update focused tests for KeyExchange handling
+- [x] Add debug hex logging around `complete_tcp_key_exchange()`
+- [x] Make rendezvous key extraction tolerant of both signed payload layouts
+- [x] Add focused tests for the accepted layouts
 - **Status:** complete
 
 ### Phase 4: Verification
 - [x] Run `cargo build`
-- [x] Run targeted rendezvous tests
-- [x] Summarize behavior and residual risks
+- [x] Run the requested live terminal connection command equivalent for the current CLI
+- [x] Run `cargo test`
+- [x] Summarize what the live server actually did
 - **Status:** complete
 
 ## Key Questions
-1. Can `crypto_box`’s sealed-box support cover the server hello / client response without adding a new dependency?
-2. Does hbbs TCP use the existing `EncryptedStream` framing, or does it need a separate ChaCha20-Poly1305 transport wrapper?
-3. Should the handshake remain internal to `punch_hole_via_tcp_with_conn_type()` or return a new transport abstraction?
+1. Does the live hbbs server actually send a TCP `KeyExchange` on this path?
+2. Is the server payload `signature || key`, `key || signature`, or something else?
+3. If verification fails, what is the safest fallback extraction rule for self-hosted deployments?
 
 ## Decisions Made
 | Decision | Rationale |
 |----------|-----------|
-| Reuse existing `crypto_box` crate for sealed-box encryption if possible | Avoid adding sodiumoxide unless the current dependency set is insufficient |
-| Follow the official RustDesk `secure_tcp` flow over the simplified research summary | The upstream client is the primary source for the real wire behavior |
-| Reuse the existing `EncryptedStream` after the hbbs TCP handshake | Official source uses a secretbox-style encrypted framed stream compatible with the existing local transport model |
+| Follow `key_exchange_client_response.md` and the upstream `secure_tcp` client flow, not the older simplified TCP note | The newer primary-source research matches the local crypto helpers |
+| Add handshake logging before changing core crypto primitives | The failure needed live wire evidence more than another crypto rewrite |
+| Accept both `signature || key` and `key || signature` layouts when a verifiable 32-byte key can be recovered | This is a low-risk compatibility guard for self-hosted / version-skewed servers |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| The research summary described a simpler one-key/ChaCha handshake than the upstream client actually uses | 1 | Checked the official RustDesk source and implemented the signed-ephemeral-key + encrypted replay flow instead |
-| `src/rendezvous.rs` is compiled directly inside some integration tests with local `#[path = ...]` modules | 1 | Updated `tests/live_server_test.rs` to include the matching local `transport` and `crypto` modules |
+| The current CLI no longer has the `direct` subcommand from the bug report | 1 | Used the equivalent `connect <peer> --terminal ...` invocation |
+| The live hbbs server did not emit `KeyExchange`; it reset the TCP punch socket and the client fell back to relay | 1 | Verified the terminal session still completed and kept the instrumentation/tests for when a keyed hbbs path is exercised |
 
 ## Notes
-- `PunchHoleRequest` over TCP currently goes out in plaintext and only accepts plaintext `PunchHoleResponse` / `RelayResponse`.
-- `proto/rendezvous.proto` already defines `KeyExchange`.
+- The live server used in verification did not hit the TCP `KeyExchange` path on the tested terminal flow.
+- `proto/rendezvous.proto` already defines `KeyExchange`, so the remaining issue is runtime behavior rather than schema.
 
 ## Follow-Up Fixes
 - Issue `#39`: when the provided key does not verify the hbbs TCP signature, the client now logs a warning and proceeds with the embedded rendezvous key instead of aborting the handshake.

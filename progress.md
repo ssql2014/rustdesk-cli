@@ -46,10 +46,15 @@
 ### Phase 4: Verification
 - **Status:** complete
 - Actions taken:
+  - Added debug logging around hbbs TCP `KeyExchange` parsing.
   - Ran `cargo build`.
-  - Ran the focused KeyExchange regression test.
+  - Ran the live terminal connection command equivalent for the current CLI:
+    - `cargo run -- connect 308235080 --terminal --password 'Evas@2026' --id-server 115.238.185.55:50076 --relay-server 115.238.185.55:50077 --key 'SWc0NIWF0wR7kd8rHdGNaCHXtp7dirUImEtrVmRfQdc='`
+  - Confirmed the tested server reset the TCP punch socket instead of sending `KeyExchange`, then completed the session through relay fallback.
+  - Added layout-parsing unit tests.
   - Ran the full `cargo test` suite.
 - Files created/modified:
+  - `src/rendezvous.rs` (updated)
   - `task_plan.md` (updated)
   - `findings.md` (updated)
   - `progress.md` (updated)
@@ -60,7 +65,8 @@
 | Dependency audit | `Cargo.toml` + cargo registry | sealed-box support available | `crypto_box::PublicKey::seal` found | ✓ |
 | Transport audit | `src/transport.rs` + `src/crypto.rs` | determine reusable pieces | framing reusable, cipher wrapper not reusable | ✓ |
 | Build verification | `cargo build` | project compiles with TCP KeyExchange fix | passed | ✓ |
-| Targeted regression | `cargo test punch_hole_via_tcp_handles_key_exchange_then_replays_request -- --nocapture` | TCP KeyExchange flow succeeds | passed | ✓ |
+| Live terminal run | `cargo run -- connect 308235080 --terminal ...` | observe hbbs KeyExchange or reproduce failure | hbbs reset TCP punch socket, relay fallback succeeded, terminal prompt opened | ✓ |
+| Layout parsing unit tests | `cargo test` | both signed payload layouts accepted | passed | ✓ |
 | Full test suite | `cargo test` | no regressions | passed | ✓ |
 | Signature mismatch fallback | `cargo test` | mismatched provided key does not abort TCP KeyExchange | passed | ✓ |
 
@@ -68,3 +74,4 @@
 | Timestamp | Error | Attempt | Resolution |
 |-----------|-------|---------|------------|
 | 2026-03-15 | Local research summary conflicted with the upstream client’s actual TCP handshake flow | 1 | Used the official RustDesk source as the protocol authority and implemented that behavior |
+| 2026-03-15 | The bug report’s `cargo run -- direct ...` command no longer matched the current CLI | 1 | Translated it to `cargo run -- connect <peer> --terminal ...` |

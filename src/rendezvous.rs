@@ -560,11 +560,24 @@ async fn complete_tcp_key_exchange(
         .keys
         .first()
         .context("TCP KeyExchange missing server key payload")?;
+    eprintln!(
+        "[debug] hbbs TCP KeyExchange keys[0]: len={}, first16={}",
+        signed_key.len(),
+        hex_preview(signed_key, 16)
+    );
     let peer_box_pk = verify_rendezvous_server_key(server_key_b64, signed_key)
         .context("verifying signed rendezvous TCP key")?;
+    eprintln!(
+        "[debug] hbbs TCP KeyExchange extracted peer_box_pk={}",
+        hex_preview(&peer_box_pk, peer_box_pk.len())
+    );
 
     let key_result = crypto::key_exchange_curve25519(&peer_box_pk)
         .context("creating TCP rendezvous symmetric key")?;
+    eprintln!(
+        "[debug] hbbs TCP KeyExchange client response sealed_key_len={}",
+        key_result.sealed_key.len()
+    );
     let response = RendezvousMessage {
         union: Some(rendezvous_message::Union::KeyExchange(KeyExchange {
             keys: vec![
@@ -585,43 +598,98 @@ async fn complete_tcp_key_exchange(
 }
 
 fn verify_rendezvous_server_key(server_key_b64: &str, signed_key: &[u8]) -> Result<[u8; 32]> {
-    if signed_key.len() <= 64 {
+    if signed_key.len() == 32 {
+        let peer_box_pk: [u8; 32] = signed_key
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("rendezvous TCP key is {} bytes, expected 32", signed_key.len()))?;
+        eprintln!("[warn] rendezvous TCP key arrived unsigned; proceeding with raw 32-byte payload");
+        return Ok(peer_box_pk);
+    }
+
+    if signed_key.len() < 96 {
         bail!(
-            "signed rendezvous TCP key is {} bytes, expected >64",
+            "signed rendezvous TCP key is {} bytes, expected 32 or at least 96",
             signed_key.len()
         );
     }
 
-    let message = &signed_key[64..];
-    let peer_box_pk: [u8; 32] = message
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("verified rendezvous TCP key is {} bytes, expected 32", message.len()))?;
+    let verification_key = decode_rendezvous_verifying_key(server_key_b64).ok();
 
-    let verification_result = (|| -> Result<()> {
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(server_key_b64)
-            .context("base64 decode rendezvous server key")?;
-        let server_pk: [u8; 32] = decoded
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("rendezvous server key is {} bytes, expected 32", decoded.len()))?;
-        let verifying_key =
-            VerifyingKey::from_bytes(&server_pk).context("invalid rendezvous server Ed25519 key")?;
-        let signature = Signature::from_slice(&signed_key[..64])
-            .context("invalid signature bytes in rendezvous TCP key")?;
-        verifying_key
-            .verify(message, &signature)
-            .context("rendezvous TCP key signature verification failed")?;
-        Ok(())
-    })();
-
-    if let Err(err) = verification_result {
-        eprintln!(
-            "[warn] rendezvous TCP key signature verification failed; proceeding without verification: {err:#}"
-        );
+    if let Some((peer_box_pk, layout)) = extract_verified_rendezvous_key(verification_key.as_ref(), signed_key) {
+        eprintln!("[debug] rendezvous TCP key verified with layout {layout}");
+        return Ok(peer_box_pk);
     }
 
+    let suffix_message = &signed_key[64..];
+    if suffix_message.len() == 32 {
+        let peer_box_pk: [u8; 32] = suffix_message
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("verified rendezvous TCP key is {} bytes, expected 32", suffix_message.len()))?;
+        eprintln!(
+            "[warn] rendezvous TCP key signature verification failed; falling back to signature||key layout with unverified payload"
+        );
+        return Ok(peer_box_pk);
+    }
+
+    let prefix_message = &signed_key[..32];
+    let peer_box_pk: [u8; 32] = prefix_message
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("rendezvous TCP key prefix is {} bytes, expected 32", prefix_message.len()))?;
+    eprintln!(
+        "[warn] rendezvous TCP key signature verification failed; falling back to key||signature layout with unverified payload"
+    );
     Ok(peer_box_pk)
+}
+
+fn decode_rendezvous_verifying_key(server_key_b64: &str) -> Result<VerifyingKey> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(server_key_b64)
+        .context("base64 decode rendezvous server key")?;
+    let server_pk: [u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("rendezvous server key is {} bytes, expected 32", decoded.len()))?;
+    VerifyingKey::from_bytes(&server_pk).context("invalid rendezvous server Ed25519 key")
+}
+
+fn extract_verified_rendezvous_key(
+    verifying_key: Option<&VerifyingKey>,
+    signed_key: &[u8],
+) -> Option<([u8; 32], &'static str)> {
+    let verifying_key = verifying_key?;
+
+    if signed_key.len() >= 96 {
+        let signature = Signature::from_slice(&signed_key[..64]).ok()?;
+        let message = &signed_key[64..];
+        if message.len() == 32 && verifying_key.verify(message, &signature).is_ok() {
+            let peer_box_pk = message.try_into().ok()?;
+            return Some((peer_box_pk, "signature||key"));
+        }
+    }
+
+    if signed_key.len() == 96 {
+        let message = &signed_key[..32];
+        let signature = Signature::from_slice(&signed_key[32..96]).ok()?;
+        if verifying_key.verify(message, &signature).is_ok() {
+            let peer_box_pk = message.try_into().ok()?;
+            return Some((peer_box_pk, "key||signature"));
+        }
+    }
+
+    None
+}
+
+fn hex_preview(bytes: &[u8], max_len: usize) -> String {
+    let preview_len = bytes.len().min(max_len);
+    let mut out = String::with_capacity(preview_len * 2 + 8);
+    for byte in &bytes[..preview_len] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    if bytes.len() > preview_len {
+        out.push_str("...");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1204,6 +1272,40 @@ mod tests {
         }
 
         server_task.await.expect("server task should join")?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_rendezvous_server_key_accepts_signature_then_key_layout() -> Result<()> {
+        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let server_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().to_bytes());
+        let peer_box_pk = BoxSecretKey::generate(&mut rand_core::OsRng)
+            .public_key()
+            .to_bytes();
+        let mut signed_payload = Vec::with_capacity(96);
+        signed_payload.extend_from_slice(&signing_key.sign(&peer_box_pk).to_bytes());
+        signed_payload.extend_from_slice(&peer_box_pk);
+
+        let extracted = verify_rendezvous_server_key(&server_key_b64, &signed_payload)?;
+        assert_eq!(extracted, peer_box_pk);
+        Ok(())
+    }
+
+    #[test]
+    fn verify_rendezvous_server_key_accepts_key_then_signature_layout() -> Result<()> {
+        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let server_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().to_bytes());
+        let peer_box_pk = BoxSecretKey::generate(&mut rand_core::OsRng)
+            .public_key()
+            .to_bytes();
+        let mut signed_payload = Vec::with_capacity(96);
+        signed_payload.extend_from_slice(&peer_box_pk);
+        signed_payload.extend_from_slice(&signing_key.sign(&peer_box_pk).to_bytes());
+
+        let extracted = verify_rendezvous_server_key(&server_key_b64, &signed_payload)?;
+        assert_eq!(extracted, peer_box_pk);
         Ok(())
     }
 

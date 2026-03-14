@@ -10,6 +10,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream as StdUnixStream;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -100,14 +101,76 @@ impl LockFile {
     }
 }
 
-/// Check if a daemon is already running by reading the lock file and checking the PID.
-pub fn is_daemon_running() -> bool {
-    let lock = match LockFile::read() {
-        Ok(l) => l,
-        Err(_) => return false,
+struct DaemonCleanupGuard;
+
+impl Drop for DaemonCleanupGuard {
+    fn drop(&mut self) {
+        cleanup();
+    }
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    let Ok(pid_i32) = i32::try_from(pid) else {
+        return false;
     };
-    // Check if process is alive
-    unsafe { libc::kill(lock.pid as i32, 0) == 0 }
+    if pid_i32 <= 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid_i32, 0) };
+    if rc == 0 {
+        true
+    } else {
+        matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(code) if code == libc::EPERM
+        )
+    }
+}
+
+fn is_socket_alive(socket_path: &Path) -> bool {
+    StdUnixStream::connect(socket_path).is_ok()
+}
+
+fn cleanup_stale_daemon_artifacts(
+    socket_path: &Path,
+    lock_path: &Path,
+    error_path: &Path,
+) -> Result<()> {
+    let socket_exists = socket_path.exists();
+    let lock_exists = lock_path.exists();
+
+    if !socket_exists && !lock_exists {
+        let _ = fs::remove_file(error_path);
+        return Ok(());
+    }
+
+    let socket_alive = socket_exists && is_socket_alive(socket_path);
+    let lock_alive = if lock_exists {
+        match fs::read_to_string(lock_path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<LockFile>(&data).ok())
+        {
+            Some(lock) => pid_is_alive(lock.pid),
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    if socket_alive || lock_alive {
+        anyhow::bail!("Daemon already running. Disconnect first, or use other commands.");
+    }
+
+    let _ = fs::remove_file(socket_path);
+    let _ = fs::remove_file(lock_path);
+    let _ = fs::remove_file(error_path);
+    Ok(())
+}
+
+/// Check if a daemon is already running by probing the socket and lock PID.
+pub fn is_daemon_running() -> bool {
+    is_socket_alive(Path::new(SOCKET_PATH))
+        || LockFile::read().ok().is_some_and(|lock| pid_is_alive(lock.pid))
 }
 
 /// Spawn the daemon as a background process by re-executing ourselves
@@ -121,14 +184,11 @@ pub fn spawn_daemon(
     key: Option<&str>,
     timeout: Option<u64>,
 ) -> Result<()> {
-    if is_daemon_running() {
-        anyhow::bail!("Daemon already running. Disconnect first, or use other commands.");
-    }
-
-    // Clean up stale socket/lock
-    let _ = fs::remove_file(SOCKET_PATH);
-    let _ = fs::remove_file(LOCK_PATH);
-    let _ = fs::remove_file(ERROR_PATH);
+    cleanup_stale_daemon_artifacts(
+        Path::new(SOCKET_PATH),
+        Path::new(LOCK_PATH),
+        Path::new(ERROR_PATH),
+    )?;
 
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
@@ -229,12 +289,15 @@ pub async fn run_daemon(
     connect_timeout: Option<u64>,
     timeout: Option<u64>,
 ) -> Result<()> {
-    // Clean up stale socket
-    let _ = fs::remove_file(SOCKET_PATH);
-    let _ = fs::remove_file(ERROR_PATH);
+    cleanup_stale_daemon_artifacts(
+        Path::new(SOCKET_PATH),
+        Path::new(LOCK_PATH),
+        Path::new(ERROR_PATH),
+    )?;
 
     let listener = UnixListener::bind(SOCKET_PATH)
         .context("Failed to bind Unix socket")?;
+    let _cleanup_guard = DaemonCleanupGuard;
 
     // Set socket permissions to owner-only
     fs::set_permissions(SOCKET_PATH, fs::Permissions::from_mode(0o600))?;
@@ -1382,11 +1445,13 @@ fn write_startup_error(message: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener as StdUnixListener;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
         Mutex,
     };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     const SENTINEL: &str = "__RDCLI_00000000000000000000000000000001__";
 
@@ -1810,6 +1875,68 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["message"], "test message");
+    }
+
+    fn temp_daemon_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base = std::env::temp_dir();
+        (
+            base.join(format!("rustdesk-cli-test-{suffix}.sock")),
+            base.join(format!("rustdesk-cli-test-{suffix}.lock")),
+            base.join(format!("rustdesk-cli-test-{suffix}.error")),
+        )
+    }
+
+    #[test]
+    fn cleanup_stale_daemon_artifacts_removes_dead_pid_lock_and_socket() {
+        let (socket_path, lock_path, error_path) = temp_daemon_paths();
+        fs::write(&socket_path, b"stale socket").unwrap();
+        fs::write(
+            &lock_path,
+            serde_json::to_string(&LockFile {
+                pid: u32::MAX,
+                socket: socket_path.display().to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(&error_path, b"stale error").unwrap();
+
+        cleanup_stale_daemon_artifacts(&socket_path, &lock_path, &error_path).unwrap();
+
+        assert!(!socket_path.exists());
+        assert!(!lock_path.exists());
+        assert!(!error_path.exists());
+    }
+
+    #[test]
+    fn cleanup_stale_daemon_artifacts_rejects_live_socket() {
+        let (socket_path, lock_path, error_path) = temp_daemon_paths();
+        let listener = StdUnixListener::bind(&socket_path).unwrap();
+
+        let err = cleanup_stale_daemon_artifacts(&socket_path, &lock_path, &error_path)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Daemon already running"));
+
+        drop(listener);
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn cleanup_stale_daemon_artifacts_removes_unconnectable_socket_file() {
+        let (socket_path, lock_path, error_path) = temp_daemon_paths();
+        fs::write(&socket_path, b"not a socket").unwrap();
+
+        cleanup_stale_daemon_artifacts(&socket_path, &lock_path, &error_path).unwrap();
+
+        assert!(!socket_path.exists());
+        assert!(!lock_path.exists());
+        assert!(!error_path.exists());
     }
 
     #[test]

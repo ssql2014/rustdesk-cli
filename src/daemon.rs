@@ -50,11 +50,14 @@ const MAX_EXEC_COMPLETION_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHELL_TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(90); // 1.5× 60s keep_alive
-const RECONNECT_MAX_ATTEMPTS: usize = 3;
+const RECONNECT_MAX_ATTEMPTS: usize = 6;
 const RECONNECT_BACKOFFS: [Duration; RECONNECT_MAX_ATTEMPTS] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
     Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
 ];
 
 fn conn_type_for_command(cmd: &SessionCommand) -> ConnType {
@@ -64,10 +67,13 @@ fn conn_type_for_command(cmd: &SessionCommand) -> ConnType {
     }
 }
 
-fn login_union_for_conn_type(conn_type: ConnType) -> Option<login_request::Union> {
+fn login_union_for_conn_type(
+    conn_type: ConnType,
+    service_id: Option<&str>,
+) -> Option<login_request::Union> {
     match conn_type {
         ConnType::Terminal => Some(login_request::Union::Terminal(crate::proto::hbb::Terminal {
-            service_id: String::new(),
+            service_id: service_id.unwrap_or_default().to_string(),
         })),
         _ => None,
     }
@@ -319,6 +325,7 @@ pub async fn run_daemon(
     let timeout_secs = connect_timeout.unwrap_or(30);
     let idle_timeout = Duration::from_secs(timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT.as_secs()));
     let mut active_conn_type = ConnType::DefaultConn;
+    let mut active_service_id: Option<String> = None;
     let conn_result = match connect_with_timeout(&config, timeout_secs, active_conn_type).await {
         Ok(r) => r,
         Err(ConnectWithTimeoutError::Connect(e)) => {
@@ -451,7 +458,7 @@ pub async fn run_daemon(
                         "daemon: {}",
                         resp.message.as_deref().unwrap_or("reconnecting...")
                     );
-                })
+                }, active_service_id.as_deref())
                 .await
                 {
                     Ok(new_conn) => {
@@ -473,7 +480,7 @@ pub async fn run_daemon(
                             "daemon: {}",
                             resp.message.as_deref().unwrap_or("reconnecting...")
                         );
-                    })
+                    }, active_service_id.as_deref())
                     .await
                     {
                         Ok(new_conn) => {
@@ -498,7 +505,7 @@ pub async fn run_daemon(
                             "daemon: {}",
                             resp.message.as_deref().unwrap_or("reconnecting...")
                         );
-                    })
+                    }, active_service_id.as_deref())
                     .await
                     {
                         Ok(new_conn) => {
@@ -537,12 +544,15 @@ pub async fn run_daemon(
                 let desired_conn_type = conn_type_for_command(&cmd);
 
                 if desired_conn_type != active_conn_type {
+                    if desired_conn_type != ConnType::Terminal {
+                        active_service_id = None;
+                    }
                     match reconnect_encrypted_stream(&config, &mut session, desired_conn_type, |resp| {
                         eprintln!(
                             "daemon: {}",
                             resp.message.as_deref().unwrap_or("reconnecting...")
                         );
-                    })
+                    }, active_service_id.as_deref())
                     .await
                     {
                         Ok(new_conn) => {
@@ -561,7 +571,14 @@ pub async fn run_daemon(
                 // The ack response is sent inside shell_session; on return we
                 // loop back to accept the next UDS connection.
                 if matches!(cmd, SessionCommand::Shell) {
-                    if let Err(e) = shell_session(&mut encrypted, buf_reader, writer).await {
+                    if let Err(e) = shell_session(
+                        &mut encrypted,
+                        buf_reader,
+                        writer,
+                        &mut active_service_id,
+                    )
+                    .await
+                    {
                         eprintln!("daemon: shell session error: {e:#}");
                         if should_reconnect(&e) {
                             match reconnect_encrypted_stream(&config, &mut session, active_conn_type, |resp| {
@@ -569,7 +586,7 @@ pub async fn run_daemon(
                                     "daemon: {}",
                                     resp.message.as_deref().unwrap_or("reconnecting...")
                                 );
-                            })
+                            }, active_service_id.as_deref())
                             .await
                             {
                                 Ok(new_conn) => {
@@ -606,6 +623,7 @@ pub async fn run_daemon(
                                 &mut session,
                                 active_conn_type,
                                 |_resp| {},
+                                active_service_id.as_deref(),
                             )
                             .await
                             {
@@ -649,6 +667,7 @@ pub async fn run_daemon(
                         &mut writer,
                         command,
                         *timeout,
+                        &mut active_service_id,
                     )
                     .await
                     {
@@ -659,6 +678,7 @@ pub async fn run_daemon(
                                 &mut session,
                                 active_conn_type,
                                 |_resp| {},
+                                active_service_id.as_deref(),
                             )
                             .await
                             {
@@ -669,6 +689,7 @@ pub async fn run_daemon(
                                         &mut writer,
                                         command,
                                         *timeout,
+                                        &mut active_service_id,
                                     )
                                     .await
                                     {
@@ -707,6 +728,7 @@ pub async fn run_daemon(
                             &mut session,
                             active_conn_type,
                             |_resp| {},
+                            active_service_id.as_deref(),
                         )
                             .await;
 
@@ -769,7 +791,7 @@ async fn connect_with_timeout(
 ) -> std::result::Result<connection::ConnectionResult, ConnectWithTimeoutError> {
     tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        connection::connect_with_mode(config, conn_type, login_union_for_conn_type(conn_type)),
+        connection::connect_with_mode(config, conn_type, login_union_for_conn_type(conn_type, None)),
     )
     .await
     .map_err(|_| ConnectWithTimeoutError::TimedOut(timeout_secs))?
@@ -891,9 +913,13 @@ fn push_progress_response(remote_path: &str, progress: PushProgress) -> SessionR
     )
 }
 
-fn reconnecting_response(attempt: usize, backoff: Duration) -> SessionResponse {
+fn reconnecting_response(
+    attempt: usize,
+    total_attempts: usize,
+    backoff: Duration,
+) -> SessionResponse {
     SessionResponse::error(format!(
-        "reconnecting... attempt {attempt}/{RECONNECT_MAX_ATTEMPTS} in {}s",
+        "reconnecting... attempt {attempt}/{total_attempts} in {}s",
         backoff.as_secs()
     ))
 }
@@ -924,7 +950,7 @@ where
 
     for (idx, backoff) in backoffs.iter().copied().enumerate() {
         let attempt = idx + 1;
-        let reconnecting = reconnecting_response(attempt, backoff);
+        let reconnecting = reconnecting_response(attempt, backoffs.len(), backoff);
         notify(&reconnecting);
         tokio::time::sleep(backoff).await;
 
@@ -942,12 +968,19 @@ async fn reconnect_encrypted_stream<N>(
     session: &mut Session,
     conn_type: ConnType,
     notify: N,
+    service_id: Option<&str>,
 ) -> Result<connection::ConnectionResult>
 where
     N: FnMut(&SessionResponse),
 {
     let conn = reconnect_with_retry(
-        || connection::connect_with_mode(config, conn_type, login_union_for_conn_type(conn_type)),
+        || {
+            connection::connect_with_mode(
+                config,
+                conn_type,
+                login_union_for_conn_type(conn_type, service_id),
+            )
+        },
         notify,
     )
     .await?;
@@ -1191,7 +1224,8 @@ async fn exec_command(
     command: &str,
     timeout_secs: Option<u64>,
 ) -> Result<SessionResponse> {
-    exec_command_inner(encrypted, command, timeout_secs, None).await
+    let mut service_id = None;
+    exec_command_inner(encrypted, command, timeout_secs, None, &mut service_id).await
 }
 
 async fn exec_command_streaming(
@@ -1199,8 +1233,16 @@ async fn exec_command_streaming(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     command: &str,
     timeout_secs: Option<u64>,
+    active_service_id: &mut Option<String>,
 ) -> Result<SessionResponse> {
-    exec_command_inner(encrypted, command, timeout_secs, Some(writer)).await
+    exec_command_inner(
+        encrypted,
+        command,
+        timeout_secs,
+        Some(writer),
+        active_service_id,
+    )
+    .await
 }
 
 async fn exec_command_inner(
@@ -1208,6 +1250,7 @@ async fn exec_command_inner(
     command: &str,
     timeout_secs: Option<u64>,
     mut stream_writer: Option<&mut tokio::net::unix::OwnedWriteHalf>,
+    active_service_id: &mut Option<String>,
 ) -> Result<SessionResponse> {
     // Generate unique sentinel marker using timestamp nanos.
     let sentinel_id = std::time::SystemTime::now()
@@ -1223,6 +1266,7 @@ async fn exec_command_inner(
     )
     .await
     .map_err(|_| anyhow::anyhow!("terminal open timed out"))??;
+    *active_service_id = Some(terminal_info.service_id.clone());
 
     let tid = terminal_info.terminal_id;
 
@@ -1233,6 +1277,7 @@ async fn exec_command_inner(
                 // Keep draining.
             }
             Ok(TerminalEvent::Closed { exit_code }) => {
+                *active_service_id = None;
                 return Ok(SessionResponse::ok_with_data(
                     "Terminal closed before exec",
                     serde_json::json!({
@@ -1246,6 +1291,7 @@ async fn exec_command_inner(
             }
             Ok(TerminalEvent::Error(msg)) => {
                 let _ = terminal::close_terminal(encrypted, tid).await;
+                *active_service_id = None;
                 anyhow::bail!("terminal error during prompt drain: {msg}");
             }
             Err(e) if terminal::is_terminal_response_timeout(&e) => {
@@ -1292,6 +1338,7 @@ async fn exec_command_inner(
                 // Terminal closed before sentinel — return partial output.
                 let stdout = String::from_utf8_lossy(&collected).trim().to_string();
                 let _ = terminal::close_terminal(encrypted, tid).await;
+                *active_service_id = None;
                 return Ok(SessionResponse::ok_with_data(
                     format!("Executed `{command}`"),
                     serde_json::json!({
@@ -1305,6 +1352,7 @@ async fn exec_command_inner(
             }
             Ok(TerminalEvent::Error(msg)) => {
                 let _ = terminal::close_terminal(encrypted, tid).await;
+                *active_service_id = None;
                 anyhow::bail!("terminal error during exec: {msg}");
             }
             Err(e) if terminal::is_terminal_response_timeout(&e) => {
@@ -1313,6 +1361,7 @@ async fn exec_command_inner(
             }
             Err(e) => {
                 let _ = terminal::close_terminal(encrypted, tid).await;
+                *active_service_id = None;
                 anyhow::bail!("recv error during exec: {e:#}");
             }
         }
@@ -1320,6 +1369,7 @@ async fn exec_command_inner(
 
     // 5. Close the ephemeral terminal.
     let _ = terminal::close_terminal(encrypted, tid).await;
+    *active_service_id = None;
 
     // 6. Parse output — extract stdout and exit code from sentinel.
     let raw = String::from_utf8_lossy(&collected);
@@ -1487,6 +1537,7 @@ async fn shell_session<T, R>(
     encrypted: &mut EncryptedStream<T>,
     uds_reader: R,
     mut uds_writer: impl tokio::io::AsyncWrite + Unpin,
+    active_service_id: &mut Option<String>,
 ) -> Result<()>
 where
     T: Transport,
@@ -1511,6 +1562,7 @@ where
             anyhow::bail!("shell: terminal open timed out");
         }
     };
+    *active_service_id = Some(terminal_info.service_id.clone());
     let tid = terminal_info.terminal_id;
 
     // 2. Send ack so the CLI knows the session started.
@@ -1568,6 +1620,7 @@ where
             Event::UdsLine(None) => {
                 // CLI disconnected.
                 let _ = terminal::close_terminal(encrypted, tid).await;
+                *active_service_id = None;
                 break;
             }
             Event::Terminal(Ok(TerminalEvent::Data(data))) => {
@@ -1575,14 +1628,17 @@ where
                 uds_writer.flush().await?;
             }
             Event::Terminal(Ok(TerminalEvent::Closed { .. })) => {
+                *active_service_id = None;
                 break;
             }
             Event::Terminal(Ok(TerminalEvent::Error(msg))) => {
                 eprintln!("daemon: shell terminal error: {msg}");
+                *active_service_id = None;
                 break;
             }
             Event::Terminal(Err(e)) => {
                 eprintln!("daemon: shell recv error: {e:#}");
+                *active_service_id = None;
                 break;
             }
         }
@@ -1947,7 +2003,8 @@ mod tests {
 
         // Run shell_session.
         let buf_reader = BufReader::new(daemon_read);
-        let result = shell_session(&mut client, buf_reader, daemon_write).await;
+        let mut active_service_id = None;
+        let result = shell_session(&mut client, buf_reader, daemon_write, &mut active_service_id).await;
         assert!(result.is_ok(), "shell_session failed: {result:?}");
 
         // Read ack from CLI side.
@@ -2056,7 +2113,8 @@ mod tests {
 
         // Run shell_session.
         let buf_reader = BufReader::new(daemon_read);
-        let result = shell_session(&mut client, buf_reader, daemon_write).await;
+        let mut active_service_id = None;
+        let result = shell_session(&mut client, buf_reader, daemon_write, &mut active_service_id).await;
         assert!(result.is_ok(), "shell_session failed: {result:?}");
 
         let _server = server_task.await.unwrap();
@@ -2189,6 +2247,18 @@ mod tests {
         let data = resp.data.expect("chunk response should have data");
         assert_eq!(data["kind"], "chunk");
         assert_eq!(data["chunk"], "hello\n");
+    }
+
+    #[test]
+    fn login_union_for_terminal_preserves_service_id() {
+        let union = login_union_for_conn_type(ConnType::Terminal, Some("svc-123"))
+            .expect("terminal union");
+        match union {
+            login_request::Union::Terminal(terminal) => {
+                assert_eq!(terminal.service_id, "svc-123");
+            }
+            other => panic!("expected terminal login union, got {other:?}"),
+        }
     }
 
     #[test]

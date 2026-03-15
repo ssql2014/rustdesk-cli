@@ -1,0 +1,110 @@
+// rmsnorm_broadcast_kernel.ac
+// Broadcast pipeline kernel for RMSNorm across dual dies.
+//
+// This kernel extends the base rmsnorm kernel with broadcast semantics:
+// - Distributes input/weight tensors across two dies
+// - Each die computes RMSNorm independently on its partition
+// - Results are gathered back via cross-die memory writes
+//
+// Companion to: rmsnorm_broadcast.h, rmsnorm_broadcast_host.cpp
+// See rmsnorm_kernel.ac for the core rmsnorm device implementation.
+
+#include <hpe.h>
+#include <npurt.h>
+
+#ifdef __AC_DEVICE_COMPILE__
+#include "evas_wrap.h"
+#include "interface.h"
+#include "visa.h"
+#include "vllm_fusedop_init.h"
+
+using namespace visa::te;
+using namespace visa::matrix;
+
+#define Cluster_ID (CLUSTER_ID % 4)
+#define CSR_MCYCLE (0xb00)
+#define STR(S) #S
+#define XSTR(S) STR(S)
+
+#define read_csr(reg)                                  \
+  ({                                                   \
+    unsigned long __tmp;                               \
+    asm volatile("csrr %0, " XSTR(reg) : "=r"(__tmp)); \
+    __tmp;                                             \
+  })
+
+// Forward declaration — uses the rmsnorm template from rmsnorm_kernel.ac
+// In the actual build system, this file is compiled with rmsnorm_kernel.ac
+// linked, providing the rmsnorm<ty>() device function.
+
+extern void device_init_func();
+
+#endif  // __AC_DEVICE_COMPILE__
+
+__GLOBAL__ void rmsnorm_run_die_broadcast(
+    void* out_ddr0, void* out_ddr1,
+    void* fm_ddr0,  void* fm_ddr1,
+    void* wt_ddr0,  void* wt_ddr1,
+    int   seq_len, int dim_size, int dtype, float eps)
+{
+  gsync();
+#ifdef __AC_DEVICE_COMPILE__
+  uint64_t start_time = read_csr(CSR_MCYCLE);
+#endif
+  gsync();
+
+  // Broadcast: each die processes the full seq_len with its own fm/wt copy
+  // Output is written to both out_ddr0 and out_ddr1 (mirrored)
+  if ((dtype == 0) || (dtype == 1) || (dtype == 2)) {
+#ifdef __AC_DEVICE_COMPILE__
+    if (DIE_ID == 0) {
+      // Die 0: read from fm_ddr0/wt_ddr0, write to out_ddr0
+      if (dtype == 0) {
+        rmsnorm((visa::float16_t*)out_ddr0, (visa::float16_t*)nullptr,
+                (visa::float16_t*)fm_ddr0, (visa::float16_t*)wt_ddr0,
+                (visa::float16_t*)nullptr, seq_len, dim_size,
+                (visa::float16_t*)out_ddr1, eps);
+      } else if (dtype == 1) {
+        rmsnorm((visa::float32_t*)out_ddr0, (visa::float32_t*)nullptr,
+                (visa::float32_t*)fm_ddr0, (visa::float32_t*)wt_ddr0,
+                (visa::float32_t*)nullptr, seq_len, dim_size,
+                (visa::float32_t*)out_ddr1, eps);
+      } else {
+        rmsnorm((visa::bfloat16_t*)out_ddr0, (visa::bfloat16_t*)nullptr,
+                (visa::bfloat16_t*)fm_ddr0, (visa::bfloat16_t*)wt_ddr0,
+                (visa::bfloat16_t*)nullptr, seq_len, dim_size,
+                (visa::bfloat16_t*)out_ddr1, eps);
+      }
+    } else {
+      // Die 1: read from fm_ddr1/wt_ddr1, write to out_ddr1
+      if (dtype == 0) {
+        rmsnorm((visa::float16_t*)out_ddr1, (visa::float16_t*)nullptr,
+                (visa::float16_t*)fm_ddr1, (visa::float16_t*)wt_ddr1,
+                (visa::float16_t*)nullptr, seq_len, dim_size,
+                (visa::float16_t*)out_ddr0, eps);
+      } else if (dtype == 1) {
+        rmsnorm((visa::float32_t*)out_ddr1, (visa::float32_t*)nullptr,
+                (visa::float32_t*)fm_ddr1, (visa::float32_t*)wt_ddr1,
+                (visa::float32_t*)nullptr, seq_len, dim_size,
+                (visa::float32_t*)out_ddr0, eps);
+      } else {
+        rmsnorm((visa::bfloat16_t*)out_ddr1, (visa::bfloat16_t*)nullptr,
+                (visa::bfloat16_t*)fm_ddr1, (visa::bfloat16_t*)wt_ddr1,
+                (visa::bfloat16_t*)nullptr, seq_len, dim_size,
+                (visa::bfloat16_t*)out_ddr0, eps);
+      }
+    }
+#endif
+  }
+
+  gsync();
+  fence();
+
+#ifdef __AC_DEVICE_COMPILE__
+  uint64_t end_time = read_csr(CSR_MCYCLE);
+  if (CORE_ID == 0) {
+    printf("rmsnorm_broadcast kernel cluster%d cycle = %lu\n", Cluster_ID, end_time - start_time);
+  }
+#endif
+  gsync();
+}

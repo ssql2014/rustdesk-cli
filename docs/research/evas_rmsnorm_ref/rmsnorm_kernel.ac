@@ -1,0 +1,191 @@
+#include <hpe.h>
+#include <npurt.h>
+
+#ifdef __AC_DEVICE_COMPILE__
+#include "evas_wrap.h"
+#include "interface.h"
+#include "visa.h"
+#include "vllm_fusedop_init.h"
+
+using namespace visa::te;
+using namespace visa::matrix;
+
+#define Cluster_ID (CLUSTER_ID % 4)
+
+template <typename ty>
+__DEVICE__ void rmsnorm(ty output_ddr, ty output_res_ddr, ty input_fm, ty input_wt,
+                        ty input_residual, int M, int N, ty output_gather = nullptr,
+                        float eps = 1e-5) {
+  int m = 16;
+  int m_parts = (M + 16 * m - 1) / (16 * m);
+  ty fm_l2_ping_addr = ty(0x0);
+  ty fm_l2_pong_addr = ty(0x140000);
+  ty residual_l2_ping_addr = ty(0x280000);
+  ty residual_l2_pong_addr = ty(0x3C0000);
+
+  ty norm_mm_ping_in = (ty)0x0;
+  ty norm_mm_pong_in = (ty)0x50000;
+
+  ty norm_mm_pong_out = (ty)0xA0000;
+  ty norm_mm_ping_out = (ty)0xF0000;
+
+  ty wt_mm = (ty)0x170000;
+
+  int m_tiling_cluster_offset, m_tiling_core_offset,
+      m_pading = ((M - (m_parts - 1) * 16 * m) + 15) / 16;
+
+  ty fm_l2[2] = {fm_l2_ping_addr, fm_l2_pong_addr};
+  ty norm_in[2] = {norm_mm_ping_in, norm_mm_pong_in};
+  ty norm_out[2] = {norm_mm_ping_out, norm_mm_pong_out};
+  ty residual_l2[2] = {residual_l2_ping_addr, residual_l2_pong_addr};
+
+  NotifyConfig notify_ids;
+  uint16_t te_tec0[2] = {notify_ids.te2tec_out[0], notify_ids.te2tec_out[1]};
+  uint16_t tec0_te[2] = {notify_ids.tec2te_fm[0], notify_ids.tec2te_fm[1]};
+  bool res_add = input_residual != nullptr ? true : false;
+
+  line_copy<TE, DDR, MM>(input_wt, wt_mm, visa::make_tuple(1, N));
+  for (int i = 0; i < m_parts; i++) {
+    if (i < m_parts - 1)
+      m_tiling_cluster_offset = (4 * i + Cluster_ID) * 4 * m * N;
+    else {
+      m_tiling_cluster_offset = (4 * (m_parts - 1)) * 4 * m * N + Cluster_ID * m_pading * 4 * N;
+      m = m_pading;
+    }
+
+    if (res_add) {
+      if (CORE_ID == 0) {
+        wait_and_set_dsc<visa::te::TEC0>(te_tec0[i % 2]);
+        line_copy<TEC0, DDR, L2>(input_fm + m_tiling_cluster_offset, fm_l2[i % 2],
+                                 visa::make_tuple(m * 4, N), -1, -1, {NOTIFY_NONE, i < 2 ? 0u : 4u},
+                                 te_tec0[i % 2]);
+      }
+      if (CORE_ID == 0) {
+        wait_and_set_dsc<visa::te::TEC0>(te_tec0[i % 2]);
+        line_copy<TEC0, DDR, L2, visa::te::REDUCE_ACC>(
+            input_residual + m_tiling_cluster_offset, fm_l2[i % 2], visa::make_tuple(m * 4, N), -1,
+            -1, {get_notify_id(tec0_te[i % 2]), 0u}, te_tec0[i % 2]);
+      }
+    } else {
+      if (CORE_ID == 0) {
+        wait_and_set_dsc<visa::te::TEC0>(te_tec0[i % 2]);
+        line_copy<TEC0, DDR, L2>(input_fm + m_tiling_cluster_offset, fm_l2[i % 2],
+                                 visa::make_tuple(m * 4, N), -1, -1,
+                                 {get_notify_id(tec0_te[i % 2]), i < 2 ? 0u : 4u}, te_tec0[i % 2]);
+      }
+    }
+
+    wait_and_set_dsc<visa::te::TE>(tec0_te[i % 2]);
+    line_copy<TE, L2, MM>(fm_l2[i % 2] + m * N * CORE_ID, norm_in[i % 2], visa::make_tuple(m, N),
+                          -1, N, {i < m_parts - 2 ? get_notify_id(te_tec0[i % 2]) : NOTIFY_NONE, 1u}, tec0_te[i % 2]);
+    rmsnorm_m(mm_ptr((ty)(void*)norm_out[i % 2]), mm_ptr((ty)(void*)norm_in[i % 2]),
+              mm_ptr((ty)(void*)wt_mm), (uint16_t)m, (uint16_t)N, (visa::float32_t)eps);
+
+    m_tiling_core_offset = m_tiling_cluster_offset + m * N * CORE_ID;
+    if (i == m_parts - 1) {
+      if (m_tiling_cluster_offset + m * N * CORE_ID >= M * N)
+        continue;
+      else if (m_tiling_cluster_offset + m * N * CORE_ID + m * N >= M * N) {
+        m = (M * N - (m_tiling_cluster_offset + m * N * CORE_ID)) / N;
+      }
+    }
+    line_copy<TE, MM, DDR>(norm_in[i % 2], output_res_ddr + m_tiling_core_offset,
+                           visa::make_tuple(m, N));
+    line_copy<TE, MM, DDR>(norm_out[i % 2], output_ddr + m_tiling_core_offset,
+                           visa::make_tuple(m, N));
+    if (output_gather != nullptr)
+      line_copy<TE, MM, DDR>(norm_out[i % 2], output_gather + m_tiling_core_offset,
+                             visa::make_tuple(m, N));
+  }
+}
+
+__DEVICE__ void rmsnorm_die_f16(void* out_ddr0, void* out_res_ddr0, void* in_ddr0, void* wt_ddr0,
+                                void* in_res_ddr0, int M, int N, int dtype,
+                                void* out_ddr1 = nullptr, float eps = 1e-5) {
+  if (dtype == 0)
+    rmsnorm((visa::float16_t*)(void*)out_ddr0, (visa::float16_t*)(void*)out_res_ddr0,
+            (visa::float16_t*)(void*)in_ddr0, (visa::float16_t*)(void*)wt_ddr0,
+            (visa::float16_t*)(void*)in_res_ddr0, M, N, (visa::float16_t*)(void*)out_ddr1, eps);
+  else if (dtype == 1)
+    rmsnorm((visa::float32_t*)(void*)out_ddr0, (visa::float32_t*)(void*)out_res_ddr0,
+            (visa::float32_t*)(void*)in_ddr0, (visa::float32_t*)(void*)wt_ddr0,
+            (visa::float32_t*)(void*)in_res_ddr0, M, N, (visa::float32_t*)(void*)out_ddr1, eps);
+  else if (dtype == 2)
+    rmsnorm((visa::bfloat16_t*)(void*)out_ddr0, (visa::bfloat16_t*)(void*)out_res_ddr0,
+            (visa::bfloat16_t*)(void*)in_ddr0, (visa::bfloat16_t*)(void*)wt_ddr0,
+            (visa::bfloat16_t*)(void*)in_res_ddr0, M, N, (visa::bfloat16_t*)(void*)out_ddr1, eps);
+  else
+    printf("Unsupported dtype\n");
+}
+
+#endif
+
+extern void device_init_func();
+
+#define CSR_MCYCLE (0xb00)
+#define STR(S) #S
+#define XSTR(S) STR(S)
+
+#define read_csr(reg)                                  \
+  ({                                                   \
+    unsigned long __tmp;                               \
+    asm volatile("csrr %0, " XSTR(reg) : "=r"(__tmp)); \
+    __tmp;                                             \
+  })
+
+__GLOBAL__ void rmsnorm_run_die(void* out_ddr0, void* output_res_ddr0, void* fm_ddr0, void* wt_ddr0,
+                                void* in_res_ddr0, int seq_len0, int dim_size0, int dtype = 1,
+                                float eps = 1e-5) {
+  gsync();
+  uint64_t start_time = read_csr(CSR_MCYCLE);
+  gsync();
+
+  if ((dtype == 0) || (dtype == 1)) {
+    rmsnorm_die_f16(out_ddr0, output_res_ddr0, fm_ddr0, wt_ddr0, in_res_ddr0, seq_len0, dim_size0,
+                    dtype, nullptr, eps);
+  } else {
+  }
+  gsync();
+  fence();
+  uint64_t end_time = read_csr(CSR_MCYCLE);
+
+  if (CORE_ID == 0) {
+    printf("gemm kernel cluster%d cycle = %lu\n", Cluster_ID, end_time - start_time);
+  }
+  gsync();
+}
+
+__GLOBAL__ void rmsnorm_run_die_v2(void* out_ddr0, void* output_res_ddr0, void* fm_ddr0,
+                                   void* wt_ddr0, void* in_res_ddr0, void* out_ddr1,
+                                   void* output_res_ddr1, void* fm_ddr1, void* wt_ddr1,
+                                   void* in_res_ddr1, int seq_len, int dim_size, int dtype = 1,
+                                   float eps = 1e-5) {
+  gsync();
+  uint64_t start_time = read_csr(CSR_MCYCLE);
+  gsync();
+
+  if ((dtype == 0) || (dtype == 1) || (dtype == 2)) {
+    if (DIE_ID == 0) {
+      rmsnorm_die_f16(out_ddr0, output_res_ddr0, fm_ddr0, wt_ddr0, in_res_ddr0, (seq_len + 1) / 2,
+                      dim_size, dtype, out_ddr1, eps);
+    } else {
+      if (dtype == 0 || dtype == 2)
+        rmsnorm_die_f16(
+          (void*)((char*)out_ddr1 + ((seq_len + 1) / 2) * dim_size * 2), output_res_ddr1, fm_ddr1, wt_ddr1, in_res_ddr1, seq_len / 2, dim_size, dtype,
+          (void*)((char*)out_ddr0 + ((seq_len + 1) / 2) * dim_size * 2), eps);
+      else if(dtype == 1)
+        rmsnorm_die_f16(
+          (void*)((char*)out_ddr1 + ((seq_len + 1) / 2) * dim_size * 4), output_res_ddr1, fm_ddr1, wt_ddr1, in_res_ddr1, seq_len / 2, dim_size, dtype,
+          (void*)((char*)out_ddr0 + ((seq_len + 1) / 2) * dim_size * 4), eps);
+    }
+  } else {
+  }
+  gsync();
+  fence();
+  uint64_t end_time = read_csr(CSR_MCYCLE);
+
+  if (CORE_ID == 0) {
+    printf("gemm kernel cluster%d cycle = %lu\n", Cluster_ID, end_time - start_time);
+  }
+  gsync();
+}

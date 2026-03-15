@@ -2,6 +2,37 @@
 
 This note distills the key architectural lessons from [evas_learning_report.md](/Users/qlss/Documents/Projects/rustdesk-cli/docs/research/evas_learning_report.md) into an operator-design playbook. The goal is not to restate the manuals, but to capture the patterns that should guide future kernel work in `.ac`.
 
+## Architecture Corrections from Meeting (2026-03-15)
+
+Jerry confirmed several architectural points directly with the Evas team. These refine the mental model used below and should be treated as authoritative.
+
+### Confirmed facts
+
+- each chip has 2 dies
+- each die has 4 clusters
+- each cluster has multiple cores
+- each core is composed of:
+  - VPU, implemented as an Andes RISC-V core
+  - Tensor Core
+  - DMA
+  - Scheduler
+- the Scheduler reads VISA instructions in order but executes them out of order
+- VISA instructions are macro instructions, built from lower-level C and RISC-V instructions
+- the overall machine follows a dataflow execution model
+
+### Design implications
+
+- Out-of-order execution inside the core scheduler means operator code should expose independence between transfers, tensor-core work, and vector work whenever possible. Independent VISA instructions can overlap automatically if we do not serialize them unnecessarily with avoidable fences or coarse barriers.
+- The dataflow model reinforces the staged transfer pattern already seen in the kernels: DDR -> L2 -> MM/AM is not just a memory hierarchy detail, it is the mechanism that keeps compute fed. Operator design should focus on keeping the next tile available before the current tile finishes.
+- Because VISA is a macro-instruction layer rather than a one-to-one mapping to raw hardware operations, there is an abstraction boundary between AC/C++ source and actual execution. Performance tuning therefore depends on understanding not just which VISA ops are issued, but also how those ops expand into lower-level behavior and where that expansion may introduce hidden dependencies or scheduling limits.
+- The scheduler model suggests a practical rule: write kernels so instruction streams contain long runs of movement and compute operations that are logically independent, then use the lightest possible synchronization primitive only at true dependency boundaries.
+- The corrected core model also sharpens the division of responsibilities:
+  - Tensor Core for dense math
+  - VPU for vector and control-heavy work
+  - DMA for movement
+  - Scheduler for extracting overlap from the issued VISA stream
+  This makes operator performance primarily a scheduling and residency problem, not just an arithmetic one.
+
 ## 1. Mental Model of the Chip
 
 The E200 is not a flat SIMD device. It is a four-level hierarchy:
@@ -26,6 +57,8 @@ The fastest designs treat the chip as a dataflow machine:
 
 If an operator design does not start from this hierarchy, it will usually lose performance to movement overhead before arithmetic becomes the bottleneck.
 
+One correction from the meeting is worth making explicit: the core should be thought of as a scheduled compound processing element, not just a bag of engines. The Scheduler issues VISA macro instructions in order but can execute ready operations out of order, which means the kernel author's job is to present a dependency graph with enough independent work to keep Tensor Core, VPU, and DMA busy concurrently.
+
 ## 2. Reusable Execution Pattern
 
 The existing operators suggest a consistent kernel template:
@@ -42,6 +75,8 @@ This same pattern appears in linear, MLP, attention, fused GEMM+RoPE, and KV-cac
 ### Design rule
 
 Prefer building operators as a pipeline of staged tiles instead of as a single monolithic kernel body. The hardware is designed to reward pipelining and overlap more than raw instruction density.
+
+The meeting clarification on dataflow execution strengthens this rule. The purpose of staging is not merely to organize memory traffic; it is to keep the dataflow graph supplied so the scheduler always has ready work to issue out of order.
 
 ## 3. Memory Placement Strategy
 
@@ -86,6 +121,15 @@ This means operator boundaries should often align with engine boundaries:
 
 The strongest pattern in the existing codebase is fusion across engine-friendly stages, especially when it removes a DDR round trip. The fused GEMM+Norm+RoPE kernels are the clearest example.
 
+With the corrected core model, it is also useful to reinterpret these blocks in meeting terminology:
+
+- Tensor Core corresponds to the dense math path
+- VPU corresponds to vector math and control-oriented work
+- DMA corresponds to the movement path
+- Scheduler is the mechanism that overlaps them when dependencies allow
+
+That framing is useful when deciding whether an operator should be fused, split, or reordered.
+
 ## 5. VISA and `.ac` Programming Model Implications
 
 AC looks like C++17, but effective `.ac` code is much closer to explicit kernel assembly with templates:
@@ -93,6 +137,8 @@ AC looks like C++17, but effective `.ac` code is much closer to explicit kernel 
 - scoped pointers (`mm_ptr`, `am_ptr`, `l2_ptr`, `ddr_ptr`) encode address-space intent
 - VISA intrinsics assume the caller already solved layout, alignment, and buffer sizing
 - the MCU is responsible for orchestration, triggering, and synchronization
+
+The meeting added an important caveat: VISA is not the raw hardware interface. It is a macro-instruction layer that ultimately lowers into lower-level C and RISC-V instruction sequences. That means source-level intent and runtime behavior are related, but not identical.
 
 ### Reusable coding pattern
 
@@ -103,6 +149,14 @@ Good `.ac` kernels seem to separate into three layers:
 - math microkernel: ME or VE calls on already-resident tiles
 
 That separation is worth preserving in future operators because it keeps the kernel debuggable. It also makes it easier to reuse the movement schedule with different math cores.
+
+It also gives a clean place to reason about the abstraction boundary:
+
+- topology logic determines the dataflow graph
+- movement schedule determines data readiness
+- math microkernel determines Tensor Core and VPU utilization
+
+If performance is poor, the problem may be in any of those layers or in how the VISA macro instructions generated from them interact with the scheduler.
 
 ## 6. Synchronization Strategy
 
@@ -119,6 +173,8 @@ The report makes a strong case that synchronization should be as local as possib
 ### Why this matters
 
 Large barriers destroy the overlap that the hardware is built for. Notify is especially important for kernels with staged transfer and compute, because it lets one engine progress without stalling the full cluster.
+
+This matters even more under the corrected scheduler model. Since the scheduler can extract overlap from independent VISA instructions automatically, over-synchronizing does double damage: it blocks both explicit pipeline overlap and the scheduler's own out-of-order opportunities.
 
 ## 7. Patterns Reused by Existing Operators
 

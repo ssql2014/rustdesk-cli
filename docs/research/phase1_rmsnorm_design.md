@@ -157,9 +157,11 @@ $$\text{out}_j = \frac{(x_{\text{norm}})_j}{\text{RMS}(x_{\text{norm}})} \cdot \
 
 ### 3.4 残差融合（版本 B 支持，适用于 GemmaRMSNorm）
 
-$$x_{\text{sum}} = x_{\text{fm}} + x_{\text{residual}} \quad \text{（当 in\_res != NULL）}$$
+当 `in_res` != NULL 时：
 
-$$\text{output\_res} = x_{\text{sum}}$$
+$$x_{\text{sum}} = x_{\text{fm}} + x_{\text{residual}}$$
+
+$$\text{output-res} = x_{\text{sum}}$$
 
 $$\text{out} = \text{RMSNorm}(x_{\text{sum}}, \gamma, \varepsilon)$$
 
